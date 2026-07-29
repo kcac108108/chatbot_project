@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+combined_ca_bundle.pem
+monitorapp_root*.cer
+monitorapp_root*.pem
+.DS_Store
+*.log
+.claude/settings.local.json
