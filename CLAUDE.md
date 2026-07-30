@@ -78,6 +78,7 @@ Python(pip, requests, httpx, openai SDK 등)은 이 사설 루트 인증서를 �
 - 해결: `combined_ca_bundle.pem`(프로젝트 루트, pip 내장 certifi + MonitorApp 루트 인증서 병합) 사용
 - pip: `venv/pip.ini`에 `cert = .../combined_ca_bundle.pem` 이미 설정되어 있어 별도 옵션 불필요
 - **OpenAI API 등 앱 코드에서 HTTPS 호출 시에도 동일 문제 발생 가능** — `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE` 환경변수를 이 파일로 지정하거나, httpx 클라이언트 생성 시 `verify=combined_ca_bundle.pem` 지정 필요 (`.env.example`의 `SSL_CERT_FILE` 참고)
+- **npm도 동일 문제 있음** — `npm config get cafile`이 비어있어 Playwright 등 브라우저 바이너리 다운로드 불가 확인(2026-07-30). 웹 UI 브라우저 자동화 테스트가 필요하면 npm cafile도 `combined_ca_bundle.pem`으로 지정 필요
 - 운영(폐쇄망)은 이 문제가 없을 가능성 높음 — 배포 시 재확인 필요
 
 ## 현재 진행 상태
@@ -87,4 +88,7 @@ Python(pip, requests, httpx, openai SDK 등)은 이 사설 루트 인증서를 �
 - 정의서 3장 검증 쿼리 4개 실행 완료 (`scripts/verify_menu_queries.sql`) — 7장 검증기준 1~4번 충족
 - Python venv(3.11.9) + `requirements.txt` 설치 완료 (fastapi, oracledb, qdrant-client, openai 등)
 - Oracle 이미지: `gvenzl/oracle-xe` 사용 (기존 컨테이너 재사용)
-- 다음: `app/` 이하 적재 배치 코드(쿼리→클렌징→청크조립→임베딩→Qdrant) 작성 중
+- **적재 배치 완료**: `app/services/ingest.py` 실행 완료, Qdrant에 306개 청크 적재(기관정보 100+신청이력 128+외부요청 8+내부자료 13+심의위원회 57, 더미 데이터 건수와 정확히 일치). `scripts/verify_ingest.py`로 정의서 7장 검증기준 1~5번 전 항목 PASS 확인
+- **챗봇 API 서버 완료**: `POST /chat` — 질문 분석(대명사 해석+메타 필터 추출, 구조화 출력 1회 호출) → 벡터 검색(top6, 메타 필터, 0건 시 필터 해제 폴백) → 근거 기반 답변(temperature 0.2) → 출처 반환. 세션 단위 in-memory 대화 이력 유지. `scripts/verify_chat_api.py`로 검색 시나리오+후속 질문 대응 전 항목 PASS
+- **챗봇 웹 화면 완료**: `app/static/index.html` 단일 파일 채팅 UI(steel-classify 패턴), `/`에서 서빙. 브라우저 실사용 확인 완료(2026-07-30)
+- PoC 1~4단계(적재 배치/벡터DB/API 서버/웹 화면) 전부 1차 구현 및 검증 완료. 다음은 사용자 피드백 기반 다듬기(프롬프트 정확도, 2단계 첨부파일 청킹 등) 또는 정의서 8장 보류 항목 확정
