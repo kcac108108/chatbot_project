@@ -1,6 +1,9 @@
 # Oracle XE는 기존 `oracle-xe` 컨테이너(gvenzl/oracle-xe:21-slim, port 1521, PDB=xepdb1)를
 # steel-classify 프로젝트와 공유하므로 여기에는 포함하지 않음.
 # 챗봇 전용 스키마: CHATBOT (.env.example 참고)
+#
+# app 서비스는 steel-classify와 동일하게 운영(폐쇄망) 배포용 정의. 이 개발 PC에서
+# docker build/up으로 직접 검증하지 않고, 소스코드를 폐쇄망으로 반입해 그쪽에서 빌드·구동.
 services:
   qdrant:
     image: qdrant/qdrant:latest
@@ -11,6 +14,16 @@ services:
       - "6334:6334"
     volumes:
       - qdrant-data:/qdrant/storage
+
+  app:
+    build: .
+    image: chatbot-app:latest
+    container_name: chatbot-app
+    restart: always
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
 
 volumes:
   qdrant-data:
