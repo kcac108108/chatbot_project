@@ -26,3 +26,6 @@ QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "history_chatbot")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large")
 OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+
+# 정의서 6장: 벡터 검색 top 5~8건
+CHAT_TOP_K = int(os.getenv("CHAT_TOP_K", "6"))

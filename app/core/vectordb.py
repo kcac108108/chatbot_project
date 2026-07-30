@@ -23,3 +23,11 @@ def ensure_collection() -> None:
 
 def upsert_points(points: list[qmodels.PointStruct]) -> None:
     _client.upsert(collection_name=QDRANT_COLLECTION, points=points)
+
+
+def search(
+    vector: list[float], query_filter: qmodels.Filter | None, limit: int
+) -> list[qmodels.ScoredPoint]:
+    return _client.query_points(
+        collection_name=QDRANT_COLLECTION, query=vector, query_filter=query_filter, limit=limit
+    ).points

@@ -168,7 +168,7 @@ def build_menu3_chunks(rows: list[dict]) -> list[dict]:
                 "원본ID": request_id,
                 "담당자": head["USERNM"],
                 "결재자": head["DECIDING_OFFICER"],
-                "연도": head["MAIN_CR_DTM"].year if head["MAIN_CR_DTM"] else None,
+                "연도": str(head["MAIN_CR_DTM"].year) if head["MAIN_CR_DTM"] else None,
             },
         })
     return chunks
