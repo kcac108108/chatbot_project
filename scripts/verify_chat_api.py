@@ -78,8 +78,9 @@ print("=" * 60)
 r1 = ask(f"{org} 관련 이력 알려줘")
 sid = r1["session_id"]
 r2 = ask("그 기관 사업명이 뭐야?", session_id=sid)
-check("대명사 후속 질문이 세션 맥락으로 해결됨", org in r2["answer"] and r2["session_id"] == sid,
-      f"answer={r2['answer']}")
+check("대명사 후속 질문이 세션 맥락으로 해결됨",
+      r2["session_id"] == sid and any(s["기관명"] == org for s in r2["sources"]),
+      f"answer={r2['answer']} sources={r2['sources']}")
 
 print()
 print("=" * 60)
