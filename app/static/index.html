@@ -3,146 +3,581 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>교부기관 이력관리시스템 챗봇 (PoC)</title>
+<title>이력관리시스템 챗봇 (PoC)</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%92%AC%3C/text%3E%3C/svg%3E">
 <style>
   * { box-sizing: border-box; }
+  :root {
+    --page-bg: #eef1f4;
+    --sidebar-bg: #ffffff;
+    --ink: #1b2433;
+    --ink-soft: #6b7684;
+    --ink-faint: #9aa3ae;
+    --rule: #e6e9ed;
+    --widget-panel: #1c2836;
+    --accent: #3b5bdb;
+    --accent-soft: #e8ecfb;
+    --mint: #34c9a3;
+    --bot-bubble: #24313f;
+    --ink-dark: #dde3ea;
+    --ink-dark-soft: #8ea0b5;
+    --danger: #ef5b5b;
+    --danger-soft: rgba(239,91,91,.12);
+  }
+  html, body { height: 100%; }
   body {
     margin: 0;
-    font-family: "Malgun Gothic", "Apple SD Gothic Neo", sans-serif;
-    background: #f2f4f7;
+    font-family: "Pretendard", "Apple SD Gothic Neo", "Malgun Gothic", "Segoe UI", sans-serif;
+    background: var(--page-bg);
+    color: var(--ink);
+    overflow: hidden;
+    word-break: keep-all;
+    overflow-wrap: break-word;
+  }
+
+  .shell {
+    width: 100%;
     height: 100vh;
-    display: flex;
-    flex-direction: column;
+    background: var(--sidebar-bg);
+    display: grid;
+    grid-template-columns: 300px 1fr;
+    grid-template-rows: 100vh;
+    position: relative;
+    overflow: hidden;
   }
-  header {
-    background: #1c3d5a;
-    color: #fff;
-    padding: 16px 20px;
-    font-size: 18px;
-    font-weight: 600;
-  }
-  header .sub {
-    font-size: 12px;
-    font-weight: 400;
-    color: #b9c9d8;
-    margin-top: 2px;
-  }
-  #chat {
-    flex: 1;
+
+  /* ---------------- sidebar ---------------- */
+  .sidebar {
+    padding: 20px 16px;
+    border-right: 1px solid var(--rule);
     overflow-y: auto;
-    padding: 20px;
     display: flex;
     flex-direction: column;
-    gap: 14px;
+    min-height: 0;
   }
-  .msg { display: flex; flex-direction: column; max-width: 72%; }
-  .msg.user { align-self: flex-end; align-items: flex-end; }
-  .msg.bot { align-self: flex-start; align-items: flex-start; }
-  .bubble {
-    padding: 10px 14px;
-    border-radius: 12px;
-    line-height: 1.5;
-    white-space: pre-wrap;
-    font-size: 14px;
+  .sidebar-brand {
+    display: flex; align-items: center; gap: 9px;
+    margin-bottom: 22px; padding: 0 2px;
   }
-  .msg.user .bubble { background: #1c3d5a; color: #fff; border-bottom-right-radius: 2px; }
-  .msg.bot .bubble { background: #fff; color: #222; border: 1px solid #e0e4e9; border-bottom-left-radius: 2px; }
-  .msg.bot .bubble.error { background: #fdecea; border-color: #f5c2bd; color: #a12b1f; }
-  .sources { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 6px; }
-  .source-chip {
-    font-size: 11px;
-    background: #eaf0f7;
-    color: #2c4a6b;
-    border: 1px solid #cfdcea;
-    border-radius: 999px;
-    padding: 3px 9px;
+  .sidebar-logo {
+    width: 26px; height: 26px; border-radius: 50%; flex-shrink: 0;
+    background: #eef1f4 url("/static/bot-avatar.png") center / cover no-repeat;
   }
-  .sources-label { font-size: 11px; color: #8a94a0; margin-top: 8px; margin-bottom: 2px; }
-  .typing { font-size: 13px; color: #8a94a0; padding: 4px 14px; }
-  #input-bar {
+  .sidebar-brand b { font-size: 13.5px; letter-spacing: -.01em; }
+  .sidebar h3 { font-size: 11.5px; font-weight: 700; color: var(--ink); margin: 0 0 8px; }
+  .side-section { margin-bottom: 22px; }
+  .side-list { display: flex; flex-direction: column; gap: 2px; }
+  .side-item {
+    font-family: inherit; font-size: 12.5px; text-align: left; line-height: 1.45;
+    background: transparent; border: none; color: var(--ink-soft);
+    padding: 8px 10px; border-radius: 7px; cursor: pointer;
+    transition: background .15s, color .15s;
+  }
+  .side-item:hover { background: var(--accent-soft); color: var(--accent); }
+  .side-item.active { background: var(--accent-soft); color: var(--accent); font-weight: 700; }
+  #faq-list.side-list { gap: 7px; }
+  .faq-item {
+    background: var(--page-bg);
+    border: 1px solid var(--rule);
+    border-radius: 9px;
+  }
+  .faq-item:hover { background: var(--accent-soft); border-color: rgba(59,91,219,.3); }
+  .side-recent {
+    font-size: 12px; text-align: left; width: 100%; background: transparent; border: none;
+    font-family: inherit; color: var(--ink-faint); cursor: pointer;
+    padding: 6px 9px; line-height: 1.5; border-left: 2px solid var(--rule);
+    transition: border-color .15s, color .15s;
+  }
+  .side-recent:hover { border-color: var(--accent); color: var(--ink-soft); }
+  .side-empty { font-size: 11.5px; color: var(--ink-faint); padding: 4px 9px; }
+
+  /* ---------------- widget (right) ---------------- */
+  .widget-wrap {
+    padding: 18px;
+    background: linear-gradient(160deg, #f4f6f9, #e9edf2);
     display: flex;
-    gap: 8px;
-    padding: 14px 20px;
-    background: #fff;
-    border-top: 1px solid #e0e4e9;
+    min-width: 0;
+    min-height: 0;
   }
-  #question {
+  .widget {
     flex: 1;
-    padding: 10px 14px;
-    border: 1px solid #ccd3da;
-    border-radius: 8px;
-    font-size: 14px;
-    outline: none;
+    background: #16202e;
+    border-radius: 14px;
+    box-shadow: 0 18px 44px -18px rgba(10,14,20,.5);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
   }
-  #question:focus { border-color: #1c3d5a; }
+  .widget-head {
+    display: flex; align-items: center; gap: 10px;
+    padding: 13px 16px; background: var(--widget-panel);
+    border-bottom: 1px solid rgba(255,255,255,.06);
+    flex-shrink: 0;
+  }
+  .menu-toggle {
+    display: none;
+    width: 28px; height: 28px; border-radius: 7px;
+    background: transparent; border: 1px solid rgba(255,255,255,.14);
+    color: #b7c0d1; cursor: pointer; flex-shrink: 0;
+    align-items: center; justify-content: center; font-size: 14px;
+  }
+  .widget-logo { width: 24px; height: 24px; border-radius: 50%; flex-shrink: 0; background: #eef1f4 url("/static/bot-avatar.png") center / cover no-repeat; }
+  .widget-head b { font-size: 13.5px; color: #fff; }
+  .widget-head .badge { font-size: 10px; color: #7c8794; margin-left: 6px; border: 1px solid rgba(124,135,148,.4); border-radius: 4px; padding: 1px 6px; }
+
+  #chat {
+    flex: 1; min-height: 0; overflow-y: auto;
+    padding: 20px 18px; display: flex; flex-direction: column; gap: 16px;
+  }
+  #chat::-webkit-scrollbar { width: 7px; }
+  #chat::-webkit-scrollbar-thumb { background: rgba(255,255,255,.12); border-radius: 999px; }
+  #chat::-webkit-scrollbar-track { background: transparent; }
+
+  .msg-row { display: flex; gap: 9px; max-width: min(640px, 86%); animation: fadeIn .22s ease; }
+  .msg-row.user { align-self: flex-end; flex-direction: row-reverse; }
+  .msg-row.bot { align-self: flex-start; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+  @keyframes flashHighlight { 0% { box-shadow: 0 0 0 0 rgba(59,91,219,.6); } 100% { box-shadow: 0 0 0 9px rgba(59,91,219,0); } }
+  .msg-row.flash .bubble { animation: flashHighlight .9s ease; }
+
+  .avatar {
+    width: 26px; height: 26px; border-radius: 50%; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 10px; font-weight: 700;
+  }
+  .avatar.bot {
+    background: #eef1f4 url("/static/bot-avatar.png") center / cover no-repeat;
+  }
+  .avatar.user { background: #38455a; color: #cdd6e2; }
+
+  .msg-col { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+  .msg-row.user .msg-col { align-items: flex-end; }
+
+  .bubble {
+    padding: 10px 14px; border-radius: 12px; line-height: 1.6;
+    white-space: pre-wrap; font-size: 13.3px;
+  }
+  .msg-row.user .bubble { background: var(--accent); color: #fff; border-bottom-right-radius: 3px; }
+  .msg-row.bot .bubble { background: var(--bot-bubble); color: var(--ink-dark); border-bottom-left-radius: 3px; }
+  .bubble.error { background: var(--danger-soft); color: #ff9f9f; }
+
+  .retry-btn {
+    align-self: flex-start; background: transparent; border: 1px solid rgba(239,91,91,.4);
+    color: #ff9f9f; border-radius: 8px; padding: 5px 12px; font-size: 12px;
+    cursor: pointer; font-family: inherit; transition: background .15s;
+  }
+  .retry-btn:hover { background: var(--danger-soft); }
+
+  .detail-list { display: flex; flex-direction: column; gap: 5px; width: 100%; }
+  .detail-row { border: 1px solid rgba(255,255,255,.08); border-radius: 9px; background: rgba(255,255,255,.02); overflow: hidden; }
+  .detail-head {
+    width: 100%; display: flex; align-items: baseline; gap: 8px;
+    background: transparent; border: none; text-align: left; cursor: pointer;
+    font-family: inherit; color: var(--ink-dark); font-size: 12.3px; padding: 8px 11px;
+  }
+  .detail-head:hover { background: rgba(255,255,255,.04); }
+  .detail-label { font-weight: 800; color: var(--mint); flex-shrink: 0; font-size: 11.5px; }
+  .detail-teaser { color: var(--ink-dark-soft); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .detail-chevron { color: var(--mint); flex-shrink: 0; transition: transform .15s; font-size: 13px; }
+  .detail-row.open .detail-chevron { transform: rotate(90deg); }
+  .detail-row.open .detail-teaser { visibility: hidden; }
+  .detail-body { display: none; padding: 0 12px 11px; font-size: 12.6px; line-height: 1.65; color: var(--ink-dark-soft); }
+  .detail-row.open .detail-body { display: block; }
+
+  .sources-label { font-size: 10.5px; color: var(--ink-dark-soft); margin-top: 2px; }
+  .sources { display: flex; flex-direction: column; gap: 6px; width: 100%; }
+  .source-row { display: flex; flex-direction: column; align-items: flex-start; }
+  .detail-source-row { margin-top: 8px; }
+  .source-chip {
+    font-size: 10.8px; background: rgba(52,201,163,.12); color: var(--mint);
+    border: 1px solid rgba(52,201,163,.35); border-radius: 999px; padding: 4px 10px;
+    cursor: pointer; font-family: inherit; transition: background .15s, border-color .15s;
+  }
+  .source-chip:hover { background: rgba(52,201,163,.22); border-color: rgba(52,201,163,.55); }
+  .source-preview {
+    display: none; margin-top: 4px; padding: 9px 11px;
+    background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.08);
+    border-radius: 10px; font-size: 11.8px; color: var(--ink-dark-soft); line-height: 1.55; white-space: pre-wrap;
+  }
+  .source-row.open .source-preview { display: block; }
+
+  .field-list {
+    display: none; margin-top: 4px;
+    border: 1px solid rgba(255,255,255,.08); border-radius: 10px; overflow: hidden;
+  }
+  .source-row.open .field-list { display: block; }
+  .field-row {
+    display: flex; gap: 10px; padding: 7px 11px; font-size: 11.8px;
+    border-bottom: 1px solid rgba(255,255,255,.08);
+  }
+  .field-row:last-child { border-bottom: none; }
+  .field-row:nth-child(even) { background: rgba(255,255,255,.02); }
+  .field-label { flex: 0 0 64px; color: var(--mint); font-weight: 700; }
+  .field-value { flex: 1; min-width: 0; color: var(--ink-dark-soft); line-height: 1.55; white-space: pre-wrap; }
+
+  .typing {
+    display: flex; align-items: center; gap: 4px;
+    padding: 12px 16px; background: var(--bot-bubble);
+    border-radius: 12px; border-bottom-left-radius: 3px;
+  }
+  .typing span { width: 5px; height: 5px; border-radius: 50%; background: var(--mint); animation: bounce 1.2s infinite ease-in-out; }
+  .typing span:nth-child(2) { animation-delay: .15s; }
+  .typing span:nth-child(3) { animation-delay: .3s; }
+  @keyframes bounce { 0%, 80%, 100% { transform: scale(0.6); opacity: .4; } 40% { transform: scale(1); opacity: 1; } }
+
+  #input-bar { padding: 12px 14px; background: var(--widget-panel); border-top: 1px solid rgba(255,255,255,.06); flex-shrink: 0; }
+  .input-inner {
+    display: flex; align-items: flex-end; gap: 8px;
+    background: #101823; border: 1px solid rgba(255,255,255,.08); border-radius: 11px;
+    padding: 5px 5px 5px 13px; transition: border-color .15s;
+  }
+  .input-inner:focus-within { border-color: rgba(59,91,219,.55); }
+  #question {
+    flex: 1; padding: 8px 0; border: none; background: transparent;
+    color: var(--ink-dark); font-size: 13.3px; font-family: inherit;
+    outline: none; resize: none; max-height: 110px; line-height: 1.4;
+  }
+  #question::placeholder { color: #5b6675; }
   #send {
-    padding: 10px 20px;
-    background: #1c3d5a;
-    color: #fff;
-    border: none;
-    border-radius: 8px;
-    font-size: 14px;
-    cursor: pointer;
+    width: 32px; height: 32px; border-radius: 8px; flex-shrink: 0;
+    background: var(--accent); color: #fff; border: none; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    transition: opacity .15s;
   }
-  #send:disabled { background: #a9b6c2; cursor: default; }
-  #send:hover:not(:disabled) { background: #163149; }
+  #send svg { width: 13px; height: 13px; fill: currentColor; }
+  #send:disabled { background: #3a4250; cursor: default; }
+  #send:hover:not(:disabled) { opacity: .88; }
+
+  .sidebar-backdrop { display: none; }
+
+  @media (max-width: 720px) {
+    .shell { grid-template-columns: 1fr; }
+    .menu-toggle { display: flex; }
+    .sidebar {
+      position: fixed; inset: 0 auto 0 0; width: 280px; z-index: 20;
+      transform: translateX(-100%); transition: transform .2s ease;
+      box-shadow: 14px 0 30px rgba(15,20,28,.18);
+    }
+    .shell.sidebar-open .sidebar { transform: translateX(0); }
+    .sidebar-backdrop {
+      display: none; position: fixed; inset: 0; background: rgba(10,14,20,.4); z-index: 19;
+    }
+    .shell.sidebar-open .sidebar-backdrop { display: block; }
+    .widget-wrap { padding: 0; }
+    .widget { border-radius: 0; }
+    .msg-row { max-width: 92%; }
+  }
 </style>
 </head>
 <body>
-  <header>
-    교부기관 이력관리시스템 챗봇 (PoC)
-    <div class="sub">4개 메뉴 이력 데이터 기반 질의응답 — 근거 자료를 함께 표시합니다</div>
-  </header>
-  <div id="chat"></div>
-  <div id="input-bar">
-    <input id="question" type="text" placeholder="질문을 입력하세요 (예: OO기관 관련 이력 알려줘)" autocomplete="off">
-    <button id="send">전송</button>
+  <div class="shell" id="shell">
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-brand">
+        <div class="sidebar-logo"></div>
+        <b>이력관리시스템</b>
+      </div>
+
+      <div class="side-section">
+        <h3>빠른 메뉴</h3>
+        <div class="side-list" id="menu-list"></div>
+      </div>
+
+      <div class="side-section">
+        <h3>자주 묻는 질문</h3>
+        <div class="side-list" id="faq-list"></div>
+      </div>
+
+      <div class="side-section">
+        <h3>최근 검색</h3>
+        <div class="side-list" id="recent-list">
+          <div class="side-empty">아직 검색 기록이 없습니다</div>
+        </div>
+      </div>
+    </aside>
+    <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
+
+    <div class="widget-wrap">
+      <div class="widget">
+        <div class="widget-head">
+          <button class="menu-toggle" id="menu-toggle" type="button" aria-label="메뉴 열기">☰</button>
+          <div class="widget-logo"></div>
+          <b>이력관리시스템 챗봇</b><span class="badge">PoC</span>
+        </div>
+        <div id="chat"></div>
+        <div id="input-bar">
+          <div class="input-inner">
+            <textarea id="question" rows="1" placeholder="질문을 입력하세요 (예: OO기관 관련 이력 알려줘) — Shift+Enter로 줄바꿈" autocomplete="off"></textarea>
+            <button id="send" type="button" aria-label="전송">
+              <svg viewBox="0 0 24 24"><path d="M3 11l18-8-8 18-2.5-7.5L3 11z"/></svg>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 
 <script>
 let sessionId = null;
+let composing = false;
+let currentMenuScope = null; // null = 전체(범위 없음)
+let recentQuestions = [];
 
+const shellEl = document.getElementById("shell");
 const chatEl = document.getElementById("chat");
 const questionEl = document.getElementById("question");
 const sendEl = document.getElementById("send");
+const menuListEl = document.getElementById("menu-list");
+const faqListEl = document.getElementById("faq-list");
+const recentListEl = document.getElementById("recent-list");
+const sidebarEl = document.getElementById("sidebar");
+const sidebarBackdropEl = document.getElementById("sidebar-backdrop");
+const menuToggleEl = document.getElementById("menu-toggle");
 
-function addMessage(role, text, sources, isError) {
-  const msg = document.createElement("div");
-  msg.className = "msg " + role;
+const DETAIL_TEASER_LEN = 42;
+const RECENT_LIMIT = 5;
+
+function buildSourceChip(s) {
+  const srow = document.createElement("div");
+  srow.className = "source-row";
+
+  const chip = document.createElement("button");
+  chip.className = "source-chip";
+  chip.type = "button";
+  chip.textContent = `[${s.데이터유형}] ${s.원본ID}` + (s.기관명 ? ` · ${s.기관명}` : "");
+  srow.appendChild(chip);
+
+  if (s.세부항목 && s.세부항목.length > 0) {
+    const list = document.createElement("div");
+    list.className = "field-list";
+    s.세부항목.forEach(f => {
+      const row = document.createElement("div");
+      row.className = "field-row";
+
+      const label = document.createElement("div");
+      label.className = "field-label";
+      label.textContent = f.label;
+      row.appendChild(label);
+
+      const value = document.createElement("div");
+      value.className = "field-value";
+      value.textContent = f.value;
+      row.appendChild(value);
+
+      list.appendChild(row);
+    });
+    srow.appendChild(list);
+    chip.addEventListener("click", () => srow.classList.toggle("open"));
+  } else if (s.미리보기) {
+    const preview = document.createElement("div");
+    preview.className = "source-preview";
+    preview.textContent = s.미리보기;
+    srow.appendChild(preview);
+    chip.addEventListener("click", () => srow.classList.toggle("open"));
+  } else {
+    chip.style.cursor = "default";
+  }
+  return srow;
+}
+
+const MENU_ITEMS = ["전체", "기관별 사업정보", "외부요청", "내부자료", "심의위원회"];
+
+const FAQ_ITEMS = [
+  "이력관리시스템에 등록된 업체명 목록을 전부 알려줘",
+  "외부요청으로 등록된 업체명을 알려줘",
+  "내부자료 담당자 이름 목록을 알려줘",
+  "심의위원회에서 승인불가된 안건을 알려줘",
+  "국가 항목을 요청한 업체를 알려줘",
+];
+
+function closeSidebarOnMobile() {
+  shellEl.classList.remove("sidebar-open");
+}
+
+function renderMenuList() {
+  menuListEl.innerHTML = "";
+  MENU_ITEMS.forEach(label => {
+    const btn = document.createElement("button");
+    btn.className = "side-item" + ((currentMenuScope || "전체") === label ? " active" : "");
+    btn.type = "button";
+    btn.textContent = label;
+    btn.addEventListener("click", () => {
+      setMenuScope(label);
+      closeSidebarOnMobile();
+    });
+    menuListEl.appendChild(btn);
+  });
+}
+
+function setMenuScope(label) {
+  currentMenuScope = label === "전체" ? null : label;
+  renderMenuList();
+}
+
+function renderFaqList() {
+  faqListEl.innerHTML = "";
+  FAQ_ITEMS.forEach(q => {
+    const btn = document.createElement("button");
+    btn.className = "side-item faq-item";
+    btn.type = "button";
+    btn.textContent = q;
+    btn.addEventListener("click", () => {
+      closeSidebarOnMobile();
+      submitQuestion(q);
+    });
+    faqListEl.appendChild(btn);
+  });
+}
+
+function renderRecentList() {
+  recentListEl.innerHTML = "";
+  if (recentQuestions.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "side-empty";
+    empty.textContent = "아직 검색 기록이 없습니다";
+    recentListEl.appendChild(empty);
+    return;
+  }
+  recentQuestions.forEach(item => {
+    const btn = document.createElement("button");
+    btn.className = "side-recent";
+    btn.type = "button";
+    btn.textContent = item.q;
+    btn.addEventListener("click", () => {
+      closeSidebarOnMobile();
+      jumpToMessage(item.rowEl);
+    });
+    recentListEl.appendChild(btn);
+  });
+}
+
+function jumpToMessage(rowEl) {
+  if (!rowEl || !rowEl.isConnected) return;
+  rowEl.scrollIntoView({ behavior: "smooth", block: "center" });
+  rowEl.classList.add("flash");
+  setTimeout(() => rowEl.classList.remove("flash"), 900);
+}
+
+function pushRecentQuestion(q, rowEl) {
+  recentQuestions = [{ q, rowEl }, ...recentQuestions.filter(item => item.q !== q)].slice(0, RECENT_LIMIT);
+  renderRecentList();
+}
+
+function addMessage(role, text, sources, isError, retryQuestion, details) {
+  const row = document.createElement("div");
+  row.className = "msg-row " + role;
+
+  const avatar = document.createElement("div");
+  avatar.className = "avatar " + role;
+  if (role === "user") avatar.textContent = "나";
+  row.appendChild(avatar);
+
+  const col = document.createElement("div");
+  col.className = "msg-col";
 
   const bubble = document.createElement("div");
   bubble.className = "bubble" + (isError ? " error" : "");
   bubble.textContent = text;
-  msg.appendChild(bubble);
+  col.appendChild(bubble);
 
-  if (sources && sources.length > 0) {
+  if (isError && retryQuestion) {
+    const retryBtn = document.createElement("button");
+    retryBtn.className = "retry-btn";
+    retryBtn.textContent = "다시 시도";
+    retryBtn.addEventListener("click", () => {
+      row.remove();
+      callChat(retryQuestion);
+    });
+    col.appendChild(retryBtn);
+  }
+
+  if (details && details.length > 0) {
+    const list = document.createElement("div");
+    list.className = "detail-list";
+    details.forEach(d => {
+      const drow = document.createElement("div");
+      drow.className = "detail-row" + (details.length === 1 ? " open" : "");
+
+      const head = document.createElement("button");
+      head.className = "detail-head";
+      head.type = "button";
+
+      const label = document.createElement("span");
+      label.className = "detail-label";
+      label.textContent = d.label;
+      head.appendChild(label);
+
+      const teaser = document.createElement("span");
+      teaser.className = "detail-teaser";
+      teaser.textContent = d.narrative.length > DETAIL_TEASER_LEN
+        ? d.narrative.slice(0, DETAIL_TEASER_LEN) + "…"
+        : d.narrative;
+      head.appendChild(teaser);
+
+      const chevron = document.createElement("span");
+      chevron.className = "detail-chevron";
+      chevron.textContent = "▸";
+      head.appendChild(chevron);
+
+      drow.appendChild(head);
+
+      const body = document.createElement("div");
+      body.className = "detail-body";
+
+      const narrative = document.createElement("div");
+      narrative.textContent = d.narrative;
+      body.appendChild(narrative);
+
+      if (d.source) {
+        const srow = buildSourceChip(d.source);
+        srow.classList.add("detail-source-row");
+        body.appendChild(srow);
+      }
+
+      drow.appendChild(body);
+
+      head.addEventListener("click", () => drow.classList.toggle("open"));
+      list.appendChild(drow);
+    });
+    col.appendChild(list);
+  }
+
+  // 근거자료가 건별 상세(details) 안에 이미 각각 붙어있으면, 맨 아래에 뭉쳐서
+  // 또 보여줄 필요가 없다 — 상세 항목이 없는 좁은 질문(단일 사실 답변)일 때만 표시
+  if (sources && sources.length > 0 && !(details && details.length > 0)) {
     const label = document.createElement("div");
     label.className = "sources-label";
-    label.textContent = "근거 자료";
-    msg.appendChild(label);
+    label.textContent = "근거 자료 (클릭하면 내용 미리보기)";
+    col.appendChild(label);
 
     const box = document.createElement("div");
     box.className = "sources";
-    sources.forEach(s => {
-      const chip = document.createElement("span");
-      chip.className = "source-chip";
-      chip.textContent = `[${s.데이터유형}] ${s.원본ID}` + (s.기관명 ? ` · ${s.기관명}` : "");
-      box.appendChild(chip);
-    });
-    msg.appendChild(box);
+    sources.forEach(s => box.appendChild(buildSourceChip(s)));
+    col.appendChild(box);
   }
 
-  chatEl.appendChild(msg);
+  row.appendChild(col);
+  chatEl.appendChild(row);
   chatEl.scrollTop = chatEl.scrollHeight;
-  return msg;
+  return row;
 }
 
 function addTyping() {
+  const row = document.createElement("div");
+  row.className = "msg-row bot";
+  row.id = "typing-indicator";
+
+  const avatar = document.createElement("div");
+  avatar.className = "avatar bot";
+  row.appendChild(avatar);
+
   const el = document.createElement("div");
   el.className = "typing";
-  el.id = "typing-indicator";
-  el.textContent = "답변 작성 중...";
-  chatEl.appendChild(el);
+  el.innerHTML = "<span></span><span></span><span></span>";
+  row.appendChild(el);
+
+  chatEl.appendChild(row);
   chatEl.scrollTop = chatEl.scrollHeight;
 }
 
@@ -151,46 +586,73 @@ function removeTyping() {
   if (el) el.remove();
 }
 
-async function sendQuestion() {
-  const question = questionEl.value.trim();
-  if (!question) return;
+function autoResize() {
+  questionEl.style.height = "auto";
+  questionEl.style.height = Math.min(questionEl.scrollHeight, 110) + "px";
+}
 
-  addMessage("user", question);
-  questionEl.value = "";
+async function callChat(question) {
   sendEl.disabled = true;
   addTyping();
-
   try {
     const resp = await fetch("/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question, session_id: sessionId }),
+      body: JSON.stringify({ question, session_id: sessionId, menu_scope: currentMenuScope }),
     });
     removeTyping();
 
     if (!resp.ok) {
-      addMessage("bot", `오류가 발생했습니다. (HTTP ${resp.status})`, null, true);
+      addMessage("bot", `오류가 발생했습니다. (HTTP ${resp.status})`, null, true, question);
       return;
     }
 
     const data = await resp.json();
     sessionId = data.session_id;
-    addMessage("bot", data.answer, data.sources);
+    addMessage("bot", data.answer, data.sources, false, null, data.details);
   } catch (err) {
     removeTyping();
-    addMessage("bot", "서버에 연결할 수 없습니다.", null, true);
+    addMessage("bot", "서버에 연결할 수 없습니다.", null, true, question);
   } finally {
     sendEl.disabled = false;
     questionEl.focus();
   }
 }
 
+function submitQuestion(question) {
+  const row = addMessage("user", question);
+  pushRecentQuestion(question, row);
+  callChat(question);
+}
+
+function sendQuestion() {
+  const question = questionEl.value.trim();
+  if (!question) return;
+  questionEl.value = "";
+  autoResize();
+  submitQuestion(question);
+}
+
 sendEl.addEventListener("click", sendQuestion);
+questionEl.addEventListener("input", autoResize);
+questionEl.addEventListener("compositionstart", () => { composing = true; });
+questionEl.addEventListener("compositionend", () => { composing = false; });
 questionEl.addEventListener("keydown", (e) => {
-  if (e.key === "Enter") sendQuestion();
+  if (e.key === "Enter" && !e.shiftKey) {
+    if (composing || e.isComposing) return;
+    e.preventDefault();
+    sendQuestion();
+  }
 });
 
-addMessage("bot", "안녕하세요. 교부기관 이력관리시스템 챗봇입니다. 기관명, 연도, 담당자·요청자, 심의결과 등으로 이력을 검색할 수 있습니다.");
+menuToggleEl.addEventListener("click", () => shellEl.classList.toggle("sidebar-open"));
+sidebarBackdropEl.addEventListener("click", closeSidebarOnMobile);
+
+renderMenuList();
+renderFaqList();
+renderRecentList();
+
+addMessage("bot", "안녕하세요. 이력관리시스템 챗봇입니다. 기관명, 연도, 담당자·요청자, 심의결과 등으로 이력을 검색할 수 있습니다. 왼쪽 메뉴에서 범위를 고르시거나, 궁금한 점을 바로 입력해보세요.");
 </script>
 </body>
 </html>

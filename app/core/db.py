@@ -14,9 +14,16 @@ def get_connection():
         conn.close()
 
 
-def fetch_all(sql: str) -> list[dict]:
+def fetch_all(sql: str, params: dict | None = None) -> list[dict]:
     with get_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute(sql)
+        cursor.execute(sql, params or {})
         columns = [col[0] for col in cursor.description]
         return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+
+def execute(sql: str, params: dict | None = None) -> None:
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(sql, params or {})
+        conn.commit()

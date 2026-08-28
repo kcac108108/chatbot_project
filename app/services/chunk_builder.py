@@ -23,6 +23,23 @@ def _fmt_date(value) -> str | None:
     return value.strftime("%Y-%m-%d")
 
 
+def _fmt_date_str(value: str | None) -> str | None:
+    """REQ_DTM 등 VARCHAR2(8) "YYYYMMDD" 형식 문자열용 — datetime 객체가 아니라 _fmt_date 못 씀."""
+    if not value or len(value) != 8:
+        return value
+    return f"{value[:4]}-{value[4:6]}-{value[6:]}"
+
+
+def _detail_items(*pairs) -> list[dict]:
+    """근거자료 미리보기용 — 원본 컬럼값을 라벨별로 나눠 저장(값 없으면 제외)."""
+    items = []
+    for label, value in pairs:
+        value = cleanse(value) if isinstance(value, str) else value
+        if value is not None and value != "":
+            items.append({"label": label, "value": str(value)})
+    return items
+
+
 def _normalize_result(value: str | None) -> str | None:
     if value is None:
         return None
@@ -57,6 +74,13 @@ def build_menu1_chunks(rows: list[dict]) -> list[dict]:
                     "사업자번호": row["CRP_NO"],
                     "기관명": row["CRP_NAME"],
                     "기관분류": row["CRP_GBN"],
+                    "세부항목": _detail_items(
+                        ("사업명", row["BUSINESS_NAME"]),
+                        ("법적근거", row["LAW_COMMENT"]),
+                        ("제공목적", row["SUPPORT_COMMENT"]),
+                        ("주요내용", row["CONTENT"]),
+                        ("기관자료", row["ORG_ATT_NAMES"]),
+                    ),
                 },
             })
 
@@ -85,6 +109,19 @@ def build_menu1_chunks(rows: list[dict]) -> list[dict]:
                     "연도": row["REQ_DTM"][:4] if row["REQ_DTM"] else None,
                     "통계종류": row["STS_ISSUE_TYPE"],
                     "수출입구분": row["STS_ISSUE_GBN"],
+                    "세부항목": _detail_items(
+                        ("사업명", row["BUSINESS_NAME"]),
+                        ("신청일", _fmt_date_str(row["REQ_DTM"])),
+                        ("요청구분", row["REQ_GBN"]),
+                        ("통계종류", row["STS_ISSUE_TYPE"]),
+                        ("수출입구분", row["STS_ISSUE_GBN"]),
+                        ("제공항목", row["STS_ISSUE_ITEM"]),
+                        ("전송방식", row["TRNS_MTD"]),
+                        ("제공주기", row["TRNS_CYCLE"]),
+                        ("수수료", row["PAY_AMT"]),
+                        ("요청내용", row["REQ_NOTE"]),
+                        ("제공목적", row["SUPPORT_COMMENT"]),
+                    ),
                 },
             })
 
@@ -126,6 +163,17 @@ def build_menu2_chunks(rows: list[dict]) -> list[dict]:
                 "요청자": row["REQ_PERSON_NAME"],
                 "제공자": row["PROC_PERSON_NAME"],
                 "연도": row["REQ_DTM"][:4] if row["REQ_DTM"] else None,
+                "세부항목": _detail_items(
+                    ("제목", row["TITLE"]),
+                    ("요청자", row["REQ_PERSON_NAME"]),
+                    ("요청일", _fmt_date_str(row["REQ_DTM"])),
+                    ("요청내용", row["REQ_MENT"]),
+                    ("처리내용", row["PROC_MENT"]),
+                    ("제공자", row["PROC_PERSON_NAME"]),
+                    ("제공일", _fmt_date_str(row["PROC_DTM"])),
+                    ("제공방식", row["TRNS_MTD"]),
+                    ("특이사항", row["NOTE"]),
+                ),
             },
         })
     return chunks
@@ -161,6 +209,13 @@ def build_menu3_chunks(rows: list[dict]) -> list[dict]:
             lines.append("댓글:")
             lines.extend(comment_lines)
 
+        comments_value = "\n".join(
+            f"({_fmt_date(row['DTL_CR_DTM'])}) {cleanse(row['FILE_COMMENT'])}"
+            + (f" [첨부: {row['ATT_NAMES']}]" if row["ATT_NAMES"] else "")
+            for row in group
+            if row["FILE_COMMENT"] is not None
+        )
+
         chunks.append({
             "text": "\n".join(l for l in lines if l is not None),
             "metadata": {
@@ -169,6 +224,14 @@ def build_menu3_chunks(rows: list[dict]) -> list[dict]:
                 "담당자": head["USERNM"],
                 "결재자": head["DECIDING_OFFICER"],
                 "연도": str(head["MAIN_CR_DTM"].year) if head["MAIN_CR_DTM"] else None,
+                "세부항목": _detail_items(
+                    ("제목", head["TITLE"]),
+                    ("담당자", head["USERNM"]),
+                    ("결재자", head["DECIDING_OFFICER"]),
+                    ("등록일", _fmt_date(head["MAIN_CR_DTM"])),
+                    ("주요내용", head["PROC_MENT"]),
+                    ("댓글", comments_value or None),
+                ),
             },
         })
     return chunks
@@ -203,6 +266,16 @@ def build_menu4_chunks(rows: list[dict]) -> list[dict]:
                 "연도": row["YEAR"],
                 "차수": row["SEQ"],
                 "심의결과": _normalize_result(row["DISCUSSION_RESULT"]),
+                "세부항목": _detail_items(
+                    ("제목", row["TITLE"]),
+                    ("요청내용", row["REQ_MENT"]),
+                    ("법적근거", row["LAW_COMMENT"]),
+                    ("요청항목", row["REQ_ITEM"]),
+                    ("심의결과", row["DISCUSSION_RESULT"]),
+                    ("결정내용", row["RESULT_CONTENT"]),
+                    ("제공항목", row["PROC_ITEM"]),
+                    ("특이사항", row["NOTE"]),
+                ),
             },
         })
     return chunks

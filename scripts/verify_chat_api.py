@@ -35,7 +35,9 @@ print("=" * 60)
 print("검색 시나리오 (정의서 7장 5번)")
 print("=" * 60)
 
-org = fetch_all("SELECT CRP_NAME FROM HISTORY_ORGANIZATION_INFO WHERE ORGANIZATION_ID = 'ORG0000011'")[0]["CRP_NAME"]
+org = fetch_all(
+    "SELECT CRP_NAME FROM HISTORY_ORGANIZATION_INFO WHERE CRP_NAME IS NOT NULL FETCH FIRST 1 ROWS ONLY"
+)[0]["CRP_NAME"]
 r = ask(f"{org} 관련 이력 알려줘")
 check(f"기관명 검색 — '{org}'", org in r["answer"] and any(s["기관명"] == org for s in r["sources"]),
       f"answer={r['answer'][:60]}...")

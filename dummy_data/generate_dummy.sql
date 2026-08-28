@@ -104,9 +104,18 @@ CREATE OR REPLACE PACKAGE BODY pkg_dummy_gen AS
     );
     v_result VARCHAR2(200) := rand_pick(v_word);
     v_n NUMBER := rand_int(1,2);
+    v_candidate VARCHAR2(50);
+    v_tries NUMBER;
   BEGIN
     FOR k IN 1..v_n LOOP
-      v_result := v_result || ' ' || rand_pick(v_word);
+      v_tries := 0;
+      LOOP
+        v_candidate := rand_pick(v_word);
+        v_tries := v_tries + 1;
+        -- 이미 포함된 단어면 다시 뽑음 (안전장치로 20회 시도 후 강제 종료)
+        EXIT WHEN INSTR(' '||v_result||' ', ' '||v_candidate||' ') = 0 OR v_tries > 20;
+      END LOOP;
+      v_result := v_result || ' ' || v_candidate;
     END LOOP;
     WHILE LENGTHB(v_result) > p_max_len LOOP
       v_result := SUBSTR(v_result, 1, LENGTH(v_result)-1);

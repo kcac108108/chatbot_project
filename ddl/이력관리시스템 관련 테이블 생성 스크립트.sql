@@ -425,3 +425,21 @@ ALTER TABLE TM_ATTFILE ADD (
                 BUFFER_POOL      DEFAULT
                )
   ENABLE VALIDATE);
+
+
+-- ============================================================
+-- 아래부터는 운영 시스템 원본 DDL이 아니라, 챗봇 자체 증분 적재 관리를 위해
+-- 별도로 추가한 테이블이다(CHATBOT 스키마 전용, 운영 이력관리시스템과 무관).
+-- ============================================================
+
+--8. CHATBOT_INGEST_LOG (증분 적재 실행 기록 — 마지막 적재 이후 데이터만 골라 처리하기 위한 기준점)
+
+CREATE TABLE CHATBOT_INGEST_LOG
+(
+  RUN_AT      DATE            NOT NULL,
+  CHUNK_COUNT NUMBER          NOT NULL
+);
+
+COMMENT ON TABLE CHATBOT_INGEST_LOG IS '챗봇 적재 배치 실행 기록 — 증분 적재 시 마지막 실행 시각 조회용';
+COMMENT ON COLUMN CHATBOT_INGEST_LOG.RUN_AT IS '적재 배치 실행(완료) 시각';
+COMMENT ON COLUMN CHATBOT_INGEST_LOG.CHUNK_COUNT IS '해당 실행에서 적재된 청크 수';
