@@ -5,9 +5,17 @@ from qdrant_client.http import models as qmodels
 from app.core.config import CHAT_TOP_K
 from app.core.db import fetch_all
 from app.core.openai_client import chat_parse, embed_texts
-from app.core.vectordb import scan_text_contains
+from app.core.vectordb import find_by_type_and_source, scan_text_contains
 from app.core.vectordb import search as vector_search
-from app.models.schemas import AnswerDetail, ChatResponse, FilterExtraction, GroundedAnswer, QueryAnalysis, SourceItem
+from app.models.schemas import (
+    AnswerDetail,
+    ChatResponse,
+    FilterExtraction,
+    GroundedAnswer,
+    QueryAnalysis,
+    RelatedAttachment,
+    SourceItem,
+)
 from app.services import session_store
 
 QUERY_ANALYSIS_PROMPT = """너는 검색 전처리기다. 아래 대화 이력을 참고해 현재 질문을 분석하라.
@@ -104,6 +112,25 @@ groups 필드만 정확히 채워라.
   [자료]에 없거나 질문과 무관한 내용은 넣지 마라. 각 건은 화면에서 독립된 항목으로 이미
   구분되어 보이므로, "첫번째는/두번째는" 같은 서수 표현으로 시작할 필요 없이 그 건 자체를
   바로 설명하면 된다.
+  예외 — [자료] 표시가 "[OO첨부 ...]"로 시작하는 첨부파일 내용 출처는 위 "짧게" 규칙을
+  적용하지 마라. 이런 자료는 원본 항목이 표로 따로 안 보이고 narrative가 유일한 설명 통로라서,
+  요약만 하고 구체적 사실을 빠뜨리면 그 정보는 답변 어디에도 안 남는다. 반드시 아래를 지켜라.
+  아래 세 가지를 전부 빠짐없이 담아야 한다. 하나라도 자료에 있는데 narrative에서 빠지면
+  틀린 답변으로 간주한다.
+  1) 숫자: 자료 안에 나오는 구체적 숫자(건수·금액·비율 등)를 그대로 명시하라. "건수와 금액이
+     정리되어 있습니다"처럼 숫자를 언급 안 하고 뭉뚱그리는 표현은 금지한다.
+  2) 배경: 그 내용이 왜/무엇을 근거로 만들어졌는지(관련 지침·법령 개정, 목적 등)가 자료에
+     있으면 반드시 포함하라. 이게 가장 많이 빠뜨리는 부분이니 특히 신경 써라.
+  3) 조건: 적용기간·적용대상처럼 자료에 명시된 조건도 포함하라.
+  세 가지를 다 담은 예시 — 자료: "○ ｢무역통계 작성 및 교부에 관한 지침｣ 개정에 따라
+  중소기업 수수료 면제 적용된 내역(22년 8월~23년 8월) / 중소기업 수수료 면제 | 1,397건 |
+  161,290,225원". 이 경우 올바른 narrative는: "무역통계 작성 및 교부에 관한 지침 개정에
+  따라 2022년 8월부터 2023년 8월까지 적용된 중소기업 수수료 면제 내역으로, 1,397건이
+  면제되어 161,290,225원이 감면되었습니다." — 이렇게 배경(지침 개정)·기간·숫자가 한 문장에
+  다 들어가야 한다. "1,397건이 면제되어 161,290,225원이 감면되었습니다"처럼 숫자만 쓰고
+  배경을 뺀 문장은 틀린 예시다.
+  문장 수 제한(1~2문장)은 이 예외에는 적용되지 않는다 — 위 내용을 다 담느라 3~6문장이 되어도
+  된다. 다만 자료에 없는 내용을 지어내진 마라.
 
 문장 어미는 "~입니다/~했습니다/~합니다" 등을 자연스럽게 섞고, "~다/~였다"로만 반복해서 끝맺는
 단조로운 보고서체를 피하라. 이 규칙은 summary와 groups 모두에 적용된다.
@@ -121,16 +148,58 @@ def _render_history_text(grounded: GroundedAnswer) -> str:
     return "\n".join(lines)
 
 
+# 메인(이력) 데이터유형 -> 그 이력에 딸린 첨부내용의 데이터유형. 사용자가 "이력을 보여줄 때
+# 관련 첨부도 같이 보고 싶다"고 요청 — 원본ID가 같은 첨부내용 청크를 찾아서 소스에 묶어준다.
+_ATTACHMENT_TYPE_OF = {
+    "기관정보": "기관정보첨부",
+    "신청이력": "신청이력첨부",
+    "외부요청": "외부요청첨부",
+    "내부자료": "내부자료첨부",
+    "심의위원회": "심의위원회첨부",
+}
+
+
+def _find_related_attachments(data_type: str, source_id: str) -> list[RelatedAttachment]:
+    attachment_type = _ATTACHMENT_TYPE_OF.get(data_type)
+    if not attachment_type:
+        return []
+    chunks = find_by_type_and_source(attachment_type, source_id)
+    seen_files: set[str] = set()
+    related = []
+    for chunk in chunks:
+        filename = chunk.get("첨부파일명") or "첨부파일"
+        if filename in seen_files:
+            continue  # 큰 파일이 여러 조각으로 쪼개져 있으면 파일명이 중복되니 하나로만 표시
+        seen_files.add(filename)
+        if chunk.get("경로전용"):
+            # 테이블/SQL 정보 파일은 정보가치가 낮다고 판단해 내용은 안 보여주되, 존재
+            # 자체는 알 수 있게 목록엔 남겨두고 대신 다운로드를 제공한다. 서버 내부 경로
+            # 문자열은 화면에 굳이 노출할 필요 없다는 사용자 확인에 따라 텍스트에선 뺌
+            # (파일경로 필드 자체는 다운로드 링크 생성에 필요해 그대로 둠).
+            file_path = chunk.get("파일경로")
+            preview = "내용은 제공하지 않는 자료입니다. 아래에서 파일을 다운로드할 수 있습니다."
+            related.append(RelatedAttachment(첨부파일명=filename, 미리보기=preview, 파일경로=file_path))
+        else:
+            # 원문 전체를 그대로 보여주면 "번잡스럽고 정리 안 된" 느낌이라는 피드백에 따라,
+            # 적재 시점에 미리 만들어둔 요약(요약)을 우선 사용 — 옛 데이터라 요약이 없으면
+            # (재적재 전) 원문 미리보기로 폴백.
+            preview = chunk.get("요약") or _preview(chunk.get("text"), attachment_type) or ""
+            related.append(RelatedAttachment(첨부파일명=filename, 미리보기=preview))
+    return related
+
+
 def _resolve_source(idx: int, results: list[dict]) -> SourceItem | None:
     if not (1 <= idx <= len(results)):
         return None
     payload = results[idx - 1]
+    data_type = payload["데이터유형"]
     return SourceItem(
-        데이터유형=payload["데이터유형"],
+        데이터유형=data_type,
         원본ID=payload["원본ID"],
         기관명=payload.get("기관명"),
-        미리보기=_preview(payload.get("text")),
+        미리보기=_preview(payload.get("text"), data_type),
         세부항목=payload.get("세부항목") or [],
+        관련첨부=_find_related_attachments(data_type, payload["원본ID"]),
     )
 
 
@@ -151,13 +220,19 @@ def _build_details(grounded: GroundedAnswer, results: list[dict]) -> list[Answer
 
 _NULLISH = {"null", "none", "n/a", "미상", ""}
 _PREVIEW_LEN = 150
+# 첨부파일 출처는 "세부항목" 표가 없어서 narrative(요약)와 미리보기가 사실상 유일한 설명
+# 통로다. narrative가 원문의 핵심(배경·기간 등)을 놓치는 경우가 실제로 반복 확인됐는데,
+# 150자짜리 짧은 미리보기로는 그 내용이 잘려서 아예 어디에도 안 남는 문제가 생긴다 —
+# 첨부 출처만 훨씬 길게(사실상 전문) 보여줘서, 요약이 불완전해도 원문에서 직접 확인 가능하게 한다.
+_ATTACHMENT_PREVIEW_LEN = 3000
 
 
-def _preview(text: str | None) -> str | None:
+def _preview(text: str | None, data_type: str | None = None) -> str | None:
     if not text:
         return None
     text = text.strip()
-    return text if len(text) <= _PREVIEW_LEN else text[:_PREVIEW_LEN] + "…"
+    limit = _ATTACHMENT_PREVIEW_LEN if (data_type or "").endswith("첨부") else _PREVIEW_LEN
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 _PERSON_ROLE_FIELDS = {"요청자", "제공자", "담당자", "결재자"}
@@ -462,7 +537,9 @@ def _list_field_answer(field: str, menu: str | None) -> str:
 
     chosen_menu = menu if menu in table_map else next(iter(table_map))
     table, column = table_map[chosen_menu]
-    rows = fetch_all(f"SELECT {column} FROM {table} WHERE {column} IS NOT NULL ORDER BY {column}")
+    # DISTINCT — 같은 값(예: 업체명)이 여러 건에 걸쳐 반복되면(관세청 8건 등) 그 개수만큼
+    # 똑같은 이름이 나열되는 문제 방지. "업체명 목록"이 원하는 건 건수가 아니라 고유한 이름들.
+    rows = fetch_all(f"SELECT DISTINCT {column} FROM {table} WHERE {column} IS NOT NULL ORDER BY {column}")
     values = [r[column] for r in rows]
     particle = _FIELD_TOPIC_PARTICLE.get(field, "은")
     return f"{_MENU_LABELS[chosen_menu]}의 {field}{particle} 총 {len(values)}개입니다.\n\n" + ", ".join(values)

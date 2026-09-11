@@ -18,12 +18,19 @@ class DetailField(BaseModel):
     value: str
 
 
+class RelatedAttachment(BaseModel):
+    첨부파일명: str
+    미리보기: str
+    파일경로: Optional[str] = None
+
+
 class SourceItem(BaseModel):
     데이터유형: str
     원본ID: str
     기관명: Optional[str] = None
     미리보기: Optional[str] = None
     세부항목: list[DetailField] = Field(default_factory=list)
+    관련첨부: list[RelatedAttachment] = Field(default_factory=list)
 
 
 class AnswerDetail(BaseModel):

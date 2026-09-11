@@ -29,3 +29,6 @@ OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
 
 # 정의서 6장: 벡터 검색 top 5~8건
 CHAT_TOP_K = int(os.getenv("CHAT_TOP_K", "6"))
+
+# 2단계: 첨부파일 실물 루트 경로 (DOCUCD별 하위폴더를 담은 디렉터리)
+ATTACHMENT_BASE_DIR = os.getenv("ATTACHMENT_BASE_DIR")

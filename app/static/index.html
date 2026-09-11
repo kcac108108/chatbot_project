@@ -217,6 +217,36 @@
   .field-label { flex: 0 0 64px; color: var(--mint); font-weight: 700; }
   .field-value { flex: 1; min-width: 0; color: var(--ink-dark-soft); line-height: 1.55; white-space: pre-wrap; }
 
+  .attachment-list {
+    display: none; margin-top: 8px; padding-top: 8px;
+    border-top: 1px dashed rgba(255,255,255,.14);
+  }
+  .source-row.open .attachment-list { display: block; }
+  .attachment-list-label {
+    font-size: 10px; color: var(--ink-dark-soft); margin-bottom: 6px;
+    text-transform: uppercase; letter-spacing: .04em;
+  }
+  .attachment-item { margin-bottom: 6px; }
+  .attachment-item:last-child { margin-bottom: 0; }
+  .attachment-chip {
+    font-size: 10.5px; background: rgba(255,255,255,.05); color: var(--ink-dark-soft);
+    border: 1px solid rgba(255,255,255,.16); border-radius: 999px; padding: 3px 9px;
+    cursor: pointer; font-family: inherit; transition: background .15s, border-color .15s;
+  }
+  .attachment-chip:hover { background: rgba(255,255,255,.09); border-color: rgba(255,255,255,.3); }
+  .attachment-preview {
+    display: none; margin-top: 4px; padding: 8px 10px;
+    background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.08);
+    border-radius: 8px; font-size: 11px; color: var(--ink-dark-soft); line-height: 1.5; white-space: pre-wrap;
+  }
+  .attachment-item.open .attachment-preview { display: block; }
+  .attachment-download-link {
+    display: inline-block; margin-top: 8px; font-size: 11px; font-weight: 600;
+    color: var(--mint); text-decoration: none; border: 1px solid rgba(52,201,163,.4);
+    border-radius: 999px; padding: 4px 10px; transition: background .15s, border-color .15s;
+  }
+  .attachment-download-link:hover { background: rgba(52,201,163,.14); border-color: rgba(52,201,163,.6); }
+
   .typing {
     display: flex; align-items: center; gap: 4px;
     padding: 12px 16px; background: var(--bot-bubble);
@@ -348,6 +378,8 @@ function buildSourceChip(s) {
   chip.textContent = `[${s.데이터유형}] ${s.원본ID}` + (s.기관명 ? ` · ${s.기관명}` : "");
   srow.appendChild(chip);
 
+  let hasToggleContent = false;
+
   if (s.세부항목 && s.세부항목.length > 0) {
     const list = document.createElement("div");
     list.className = "field-list";
@@ -368,12 +400,65 @@ function buildSourceChip(s) {
       list.appendChild(row);
     });
     srow.appendChild(list);
-    chip.addEventListener("click", () => srow.classList.toggle("open"));
+    hasToggleContent = true;
   } else if (s.미리보기) {
     const preview = document.createElement("div");
     preview.className = "source-preview";
     preview.textContent = s.미리보기;
     srow.appendChild(preview);
+    hasToggleContent = true;
+  }
+
+  // 이 이력에 딸린 첨부파일 내용 — 원본ID로 연결된 첨부내용 청크가 있으면 같이 보여준다.
+  // 첨부 하나하나도 독립적으로 펼쳐볼 수 있게 별도 토글을 준다.
+  if (s.관련첨부 && s.관련첨부.length > 0) {
+    const attList = document.createElement("div");
+    attList.className = "attachment-list";
+
+    const label = document.createElement("div");
+    label.className = "attachment-list-label";
+    label.textContent = `관련 첨부파일 (${s.관련첨부.length})`;
+    attList.appendChild(label);
+
+    s.관련첨부.forEach(att => {
+      const item = document.createElement("div");
+      item.className = "attachment-item";
+
+      const attChip = document.createElement("button");
+      attChip.className = "attachment-chip";
+      attChip.type = "button";
+      attChip.textContent = att.첨부파일명;
+      item.appendChild(attChip);
+
+      const attPreview = document.createElement("div");
+      attPreview.className = "attachment-preview";
+      attPreview.textContent = att.미리보기;
+      item.appendChild(attPreview);
+
+      // 내용은 안 보여주기로 한 자료(테이블/SQL 정보성)는 요약 대신 파일 자체를
+      // 내려받을 수 있는 링크를 추가로 보여준다.
+      if (att.파일경로) {
+        const downloadLink = document.createElement("a");
+        downloadLink.className = "attachment-download-link";
+        downloadLink.href = `/attachment-download?file_path=${encodeURIComponent(att.파일경로)}`;
+        downloadLink.textContent = "파일 다운로드";
+        downloadLink.addEventListener("click", (e) => e.stopPropagation());
+        attPreview.appendChild(downloadLink);
+      }
+
+      attChip.addEventListener("click", (e) => {
+        e.stopPropagation();
+        item.classList.toggle("open");
+      });
+
+      attList.appendChild(item);
+    });
+
+    srow.appendChild(attList);
+    hasToggleContent = true;
+  }
+
+  if (hasToggleContent) {
     chip.addEventListener("click", () => srow.classList.toggle("open"));
   } else {
     chip.style.cursor = "default";
