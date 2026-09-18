@@ -47,6 +47,13 @@ _PATH_ONLY_FILENAMES = {
     # 이 사건과 무관한 일반 SQL 기술 튜토리얼(2026-09 확인)
     "한국무역통계진흥원 자사실적정보 4G 항목정의서_20231114_업데이트중.xlsx",
     "Analytic Function.doc",
+    # 신청이력첨부·내부자료 엑셀 재검토(2026-09-18) — 사용자 판단으로 제외 확정.
+    # "목록통관+수출목록 변환신고"만 DB 컬럼정의 카탈로그(TABLE_NAME/COLUMN_NAME 패턴)이고
+    # 나머지 3건은 실제 업무 데이터였으나, 사용자가 챗봇 정보가치 기준으로 함께 제외 판단함.
+    "TIPA 분기별 금액리스트(2022년).xlsx",
+    "TIPA 분기별 금액리스트(2021년).xlsx",
+    "효성계열사 전송 오류 확인 및 재전송_20240923.xlsx",
+    "목록통관+수출목록 변환신고.xlsx",
 }
 
 
@@ -95,22 +102,41 @@ class _AttachmentSummary(BaseModel):
 # (실제로 40만자짜리 파일이 있어 전문을 그대로 넣으면 한도를 넘길 수 있음)
 _SUMMARIZE_INPUT_LIMIT = 12000
 
-_SUMMARIZE_PROMPT = (
+_SUMMARIZE_PROMPT_BASE = (
     "다음은 첨부파일에서 추출한 원문 내용이다. 챗봇 화면에 보여줄 간략한 요약으로 정리하라.\n"
     "- 반드시 포함: 구체적 수치(건수·금액 등), 배경/근거(지침·법령 개정 등 왜 이 내용이 생겼는지), 적용 기간·조건\n"
-    "- 항목 나열이 아니라 자연스러운 문장 3~5개로 서술\n"
+    "- 항목 나열이 아니라 자연스러운 문장으로 서술\n"
     "- 원문에 없는 내용을 지어내지 마라\n"
-    "- 200~400자 내외로 작성"
 )
+
+# 원문 길이가 길수록 담아야 할 정보(사건·수치·조건)도 많아지므로, 요약 분량도 원문 길이에
+# 비례해서 늘어나도록 구간을 나눈다 — 짧은 문서를 억지로 늘리거나 긴 문서를 3~5문장으로
+# 눌러 담아 정보가 유실되는 것을 방지(사용자 피드백, 2026-09-18).
+_SUMMARIZE_LENGTH_TIERS = [
+    (500, "1~2문장, 80~150자 내외로 작성"),
+    (2000, "2~3문장, 150~300자 내외로 작성"),
+    (5000, "3~5문장, 200~400자 내외로 작성"),
+    (9000, "5~8문장, 400~700자 내외로 작성"),
+    (float("inf"), "8~12문장, 700~1000자 내외로 작성"),
+]
+
+
+def _summarize_length_guide(length: int) -> str:
+    for threshold, guide in _SUMMARIZE_LENGTH_TIERS:
+        if length <= threshold:
+            return guide
+    return _SUMMARIZE_LENGTH_TIERS[-1][1]
 
 
 def _summarize_attachment(text: str, filename: str) -> str:
     """첨부파일 원문 전체를 그대로 보여주면 '번잡스럽고 정리 안 된' 느낌이라는 사용자
-    피드백에 따라, 적재 시점에 핵심만 추린 짧은 요약을 미리 만들어 저장해둔다."""
+    피드백에 따라, 적재 시점에 핵심만 추린 요약을 미리 만들어 저장해둔다. 요약 분량은
+    원문 길이에 맞춰 조절한다(짧은 문서=짧은 요약, 긴 문서=더 여유로운 요약)."""
     truncated = text if len(text) <= _SUMMARIZE_INPUT_LIMIT else text[:_SUMMARIZE_INPUT_LIMIT]
+    prompt = _SUMMARIZE_PROMPT_BASE + f"- {_summarize_length_guide(len(truncated))}"
     result = chat_parse(
         messages=[
-            {"role": "system", "content": _SUMMARIZE_PROMPT},
+            {"role": "system", "content": prompt},
             {"role": "user", "content": f"[파일명: {filename}]\n{truncated}"},
         ],
         response_format=_AttachmentSummary,
