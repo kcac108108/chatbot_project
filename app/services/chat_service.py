@@ -157,6 +157,7 @@ _ATTACHMENT_TYPE_OF = {
     "내부자료": "내부자료첨부",
     "심의위원회": "심의위원회첨부",
 }
+_BASE_TYPE_OF = {v: k for k, v in _ATTACHMENT_TYPE_OF.items()}
 
 
 def _find_related_attachments(data_type: str, source_id: str) -> list[RelatedAttachment]:
@@ -193,6 +194,27 @@ def _resolve_source(idx: int, results: list[dict]) -> SourceItem | None:
         return None
     payload = results[idx - 1]
     data_type = payload["데이터유형"]
+    source_id = payload["원본ID"]
+
+    # 첨부 청크가 검색의 직접 출처로 잡히면, 그 첨부 하나만 뚝 떼서 보여주지 않고 부모
+    # 이력(기관정보/신청이력/외부요청/내부자료/심의위원회)의 표를 메인으로 보여주고 실제
+    # 매칭된 첨부는 관련첨부로 묶는다 — 부모 이력엔 항상 정해진 컬럼(세부항목 표)이 있어
+    # 형태가 일관되고, 첨부만 단독으로 나올 때보다 깔끔하다는 사용자 확인(2026-09-21)에 따름.
+    base_type = _BASE_TYPE_OF.get(data_type)
+    if base_type:
+        parents = find_by_type_and_source(base_type, source_id, limit=1)
+        if parents:
+            parent = parents[0]
+            return SourceItem(
+                데이터유형=base_type,
+                원본ID=source_id,
+                기관명=parent.get("기관명"),
+                미리보기=_preview(parent.get("text"), base_type),
+                세부항목=parent.get("세부항목") or [],
+                관련첨부=_find_related_attachments(base_type, source_id),
+            )
+        # 부모 레코드를 못 찾으면(데이터 정합성 예외 상황) 기존처럼 첨부 자체를 보여준다.
+
     # 첨부 청크가 "관련첨부"로 딸려 나올 때는 사전 생성 요약을 우선 쓰도록 돼 있었는데
     # (_find_related_attachments), 첨부 청크 자체가 검색의 주 출처로 잡힐 때는 이 우선순위가
     # 빠져있어 항상 원문(최대 3,000자)이 그대로 노출되는 문제가 재현됨(2026-09-21, 사용자가
@@ -201,11 +223,11 @@ def _resolve_source(idx: int, results: list[dict]) -> SourceItem | None:
     preview = payload.get("요약") or _preview(payload.get("text"), data_type)
     return SourceItem(
         데이터유형=data_type,
-        원본ID=payload["원본ID"],
+        원본ID=source_id,
         기관명=payload.get("기관명"),
         미리보기=preview,
         세부항목=payload.get("세부항목") or [],
-        관련첨부=_find_related_attachments(data_type, payload["원본ID"]),
+        관련첨부=_find_related_attachments(data_type, source_id),
     )
 
 
