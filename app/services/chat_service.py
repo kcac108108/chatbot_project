@@ -234,15 +234,32 @@ def _resolve_source(idx: int, results: list[dict]) -> SourceItem | None:
 def _build_details(grounded: GroundedAnswer, results: list[dict]) -> list[AnswerDetail]:
     if grounded.no_result:
         return []
-    if len(grounded.groups) == 1:
+
+    # 첨부가 부모 이력으로 승격되면서(_resolve_source), LLM이 부모 레코드와 그 첨부를
+    # 서로 다른 [자료]로 보고 별도 그룹 2개를 만들어도 카드는 결국 같은 (데이터유형,원본ID)로
+    # 승격된다 — sources 목록은 이미 이 키로 중복을 거르지만, 여기(건별 상세 카드 목록)는
+    # 안 거르고 있어서 같은 내용이 "N번째 건"으로 두 번 나올 수 있었음(2026-09-21 재현:
+    # WTO 관련 질문에서 부모+첨부 겹침 3건 확인). 그룹 단계에서도 동일하게 중복 제거한다.
+    seen: set[tuple[str, str]] = set()
+    resolved: list[tuple] = []
+    for group in grounded.groups:
+        source = _resolve_source(group.source_index, results)
+        key = (source.데이터유형, source.원본ID) if source else None
+        if key is not None:
+            if key in seen:
+                continue
+            seen.add(key)
+        resolved.append((group, source))
+
+    if len(resolved) == 1:
         # 그룹이 하나뿐일 때 "1번째 건"으로 라벨링하면, 사용자가 "두번째" 등 특정 건을
         # 콕 집어 물어서 그 건 하나만 온 경우와 혼동됨(실제로는 N번째 건인데 항상 1번으로
         # 보임) — 여러 건일 때만 순번을 매긴다
-        group = grounded.groups[0]
-        return [AnswerDetail(label="상세", narrative=group.narrative, source=_resolve_source(group.source_index, results))]
+        group, source = resolved[0]
+        return [AnswerDetail(label="상세", narrative=group.narrative, source=source)]
     return [
-        AnswerDetail(label=f"{i}번째 건", narrative=group.narrative, source=_resolve_source(group.source_index, results))
-        for i, group in enumerate(grounded.groups, start=1)
+        AnswerDetail(label=f"{i}번째 건", narrative=group.narrative, source=source)
+        for i, (group, source) in enumerate(resolved, start=1)
     ]
 
 
