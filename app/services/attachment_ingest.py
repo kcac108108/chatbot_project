@@ -5,6 +5,7 @@
 import uuid
 from pathlib import Path
 
+import tiktoken
 from pydantic import BaseModel
 from qdrant_client.http import models as qmodels
 
@@ -25,13 +26,17 @@ _DOCUCD_MAP = {
     "C0002014": ("HISTORY_INTERNAL_INFO", "REQUEST_ID", "내부자료첨부"),
 }
 
-# text-embedding-3-large 한도(8,191토큰) 대비 여유 있게 — 한글은 토큰당 글자수가
-# 들쭉날쭉해서 안전하게 잡음. 이보다 길면 여러 조각으로 쪼갠다.
-CHUNK_CHAR_LIMIT = 6000
-# 1~4번 메뉴는 청크가 수백 자라 BATCH_SIZE=100이 안전했지만, 첨부 청크는 최대
-# CHUNK_CHAR_LIMIT까지 길어서 그대로 쓰면 OpenAI 요청 한도(30만 토큰/요청)를 넘길 수
-# 있음(실제로 재현됨) — 훨씬 작게 잡는다.
+# 1~4번 메뉴는 청크가 수백 자라 BATCH_SIZE=100이 안전했지만, 첨부 청크는 훨씬 길어서
+# 그대로 쓰면 OpenAI 요청 한도(30만 토큰/요청)를 넘길 수 있음(실제로 재현됨) — 작게 잡는다.
 BATCH_SIZE = 20
+
+# text-embedding-3-large 한도(8,191토큰) 대비 여유 있게(헤더 텍스트가 더해지는 것 감안).
+# 애초에 글자 수(6,000자) 기준으로 나눴다가, 실제 실행 중 한 청크가 8,192토큰 한도를
+# 넘겨 배치 임베딩이 통째로 실패하는 걸 발견함(2026-09-21) — 한글/숫자·기호 비중에 따라
+# 글자당 토큰 수가 들쭉날쭉해서 글자 수 기준은 안전을 보장 못함. tiktoken으로 실제
+# 토큰 수를 세어 나누는 방식으로 교체.
+_CHUNK_TOKEN_LIMIT = 7500
+_TOKENIZER = tiktoken.encoding_for_model("text-embedding-3-large")
 
 
 # 관리자 확인(2026-09-02, 2026-09-03 방식 변경): DB 테이블/컬럼 카탈로그성 자료(적재테이블
@@ -84,10 +89,11 @@ def _review_filename(att: dict, path: Path) -> str:
     return f"{att['ATTFILE_ID']}__{att['ATTFILE_NUM']}__{path.stem}.txt"
 
 
-def _split_chunks(text: str, limit: int = CHUNK_CHAR_LIMIT) -> list[str]:
-    if len(text) <= limit:
+def _split_chunks(text: str, limit: int = _CHUNK_TOKEN_LIMIT) -> list[str]:
+    tokens = _TOKENIZER.encode(text)
+    if len(tokens) <= limit:
         return [text]
-    return [text[i : i + limit] for i in range(0, len(text), limit)]
+    return [_TOKENIZER.decode(tokens[i : i + limit]) for i in range(0, len(tokens), limit)]
 
 
 def _point_id(data_type: str, source_id: str) -> str:
