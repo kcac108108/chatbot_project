@@ -375,9 +375,14 @@ def _search(
     if not results and query_filter is not None:
         # 그래도 없으면 나머지 필터는 다 제거하고 재검색한다. 단, 메뉴 스코프(allowed_data_types)는
         # 사용자가 웹 화면에서 명시적으로 고정한 것이라 검색이 실패해도 절대 벗어나지 않는다.
+        # limit도 처음에 정한 값(narrowing filter가 있었으면 20)을 그대로 유지한다 — 필터를
+        # 다 지웠다고 6으로 좁히면, 특정 기관·인물을 정확히 지목한 질문일수록(원래 20을 써야
+        # 할 상황) 오히려 후보가 줄어 진짜 정답이 top-6 밖으로 밀리는 문제가 재현됨(예: "한국
+        # 무역통계진흥원 홈페이지 보안 취약점 점검" — 기관명 필터가 있었는데도 최종 폴백에서
+        # 6개로 잘려 정답인 내부자료첨부가 순위 밖으로 밀림, 2026-09-21 발견).
         fallback_filter = _scope_only_filter(allowed_data_types) if allowed_data_types else None
-        results = vector_search(vector, fallback_filter, CHAT_TOP_K)
-        limit_used = CHAT_TOP_K
+        results = vector_search(vector, fallback_filter, search_limit)
+        limit_used = search_limit
 
     # 검색 결과 수가 이번에 사용한 상한과 같으면, 실제로는 더 있는데 상한에 걸려 잘렸을 수
     # 있다는 뜻이다("관세청 8건" 버그를 상한을 올려 고쳤더니, 68건짜리 큰 기관에서는 여전히
