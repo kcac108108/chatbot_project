@@ -85,3 +85,33 @@ def scan_text_contains(keyword: str, limit: int) -> list[dict]:
         if offset is None:
             break
     return matches
+
+
+def scan_field_contains(field: str, value: str, limit: int) -> list[dict]:
+    """본문 전체가 아니라 메타데이터의 특정 필드 값 안에 부분 문자열로 포함됐는지만 본다.
+    요청자/제공자/담당자/결재자처럼 한 필드에 여러 사람이 콤마로 같이 저장된 경우
+    (예: 담당자="김인태, 전봉석")를 잡기 위한 것 — scan_text_contains로 본문 전체를
+    스캔하면, 그 이름이 이 필드가 아니라 다른 곳(예: 서명란, 참고 언급)에 흔하게 등장하는
+    바람에 상한(limit)이 무관한 매치들로 먼저 채워져 정작 찾아야 할 레코드가 밀려나는
+    문제가 재현됨(2026-09-21, "전봉석"이 여러 문서의 담당자 서명으로 흔히 등장). 필드
+    값만 좁혀서 보면 이런 노이즈 없이 정확히 그 역할로 저장된 레코드만 찾는다."""
+    normalized_value = "".join(value.split())
+    matches: list[dict] = []
+    offset = None
+    while True:
+        points, offset = _client.scroll(
+            collection_name=QDRANT_COLLECTION,
+            limit=200,
+            offset=offset,
+            with_payload=True,
+            with_vectors=False,
+        )
+        for p in points:
+            field_value = p.payload.get(field) or ""
+            if normalized_value in "".join(field_value.split()):
+                matches.append(p.payload)
+                if len(matches) >= limit:
+                    return matches
+        if offset is None:
+            break
+    return matches

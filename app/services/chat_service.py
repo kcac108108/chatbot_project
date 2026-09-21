@@ -5,7 +5,7 @@ from qdrant_client.http import models as qmodels
 from app.core.config import CHAT_TOP_K
 from app.core.db import fetch_all
 from app.core.openai_client import chat_parse, embed_texts
-from app.core.vectordb import find_by_type_and_source, scan_text_contains
+from app.core.vectordb import find_by_type_and_source, scan_field_contains, scan_text_contains
 from app.core.vectordb import search as vector_search
 from app.models.schemas import (
     AnswerDetail,
@@ -242,6 +242,21 @@ _PERSON_ROLE_FIELDS = {"요청자", "제공자", "담당자", "결재자"}
 _MENU1_ONLY_FIELDS = {"통계종류", "수출입구분"}
 _MENU1_DATA_TYPES = {"기관정보", "신청이력"}
 
+# 통계종류는 사람이 손으로 입력한 자유 텍스트라 같은 개념인데 표기가 갈라져 있다(실측 확인,
+# 2026-09-21) — 정확매칭만 쓰면 사용자가 하나를 물어도 나머지 동의어로 저장된 레코드를
+# 전부 놓친다. 그룹 안 값이면 전부 OR로 같이 찾는다.
+_STATISTICS_TYPE_SYNONYMS = [
+    {"통관기초", "통관기초통계", "통관기초자료"},
+    {"일반가공, 세부가공", "일반 및 세부가공", "세부 및 일반가공"},
+]
+
+
+def _resolve_statistics_type_group(value: str) -> list[str]:
+    for group in _STATISTICS_TYPE_SYNONYMS:
+        if value in group:
+            return sorted(group)
+    return [value]
+
 
 def _build_filter(
     extracted: FilterExtraction, allowed_data_types: set[str] | None = None
@@ -296,7 +311,15 @@ def _build_filter(
     conditions = []
     role_conditions = []
     for field, value in values.items():
-        cond = qmodels.FieldCondition(key=field, match=qmodels.MatchValue(value=value))
+        if field == "통계종류":
+            group = _resolve_statistics_type_group(value)
+            cond = (
+                qmodels.FieldCondition(key=field, match=qmodels.MatchValue(value=group[0]))
+                if len(group) == 1
+                else qmodels.FieldCondition(key=field, match=qmodels.MatchAny(any=group))
+            )
+        else:
+            cond = qmodels.FieldCondition(key=field, match=qmodels.MatchValue(value=value))
         if role_conflict and field in _PERSON_ROLE_FIELDS:
             role_conditions.append(cond)
         else:
@@ -461,21 +484,27 @@ def _search(
                 merged.append(payload)
 
     # 요청자/제공자/담당자/결재자는 키워드와 같은 이유로 전수 스캔 안전망을 둔다 — DB엔
-    # "박상용 계장"처럼 직함이 붙어 저장돼 있는데 LLM은 "박상용"(직함 없는 이름)만 뽑아서,
-    # Qdrant 정확매칭(MatchValue)이 항상 실패 → 전체 필터 제거 폴백(top-6)으로 떨어져 개수가
-    # 줄어드는 문제가 실데이터에서 재현됨("요청자 중에 박상용 있어?" 8건 중 6건만 반환).
-    # 정확매칭 대신 본문에 그 이름이 실제로 포함된 건을 전수 스캔해서 보완한다.
+    # "박상용 계장"처럼 직함이 붙어 저장돼 있거나 "김인태, 전봉석"처럼 여러 명이 한 필드에
+    # 콤마로 같이 저장돼 있는데 LLM은 이름 하나만 뽑아서, Qdrant 정확매칭(MatchValue)이
+    # 항상 실패 → 전체 필터 제거 폴백(top-6)으로 떨어져 개수가 줄어드는 문제가 실데이터에서
+    # 재현됨("요청자 중에 박상용 있어?" 8건 중 6건만 반환). 정확매칭 대신 그 이름이 담당자
+    # 등 해당 필드 값에 실제로 포함된 건을 전수 스캔해서 보완한다.
+    # 본문 전체(scan_text_contains)가 아니라 그 필드 값만 본다(scan_field_contains) — 흔한
+    # 이름은 서명란 등 본문 여기저기에 많이 등장해서, 본문 전체를 스캔하면 무관한 매치들이
+    # 스캔 상한(KEYWORD_SCAN_LIMIT)을 먼저 채워버려 정작 그 필드에 저장된 진짜 레코드를
+    # 놓치는 문제가 재현됨(2026-09-21, "전봉석" 30건 스캔 전부 무관한 문서, 정작 담당자
+    # 필드에 "김인태, 전봉석"으로 저장된 레코드는 상한 밖으로 밀림).
     # 기관명은 여기 포함하지 않는다 — 기관명은 원래 정확매칭이 잘 되는 데다(직함 같은 접미사
-    # 문제가 없음), 기관명을 본문 전수 스캔하면 그 이름이 다른 기관의 이력 본문에 참고용으로
-    # 언급된 것까지 걸려서(예: "관세청"은 무역 관련 다른 기관 이력에도 자주 언급됨) 결과가
-    # 불필요하게 부풀거나(응답 지연 재발 위험) 스캔이 자기 상한에 걸려 오히려 "총 8건"처럼
-    # 이미 완전한 답에 "일부일 수 있다"는 잘못된 경고가 붙는 문제가 재현됨(실측 확인).
+    # 문제가 없음), 기관명을 필드 스캔하면 그 이름이 다른 기관의 이력에 참고용으로 언급된
+    # 것까지 걸려서(예: "관세청"은 무역 관련 다른 기관 이력에도 자주 언급됨) 결과가 불필요
+    # 하게 부풀거나(응답 지연 재발 위험) 스캔이 자기 상한에 걸려 오히려 "총 8건"처럼 이미
+    # 완전한 답에 "일부일 수 있다"는 잘못된 경고가 붙는 문제가 재현됨(실측 확인).
     for narrowing_field in _PERSON_ROLE_FIELDS:
         name = getattr(analysis.filters, narrowing_field, None)
         if not name:
             continue
         scan_ran = True
-        scan_results = scan_text_contains(name, KEYWORD_SCAN_LIMIT)
+        scan_results = scan_field_contains(narrowing_field, name, KEYWORD_SCAN_LIMIT)
         if len(scan_results) >= KEYWORD_SCAN_LIMIT:
             scan_incomplete = True
         for payload in scan_results:
