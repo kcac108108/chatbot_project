@@ -193,11 +193,17 @@ def _resolve_source(idx: int, results: list[dict]) -> SourceItem | None:
         return None
     payload = results[idx - 1]
     data_type = payload["데이터유형"]
+    # 첨부 청크가 "관련첨부"로 딸려 나올 때는 사전 생성 요약을 우선 쓰도록 돼 있었는데
+    # (_find_related_attachments), 첨부 청크 자체가 검색의 주 출처로 잡힐 때는 이 우선순위가
+    # 빠져있어 항상 원문(최대 3,000자)이 그대로 노출되는 문제가 재현됨(2026-09-21, 사용자가
+    # "요점 정리가 아니라 전체를 다 보여주는 느낌"이라고 다수 사례에서 지적). 같은 우선순위를
+    # 여기도 적용 — 요약이 있으면 요약, 없으면(옛 데이터·경로전용 등) 원문 미리보기로 폴백.
+    preview = payload.get("요약") or _preview(payload.get("text"), data_type)
     return SourceItem(
         데이터유형=data_type,
         원본ID=payload["원본ID"],
         기관명=payload.get("기관명"),
-        미리보기=_preview(payload.get("text"), data_type),
+        미리보기=preview,
         세부항목=payload.get("세부항목") or [],
         관련첨부=_find_related_attachments(data_type, payload["원본ID"]),
     )
