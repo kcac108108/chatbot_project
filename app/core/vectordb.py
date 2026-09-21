@@ -58,7 +58,11 @@ def scan_text_contains(keyword: str, limit: int) -> list[dict]:
     지금 규모(수백~천 단위 청크)에서는 파이썬 쪽 부분 문자열 검사가 더 안정적이다.
     띄어쓰기 유무는 무시하고 비교한다 — 질문에 "자료 제공"(띄어쓰기 있음)과 "자료제공"
     (띄어쓰기 없음)처럼 같은 뜻인데 표기만 다른 경우, 본문의 실제 띄어쓰기와 우연히
-    안 맞으면 매칭이 통째로 실패하는 문제가 재현됨."""
+    안 맞으면 매칭이 통째로 실패하는 문제가 재현됨.
+    첨부 청크는 원문(text)뿐 아니라 사전 생성된 요약(요약)도 같이 본다 — 원문은 표·수치
+    나열이라 특정 단어가 문자 그대로는 없는데 요약에서는 그 개념으로 풀어써서(예: 원문엔
+    인증서 파일 목록만 있고 "SSL 인증서"라는 표현 자체는 요약에만 등장) 원문만 보면 놓치는
+    사례가 재현됨(2026-09-21)."""
     normalized_keyword = "".join(keyword.split())
     matches: list[dict] = []
     offset = None
@@ -72,7 +76,9 @@ def scan_text_contains(keyword: str, limit: int) -> list[dict]:
         )
         for p in points:
             text = p.payload.get("text", "")
-            if normalized_keyword in "".join(text.split()):
+            summary = p.payload.get("요약", "") or ""
+            haystack = "".join(text.split()) + "".join(summary.split())
+            if normalized_keyword in haystack:
                 matches.append(p.payload)
                 if len(matches) >= limit:
                     return matches

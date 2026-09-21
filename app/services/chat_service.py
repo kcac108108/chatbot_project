@@ -258,6 +258,16 @@ def _build_filter(
 
     data_type_value = values.pop("데이터유형", None)
 
+    # 키워드가 추출된 질문("SSL 인증서 관련 자료 알려줘"처럼 특정 메뉴를 염두에 둔 게 아니라
+    # 애매한 주제어로 전수 찾아야 하는 경우)은, LLM이 그 김에 데이터유형까지 과신해서 채워
+    # 벡터 검색 자체를 엉뚱한 메뉴로 좁혀버리는 경우가 재현됨(예: 실제로는 내부자료첨부에만
+    # 있는 내용인데 데이터유형=기관정보로 단정 — 그 필터로도 결과가 0건이 아니라 다른 자료가
+    # 나와버려서 기존의 "0건이면 데이터유형 제거 후 재검색" 방어도 발동하지 않음). 키워드
+    # 스캔(scan_text_contains)은 어차피 데이터유형과 무관하게 전수 스캔하니, 여기서 벡터
+    # 검색까지 굳이 좁힐 필요가 없다 — 키워드가 있으면 데이터유형은 신뢰하지 않는다.
+    if extracted.키워드:
+        data_type_value = None
+
     # 웹 화면에서 사용자가 메뉴를 명시적으로 고정한 경우(allowed_data_types), 그게 최종
     # 후보 범위다. LLM이 뽑은 데이터유형이 그 범위 안이면 더 구체적이니 그대로 쓰고,
     # 범위 밖이거나 못 뽑았으면 스코프 전체를 OR로 건다 — 스코프는 사용자가 고른 것이라
@@ -368,6 +378,20 @@ def _search(
     # 값이니 유지한 채 데이터유형만 제거하고 먼저 재검색한다.
     if not results and analysis.filters.데이터유형 is not None:
         relaxed = analysis.filters.model_copy(update={"데이터유형": None})
+        relaxed_limit = FILTERED_SEARCH_LIMIT if _has_narrowing_filter(relaxed) else CHAT_TOP_K
+        results = vector_search(vector, _build_filter(relaxed, allowed_data_types), relaxed_limit)
+        limit_used = relaxed_limit
+
+    # 심의결과는 원본 DB 값 자체가 자유 텍스트라 표기가 제각각이고("원안수용"/"원안대로승인"/
+    # "요청안대로제공"처럼 사실상 같은 뜻인데 문구가 다름), LLM이 질문 표현을 그대로 옮기면서
+    # 조사를 붙이는 경우도 있다(예: "항목조정후제공된 건" → 값이 "항목조정후제공"이 아니라
+    # "항목조정후제공된"으로 추출돼 정확매칭이 항상 0건, 2026-09-21 재현). 데이터유형과 같은
+    # 이유로 신뢰할 수 없는 필드이니, 기관명 등 신뢰할 수 있는 필터는 유지한 채 심의결과만
+    # 추가로 제거하고 재검색한다.
+    if not results and analysis.filters.심의결과 is not None:
+        # 데이터유형(원래 추출값, 대개 "심의위원회"로 맞게 뽑힘)은 그대로 유지하고 심의결과만
+        # 지운다 — 둘 다 지우면 기관정보·신청이력까지 섞여 너무 넓어진다.
+        relaxed = analysis.filters.model_copy(update={"심의결과": None})
         relaxed_limit = FILTERED_SEARCH_LIMIT if _has_narrowing_filter(relaxed) else CHAT_TOP_K
         results = vector_search(vector, _build_filter(relaxed, allowed_data_types), relaxed_limit)
         limit_used = relaxed_limit
@@ -618,7 +642,7 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         normalized_keyword = "".join(keyword.split())
         matched = [
             i + 1 for i, payload in enumerate(results)
-            if normalized_keyword in "".join(payload["text"].split())
+            if normalized_keyword in "".join(payload["text"].split()) + "".join((payload.get("요약") or "").split())
         ]
         if matched:
             keyword_note = (
