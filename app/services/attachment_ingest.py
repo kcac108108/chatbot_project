@@ -2,6 +2,7 @@
 메뉴(DOCUCD)별로 단계적으로 롤아웃. 직접추출 가능한 형식(엑셀·한글·텍스트 등)과 비전모델이
 필요한 형식(스캔본 PDF·이미지, zip 내부 포함) 모두 `attachment_extract.extract_any`가
 알아서 구분해 처리한다."""
+import re
 import uuid
 from pathlib import Path
 
@@ -87,6 +88,17 @@ def _local_path(file_path_db: str, docucd: str, attfile_id: str) -> Path:
 
 def _review_filename(att: dict, path: Path) -> str:
     return f"{att['ATTFILE_ID']}__{att['ATTFILE_NUM']}__{path.stem}.txt"
+
+
+# OCR/비전모델 추출 결과에 페이지 하단 쪽번호("- 1 -", "- 12 -" 등)가 그대로 한 줄로
+# 섞여 나오는 경우가 실측으로 아주 흔함(2026-09-21, 전체 3,135개 청크 중 2,022줄에서
+# 발견) — 실제 내용이 아니라 순수 잡음이라 안전하게 제거 가능.
+_PAGE_NUMBER_LINE_RE = re.compile(r"^[ \t]*-\s*\d{1,4}\s*-[ \t]*$", re.MULTILINE)
+
+
+def _strip_page_numbers(text: str) -> str:
+    cleaned = _PAGE_NUMBER_LINE_RE.sub("", text)
+    return re.sub(r"\n{3,}", "\n\n", cleaned)
 
 
 def _split_chunks(text: str, limit: int = _CHUNK_TOKEN_LIMIT) -> list[str]:
@@ -224,6 +236,7 @@ def ingest_attachments(docucd: str, review_dir: Path | None = None) -> int:
                 continue
             print(f"[attachment_ingest:{docucd}] 추출완료({len(text)}자): {filename}")
 
+        text = _strip_page_numbers(text)
         summary = _summarize_attachment(text, filename)
         chunks = _split_chunks(text)
         for idx, chunk_text in enumerate(chunks):
