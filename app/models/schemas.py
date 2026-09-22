@@ -8,8 +8,9 @@ DATA_TYPES = Literal["기관정보", "신청이력", "외부요청", "내부자�
 class ChatRequest(BaseModel):
     question: str
     session_id: Optional[str] = None
-    menu_scope: Optional[Literal["기관별 사업정보", "외부요청", "내부자료", "심의위원회"]] = Field(
-        None, description="사용자가 웹 화면에서 특정 메뉴로 범위를 고정한 경우. 미지정(전체)이면 null"
+    menu_scope: Optional[Literal["기관별 사업정보", "외부요청", "내부자료", "심의위원회", "첨부파일"]] = Field(
+        None, description="사용자가 웹 화면에서 특정 메뉴로 범위를 고정한 경우. 미지정(전체)이면 null."
+        "'첨부파일'은 메뉴가 아니라 5개 메뉴의 첨부내용 전체를 가로질러 검색하는 전용 범위"
     )
 
 
