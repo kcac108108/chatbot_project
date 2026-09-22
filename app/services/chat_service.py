@@ -735,14 +735,12 @@ def _full_org_history_answer(org_name: str) -> tuple[str, list[SourceItem], list
             items.append(item)
     items.sort(key=lambda x: x.신청일 or "", reverse=True)
 
+    # 건별 목록은 "이력 보기" 버튼을 누르면 표로 바로 아래에 나오므로, 여기 답변 문장에
+    # 또 나열하면 같은 내용이 중복된다(사용자 지적, 2026-09-22) — 건수만 요약해서 안내.
     if not items:
         answer = f"{org_name}의 기관정보는 아래와 같으며, 등록된 신청이력은 없습니다."
     else:
-        lines = [f"{it.신청일 or '날짜 미상'} - {it.사업명 or '제목 없음'} ({it.원본ID})" for it in items]
-        answer = (
-            f"{org_name}의 기관정보는 아래와 같으며, 전체 신청이력은 총 {len(items)}건입니다.\n\n"
-            + "\n".join(lines)
-        )
+        answer = f"{org_name}의 기관정보는 아래와 같으며, 전체 신청이력은 총 {len(items)}건입니다."
     return answer, sources, org_payloads
 
 
