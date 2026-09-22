@@ -190,6 +190,25 @@ def _find_related_attachments(data_type: str, source_id: str) -> list[RelatedAtt
     return related
 
 
+def _build_source_item(payload: dict) -> SourceItem:
+    """payload 하나를 그대로 SourceItem으로 만든다("부모로 승격"할지 여부는 호출자가
+    이미 결정해서 넘긴 payload라고 가정) — 첨부가 "관련첨부"로 딸려 나올 때는 사전 생성
+    요약을 우선 쓰도록 돼 있었는데(_find_related_attachments), 첨부가 주 출처일 때도
+    같은 우선순위를 적용한다: 요약이 있으면 요약, 없으면(옛 데이터·경로전용 등) 원문
+    미리보기로 폴백(2026-09-21, "요점 정리가 아니라 전체를 다 보여주는 느낌" 버그 수정)."""
+    data_type = payload["데이터유형"]
+    source_id = payload["원본ID"]
+    preview = payload.get("요약") or _preview(payload.get("text"), data_type)
+    return SourceItem(
+        데이터유형=data_type,
+        원본ID=source_id,
+        기관명=payload.get("기관명"),
+        미리보기=preview,
+        세부항목=payload.get("세부항목") or [],
+        관련첨부=_find_related_attachments(data_type, source_id),
+    )
+
+
 def _resolve_source(idx: int, results: list[dict]) -> SourceItem | None:
     if not (1 <= idx <= len(results)):
         return None
@@ -205,31 +224,10 @@ def _resolve_source(idx: int, results: list[dict]) -> SourceItem | None:
     if base_type:
         parents = find_by_type_and_source(base_type, source_id, limit=1)
         if parents:
-            parent = parents[0]
-            return SourceItem(
-                데이터유형=base_type,
-                원본ID=source_id,
-                기관명=parent.get("기관명"),
-                미리보기=_preview(parent.get("text"), base_type),
-                세부항목=parent.get("세부항목") or [],
-                관련첨부=_find_related_attachments(base_type, source_id),
-            )
+            return _build_source_item(parents[0])
         # 부모 레코드를 못 찾으면(데이터 정합성 예외 상황) 기존처럼 첨부 자체를 보여준다.
 
-    # 첨부 청크가 "관련첨부"로 딸려 나올 때는 사전 생성 요약을 우선 쓰도록 돼 있었는데
-    # (_find_related_attachments), 첨부 청크 자체가 검색의 주 출처로 잡힐 때는 이 우선순위가
-    # 빠져있어 항상 원문(최대 3,000자)이 그대로 노출되는 문제가 재현됨(2026-09-21, 사용자가
-    # "요점 정리가 아니라 전체를 다 보여주는 느낌"이라고 다수 사례에서 지적). 같은 우선순위를
-    # 여기도 적용 — 요약이 있으면 요약, 없으면(옛 데이터·경로전용 등) 원문 미리보기로 폴백.
-    preview = payload.get("요약") or _preview(payload.get("text"), data_type)
-    return SourceItem(
-        데이터유형=data_type,
-        원본ID=source_id,
-        기관명=payload.get("기관명"),
-        미리보기=preview,
-        세부항목=payload.get("세부항목") or [],
-        관련첨부=_find_related_attachments(data_type, source_id),
-    )
+    return _build_source_item(payload)
 
 
 def _build_details(grounded: GroundedAnswer, results: list[dict]) -> list[AnswerDetail]:
@@ -713,17 +711,23 @@ def _looks_like_full_org_history_question(text: str, filters: FilterExtraction) 
     return any(w in text for w in _FULL_HISTORY_ASK_WORDS)
 
 
-def _full_org_history_answer(org_name: str) -> str:
+def _full_org_history_answer(org_name: str) -> tuple[str, list[SourceItem], list[dict]]:
     """get_organization_history()와 동일한 데이터 소스 — "이력 보기" 버튼을 자연어
     질문으로도 쓸 수 있게 한다. 같은 기관명이 여러 원본ID로 중복 등록돼 있을 수 있어
-    (예: 대한무역투자진흥공사 4건) 전부 찾아 이력을 합친다."""
-    org_infos = find_by_type_and_field("기관정보", "기관명", org_name)
-    if not org_infos:
-        return f"'{org_name}' 기관 정보를 찾지 못했습니다."
+    (예: 대한무역투자진흥공사 4건) 전부 찾아 이력을 합친다.
+    신청이력은 기관정보 없이 존재할 수 없다(사용자 지적, 2026-09-22) — 신청이력이
+    0건이어도 기관정보 자체는 있으면 먼저 보여줘야 한다. 처음엔 신청이력 개수만 문장으로
+    답하고 sources를 비워뒀다가, "그럼 기관정보는 왜 안 보여주냐"는 지적을 받고 수정:
+    항상 기관정보를 sources에 채우고, 신청이력 목록은 그 뒤에 텍스트로 붙인다."""
+    org_payloads = find_by_type_and_field("기관정보", "기관명", org_name)
+    if not org_payloads:
+        return f"'{org_name}' 기관 정보를 찾지 못했습니다.", [], []
+
+    sources = [_build_source_item(p) for p in org_payloads]
 
     items: list[HistoryItem] = []
     seen: set[str] = set()
-    for org in org_infos:
+    for org in org_payloads:
         for item in get_organization_history(org["원본ID"]):
             if item.원본ID in seen:
                 continue
@@ -732,9 +736,14 @@ def _full_org_history_answer(org_name: str) -> str:
     items.sort(key=lambda x: x.신청일 or "", reverse=True)
 
     if not items:
-        return f"{org_name}의 등록된 신청이력이 없습니다."
-    lines = [f"{it.신청일 or '날짜 미상'} - {it.사업명 or '제목 없음'} ({it.원본ID})" for it in items]
-    return f"{org_name}의 전체 신청이력은 총 {len(items)}건입니다.\n\n" + "\n".join(lines)
+        answer = f"{org_name}의 기관정보는 아래와 같으며, 등록된 신청이력은 없습니다."
+    else:
+        lines = [f"{it.신청일 or '날짜 미상'} - {it.사업명 or '제목 없음'} ({it.원본ID})" for it in items]
+        answer = (
+            f"{org_name}의 기관정보는 아래와 같으며, 전체 신청이력은 총 {len(items)}건입니다.\n\n"
+            + "\n".join(lines)
+        )
+    return answer, sources, org_payloads
 
 
 def ask(question: str, session_id: str | None, menu_scope: str | None = None) -> ChatResponse:
@@ -749,9 +758,10 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     if _looks_like_full_org_history_question(analysis.standalone_question, analysis.filters) and (
         allowed_data_types is None or "신청이력" in allowed_data_types
     ):
-        answer_text = _full_org_history_answer(analysis.filters.기관명)
+        answer_text, sources, org_payloads = _full_org_history_answer(analysis.filters.기관명)
         session_store.append_turn(session_id, question, answer_text)
-        return ChatResponse(session_id=session_id, answer=answer_text, sources=[])
+        session_store.set_last_sources(session_id, org_payloads)
+        return ChatResponse(session_id=session_id, answer=answer_text, sources=sources)
 
     resolved_field = _resolve_list_field(analysis.standalone_question, analysis.filters)
     # is_aggregation_question을 LLM이 이미 true로 확신했으면, 코드 휴리스틱(놓친 케이스를
