@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 
 from app.core.config import ATTACHMENT_BASE_DIR
-from app.models.schemas import ChatRequest, ChatResponse, OrganizationHistoryResponse
+from app.models.schemas import ChatRequest, ChatResponse, OrganizationHistoryResponse, SourceItem
 from app.services import chat_service
 
 router = APIRouter()
@@ -21,6 +21,16 @@ def chat(request: ChatRequest) -> ChatResponse:
 @router.get("/organization-history", response_model=OrganizationHistoryResponse)
 def organization_history(organization_id: str) -> OrganizationHistoryResponse:
     return OrganizationHistoryResponse(items=chat_service.get_organization_history(organization_id))
+
+
+# 이력 보기 표의 한 행을 클릭했을 때 — 그 건 하나만 메인 근거자료 카드와 같은 형태
+# (세부항목 표+관련첨부)로 상세 조회한다.
+@router.get("/record-detail", response_model=SourceItem)
+def record_detail(data_type: str, source_id: str) -> SourceItem:
+    detail = chat_service.get_record_detail(data_type, source_id)
+    if detail is None:
+        raise HTTPException(404, "레코드를 찾을 수 없습니다")
+    return detail
 
 
 # 내용은 안 보여주기로 한 첨부(테이블/SQL 정보성 자료)를 대신 다운로드할 수 있게 하는

@@ -697,6 +697,17 @@ def get_organization_history(organization_id: str) -> list[HistoryItem]:
     return items
 
 
+def get_record_detail(data_type: str, source_id: str) -> SourceItem | None:
+    """"이력 보기" 표의 한 행(원본ID)을 클릭했을 때, 그 건 하나만 상세 조회한다 —
+    메인 근거자료 카드와 완전히 같은 형태(세부항목 표+관련첨부)로 보여주기 위해
+    _build_source_item을 그대로 재사용. 목록 전체를 미리 다 불러오지 않고 클릭한
+    건만 지연 조회해서, 이력이 많은 기관(83건 등)도 초기 로딩이 느려지지 않는다."""
+    payloads = find_by_type_and_source(data_type, source_id, limit=1)
+    if not payloads:
+        return None
+    return _build_source_item(payloads[0])
+
+
 _FULL_HISTORY_ASK_WORDS = ("전체", "모든", "전부", "다 보여", "다보여", "다 알려")
 
 
