@@ -5,7 +5,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 
 from app.core.config import ATTACHMENT_BASE_DIR
-from app.models.schemas import ChatRequest, ChatResponse
+from app.models.schemas import ChatRequest, ChatResponse, OrganizationHistoryResponse
 from app.services import chat_service
 
 router = APIRouter()
@@ -14,6 +14,13 @@ router = APIRouter()
 @router.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest) -> ChatResponse:
     return chat_service.ask(request.question, request.session_id, request.menu_scope)
+
+
+# 기관정보 카드의 "이력 보기" 버튼 — 그 기관의 신청이력 전체를 top-K 제한 없이, LLM 서술
+# 없이 코드가 직접 날짜+제목+원본ID 표로 반환한다.
+@router.get("/organization-history", response_model=OrganizationHistoryResponse)
+def organization_history(organization_id: str) -> OrganizationHistoryResponse:
+    return OrganizationHistoryResponse(items=chat_service.get_organization_history(organization_id))
 
 
 # 내용은 안 보여주기로 한 첨부(테이블/SQL 정보성 자료)를 대신 다운로드할 수 있게 하는

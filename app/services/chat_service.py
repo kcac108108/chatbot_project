@@ -12,6 +12,7 @@ from app.models.schemas import (
     ChatResponse,
     FilterExtraction,
     GroundedAnswer,
+    HistoryItem,
     QueryAnalysis,
     RelatedAttachment,
     SourceItem,
@@ -678,6 +679,21 @@ _MENU_SCOPE_LIST_MENU = {
     "내부자료": "내부자료",
     "심의위원회": "심의위원회",
 }
+
+
+def get_organization_history(organization_id: str) -> list[HistoryItem]:
+    """특정 기관의 신청이력 전체를 top-K 제한 없이 정확히 가져온다 — LLM 서술 없이 코드가
+    직접 날짜+제목+원본ID 표로 렌더링한다("이력 보기" 버튼 클릭 시 호출). 신청이력 청크
+    payload에 이미 부모 기관ID가 들어있어 별도 Oracle 조회 없이 Qdrant만으로 완결된다."""
+    payloads = find_by_type_and_field("신청이력", "기관ID", organization_id, limit=500)
+    items = []
+    for p in payloads:
+        detail = {f["label"]: f["value"] for f in (p.get("세부항목") or [])}
+        items.append(
+            HistoryItem(원본ID=p["원본ID"], 신청일=detail.get("신청일"), 사업명=detail.get("사업명"))
+        )
+    items.sort(key=lambda x: x.신청일 or "", reverse=True)
+    return items
 
 
 def ask(question: str, session_id: str | None, menu_scope: str | None = None) -> ChatResponse:

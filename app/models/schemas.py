@@ -24,6 +24,16 @@ class RelatedAttachment(BaseModel):
     파일경로: Optional[str] = None
 
 
+class HistoryItem(BaseModel):
+    원본ID: str
+    신청일: Optional[str] = None
+    사업명: Optional[str] = None
+
+
+class OrganizationHistoryResponse(BaseModel):
+    items: list[HistoryItem] = Field(default_factory=list)
+
+
 class SourceItem(BaseModel):
     데이터유형: str
     원본ID: str

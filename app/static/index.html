@@ -256,6 +256,17 @@
   .extracted-table th { background: rgba(255,255,255,.06); color: var(--mint); font-weight: 700; }
   .extracted-table tr:nth-child(even) td { background: rgba(255,255,255,.02); }
 
+  .history-wrap { margin-top: 8px; padding-top: 8px; border-top: 1px dashed rgba(255,255,255,.14); }
+  .history-toggle-btn {
+    font-size: 10.5px; background: rgba(255,255,255,.05); color: var(--ink-dark-soft);
+    border: 1px solid rgba(255,255,255,.16); border-radius: 999px; padding: 3px 9px;
+    cursor: pointer; font-family: inherit; transition: background .15s, border-color .15s;
+  }
+  .history-toggle-btn:hover { background: rgba(255,255,255,.09); border-color: rgba(255,255,255,.3); }
+  .history-body { display: none; margin-top: 6px; }
+  .history-wrap.open .history-body { display: block; }
+  .history-count-label { font-size: 10px; margin-bottom: 4px; color: var(--ink-dark-soft); }
+
   .typing {
     display: flex; align-items: center; gap: 4px;
     padding: 12px 16px; background: var(--bot-bubble);
@@ -546,12 +557,91 @@ function buildSourceChip(s) {
     hasToggleContent = true;
   }
 
+  // 기관정보 카드엔 "이력 보기" 버튼을 둔다 — 그 기관의 신청이력 전체를 top-K 제한 없이
+  // 코드가 직접 날짜+제목+원본ID 표로 렌더링한다(LLM 서술 없음, 이력이 많은 기관도 완전한
+  // 목록 보장). 클릭 시에만 조회(지연 로딩)하고 한 번 불러오면 캐시해서 재조회 안 함.
+  if (s.데이터유형 === "기관정보") {
+    const histWrap = document.createElement("div");
+    histWrap.className = "history-wrap";
+
+    const histBtn = document.createElement("button");
+    histBtn.className = "history-toggle-btn";
+    histBtn.type = "button";
+    histBtn.textContent = "이력 보기";
+    histWrap.appendChild(histBtn);
+
+    const histBody = document.createElement("div");
+    histBody.className = "history-body";
+    histWrap.appendChild(histBody);
+
+    let loaded = false;
+    histBtn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      histWrap.classList.toggle("open");
+      if (histWrap.classList.contains("open") && !loaded) {
+        loaded = true;
+        histBody.textContent = "불러오는 중...";
+        try {
+          const res = await fetch(`/organization-history?organization_id=${encodeURIComponent(s.원본ID)}`);
+          const data = await res.json();
+          renderHistoryTable(histBody, data.items || []);
+        } catch (err) {
+          histBody.textContent = "이력을 불러오지 못했습니다.";
+        }
+      }
+    });
+
+    srow.appendChild(histWrap);
+    hasToggleContent = true;
+  }
+
   if (hasToggleContent) {
     chip.addEventListener("click", () => srow.classList.toggle("open"));
   } else {
     chip.style.cursor = "default";
   }
   return srow;
+}
+
+function renderHistoryTable(container, items) {
+  container.innerHTML = "";
+  if (items.length === 0) {
+    container.textContent = "등록된 신청이력이 없습니다.";
+    return;
+  }
+  const countLabel = document.createElement("div");
+  countLabel.className = "history-count-label";
+  countLabel.textContent = `총 ${items.length}건`;
+  container.appendChild(countLabel);
+
+  const table = document.createElement("table");
+  table.className = "extracted-table";
+  const thead = document.createElement("thead");
+  const headRow = document.createElement("tr");
+  ["신청일", "사업명", "원본ID"].forEach(h => {
+    const th = document.createElement("th");
+    th.textContent = h;
+    headRow.appendChild(th);
+  });
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+
+  const tbody = document.createElement("tbody");
+  items.forEach(it => {
+    const tr = document.createElement("tr");
+    [it.신청일 || "-", it.사업명 || "-", it.원본ID].forEach(v => {
+      const td = document.createElement("td");
+      td.textContent = v;
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+
+  const wrap = document.createElement("div");
+  wrap.className = "extracted-table-wrap";
+  wrap.appendChild(table);
+  container.appendChild(wrap);
 }
 
 const MENU_ITEMS = ["전체", "기관별 사업정보", "외부요청", "내부자료", "심의위원회"];
