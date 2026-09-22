@@ -438,6 +438,7 @@ def _search(
 
     results = vector_search(vector, query_filter, search_limit)
     limit_used = search_limit
+    filter_fully_relaxed = False
 
     # 데이터유형은 LLM이 "이력 알려줘" 같은 표현만 보고 과도하게 단정하는 경우가 많다
     # (예: 이력 자체가 없는 기관에도 "신청이력"으로 채워서, 기관명은 맞는데 데이터유형과의
@@ -474,6 +475,7 @@ def _search(
         fallback_filter = _scope_only_filter(allowed_data_types) if allowed_data_types else None
         results = vector_search(vector, fallback_filter, search_limit)
         limit_used = search_limit
+        filter_fully_relaxed = True
 
     # 검색 결과 수가 이번에 사용한 상한과 같으면, 실제로는 더 있는데 상한에 걸려 잘렸을 수
     # 있다는 뜻이다("관세청 8건" 버그를 상한을 올려 고쳤더니, 68건짜리 큰 기관에서는 여전히
@@ -489,20 +491,23 @@ def _search(
     # 앞에 쌓여 있으면 뒤에 있는 진짜 외부요청 1건을 못 찾은 것으로 답하는 경우 발생).
     # 단 메뉴 스코프가 걸려있으면, 스코프 전환 전 다른 메뉴의 이전 출처까지 새 스코프로
     # 새어 들어가지 않도록 여기서도 걸러낸다.
-    merged = []
     seen = set()
+
+    vector_payloads = []
     for r in results:
         key = (r.payload["데이터유형"], r.payload["원본ID"])
         if key not in seen:
             seen.add(key)
-            merged.append(r.payload)
+            vector_payloads.append(r.payload)
+
+    carried_payloads = []
     for p in carried_over:
         if allowed_data_types is not None and p["데이터유형"] not in allowed_data_types:
             continue
         key = (p["데이터유형"], p["원본ID"])
         if key not in seen:
             seen.add(key)
-            merged.append(p)
+            carried_payloads.append(p)
 
     # 키워드가 추출됐으면, 벡터 유사도 순위와 무관하게 본문에 그 단어가 실제로 들어간 건을
     # 전수 스캔해서 빠짐없이 합친다 (벡터 검색은 상위 몇 개만 가져와 놓치는 경우가 있음).
@@ -512,6 +517,12 @@ def _search(
     # 최종 판단 기준이 된다. 스캔이 하나라도 자기 상한에 걸리면 여전히 잘렸을 수 있다고 본다.
     scan_ran = False
     scan_incomplete = False
+    scan_payloads = []
+    # 스캔이 실제로 확인한 건의 키 — vector_payloads가 우연히 먼저 같은 건을 담아버려서
+    # (예: 최종 폴백의 무관한 상위 유사도 20건 중에 이 건이 낮은 순위로 끼어있던 경우)
+    # `seen` 때문에 scan_payloads에 새로 안 담기더라도, 이 집합엔 반드시 남겨서 아래
+    # 재정렬 로직이 "스캔으로 검증된 건"임을 놓치지 않게 한다.
+    scan_confirmed_keys = set()
 
     keyword = analysis.filters.키워드
     if keyword:
@@ -523,9 +534,10 @@ def _search(
             if allowed_data_types is not None and payload["데이터유형"] not in allowed_data_types:
                 continue
             key = (payload["데이터유형"], payload["원본ID"])
+            scan_confirmed_keys.add(key)
             if key not in seen:
                 seen.add(key)
-                merged.append(payload)
+                scan_payloads.append(payload)
 
     # 요청자/제공자/담당자/결재자는 키워드와 같은 이유로 전수 스캔 안전망을 둔다 — DB엔
     # "박상용 계장"처럼 직함이 붙어 저장돼 있거나 "김인태, 전봉석"처럼 여러 명이 한 필드에
@@ -555,9 +567,26 @@ def _search(
             if allowed_data_types is not None and payload["데이터유형"] not in allowed_data_types:
                 continue
             key = (payload["데이터유형"], payload["원본ID"])
+            scan_confirmed_keys.add(key)
             if key not in seen:
                 seen.add(key)
-                merged.append(payload)
+                scan_payloads.append(payload)
+
+    # 병합 순서: 평소엔 벡터 검색 결과(유사도로 이미 정렬된 신뢰할 수 있는 후보)를 먼저 두고
+    # 스캔 결과·이전 턴 근거는 보조 신호로 뒤에 붙인다. 하지만 위에서 필터를 전부 지우는
+    # 최종 폴백까지 갔다면(filter_fully_relaxed), 그 벡터 결과는 사실상 질문과 무관한 상위
+    # 유사도 청크일 뿐이다 — 이름·키워드가 실제로 그 필드에 있다고 스캔으로 이미 확인된
+    # 결과가 있는데도, 그게 노이즈 20건 뒤에 묻혀 답변 LLM이 "찾지 못함"으로 잘못 판단하는
+    # 문제가 재현됨(2026-09-22, "김인태, 전봉석"처럼 콤마로 여러 명이 저장된 담당자 필드 —
+    # 정확매칭 실패로 폴백까지 갔지만 scan_field_contains는 정확히 찾아냄에도 노이즈 뒤에
+    # 묻혀 답변에서 무시됨). 이럴 땐 스캔으로 확인된 건을 앞으로 끌어올리고 노이즈성 벡터
+    # 결과를 뒤로 보낸다 — 안정 정렬(stable sort)이라 그 외 상대 순서는 그대로 유지된다.
+    # 스캔으로 확인된 건이 우연히 vector_payloads 안에 먼저 들어있던 경우(무관한 상위
+    # 유사도 20건 중 낮은 순위로 끼어있던 경우)까지 잡아야 해서, "새로 추가됐는지"가 아니라
+    # scan_confirmed_keys(스캔이 실제로 확인한 키 전체)로 판단한다.
+    merged = vector_payloads + carried_payloads + scan_payloads
+    if filter_fully_relaxed and scan_confirmed_keys:
+        merged.sort(key=lambda p: (p["데이터유형"], p["원본ID"]) not in scan_confirmed_keys)
 
     # "~정보 알려줘"처럼 기관명은 있는데 신청이력 의도가 불명확한 질문에서, 벡터 검색이
     # 기관명만 보고 유사도로 신청이력까지 섞어 보여주는 문제가 있었다(2026-09-21 발견,
