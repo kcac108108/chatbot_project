@@ -699,12 +699,59 @@ def get_organization_history(organization_id: str) -> list[HistoryItem]:
     return items
 
 
+_FULL_HISTORY_ASK_WORDS = ("전체", "모든", "전부", "다 보여", "다보여", "다 알려")
+
+
+def _looks_like_full_org_history_question(text: str, filters: FilterExtraction) -> bool:
+    """기관명이 있고 "전체 이력"류 표현이면, 벡터 검색 top-K로는 완전성을 보장 못 해
+    집계 질문으로 거절되던 케이스를 "이력 보기" 버튼과 동일한 메커니즘으로 대체한다.
+    LLM이 "전체"라는 단어 때문에 기관명이 있어도 집계 질문(is_aggregation_question)으로
+    오분류하는 경우가 실측 확인됨(2026-09-22) — 기관명이 명시돼 있으면 이 판단보다
+    우선해서 정확한 전체 이력을 코드로 직접 가져와 보여준다."""
+    if not filters.기관명 or "이력" not in text:
+        return False
+    return any(w in text for w in _FULL_HISTORY_ASK_WORDS)
+
+
+def _full_org_history_answer(org_name: str) -> str:
+    """get_organization_history()와 동일한 데이터 소스 — "이력 보기" 버튼을 자연어
+    질문으로도 쓸 수 있게 한다. 같은 기관명이 여러 원본ID로 중복 등록돼 있을 수 있어
+    (예: 대한무역투자진흥공사 4건) 전부 찾아 이력을 합친다."""
+    org_infos = find_by_type_and_field("기관정보", "기관명", org_name)
+    if not org_infos:
+        return f"'{org_name}' 기관 정보를 찾지 못했습니다."
+
+    items: list[HistoryItem] = []
+    seen: set[str] = set()
+    for org in org_infos:
+        for item in get_organization_history(org["원본ID"]):
+            if item.원본ID in seen:
+                continue
+            seen.add(item.원본ID)
+            items.append(item)
+    items.sort(key=lambda x: x.신청일 or "", reverse=True)
+
+    if not items:
+        return f"{org_name}의 등록된 신청이력이 없습니다."
+    lines = [f"{it.신청일 or '날짜 미상'} - {it.사업명 or '제목 없음'} ({it.원본ID})" for it in items]
+    return f"{org_name}의 전체 신청이력은 총 {len(items)}건입니다.\n\n" + "\n".join(lines)
+
+
 def ask(question: str, session_id: str | None, menu_scope: str | None = None) -> ChatResponse:
     session_id = session_id or str(uuid.uuid4())
     history = session_store.get_history(session_id)
     carried_over = session_store.get_last_sources(session_id)
     analysis = _analyze_query(question, history)
     allowed_data_types = _MENU_SCOPE_DATA_TYPES.get(menu_scope)
+
+    # 기관명이 명시된 "전체 이력" 질문은, 메뉴 스코프가 신청이력을 배제하지 않는 한
+    # 집계 거절보다 우선해서 정확한 전체 이력을 코드로 직접 가져와 보여준다.
+    if _looks_like_full_org_history_question(analysis.standalone_question, analysis.filters) and (
+        allowed_data_types is None or "신청이력" in allowed_data_types
+    ):
+        answer_text = _full_org_history_answer(analysis.filters.기관명)
+        session_store.append_turn(session_id, question, answer_text)
+        return ChatResponse(session_id=session_id, answer=answer_text, sources=[])
 
     resolved_field = _resolve_list_field(analysis.standalone_question, analysis.filters)
     # is_aggregation_question을 LLM이 이미 true로 확신했으면, 코드 휴리스틱(놓친 케이스를
