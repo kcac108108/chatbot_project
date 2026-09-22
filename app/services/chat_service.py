@@ -5,7 +5,7 @@ from qdrant_client.http import models as qmodels
 from app.core.config import CHAT_TOP_K
 from app.core.db import fetch_all
 from app.core.openai_client import chat_parse, embed_texts
-from app.core.vectordb import find_by_type_and_source, scan_field_contains, scan_text_contains
+from app.core.vectordb import find_by_type_and_field, find_by_type_and_source, scan_field_contains, scan_text_contains
 from app.core.vectordb import search as vector_search
 from app.models.schemas import (
     AnswerDetail,
@@ -556,6 +556,20 @@ def _search(
             if allowed_data_types is not None and payload["데이터유형"] not in allowed_data_types:
                 continue
             key = (payload["데이터유형"], payload["원본ID"])
+            if key not in seen:
+                seen.add(key)
+                merged.append(payload)
+
+    # 기관정보는 특정 기관명으로 좁혀지면 top-K 제한 없이 항상 전부 가져온다 — 벡터
+    # 검색만으로는 "한국환경공단 이력 다 보여줘"처럼 이력이 많은 기관에서 기관정보 레코드가
+    # top-6 밖으로 밀려 빠지는 문제가 재현됨(2026-09-11 발견). 기관정보는 같은 기관이
+    # 중복 등록돼 있어도 원래 건수가 적어서(보통 1~4건) 전부 가져와도 안전하다 — 정확
+    # 매칭(MatchValue)이라 전수 스캔이 아닌 필터 조회만으로 완전성이 보장되니 스캔 상한에
+    # 걸릴 걱정도 없다(possibly_truncated 신호에 영향 없음).
+    org_name = analysis.filters.기관명
+    if org_name and (allowed_data_types is None or "기관정보" in allowed_data_types):
+        for payload in find_by_type_and_field("기관정보", "기관명", org_name):
+            key = ("기관정보", payload["원본ID"])
             if key not in seen:
                 seen.add(key)
                 merged.append(payload)
