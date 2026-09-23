@@ -1,3 +1,4 @@
+import re
 import uuid
 
 from qdrant_client.http import models as qmodels
@@ -464,6 +465,55 @@ def _pool_key(payload: dict) -> tuple:
     return base
 
 
+_FRAGMENT_INDEX_RE = re.compile(r"\((\d+)/(\d+)번째 조각\)")
+_FRAGMENT_HEADER_RE = re.compile(r"^\[.+?\](?: \(\d+/\d+번째 조각\))?\n")
+
+
+def _merge_attachment_fragments(payloads: list[dict]) -> list[dict]:
+    """큰 첨부파일 하나가 토큰 한도 때문에 여러 조각으로 쪼개져 검색 결과에 여러 개
+    올라오면, 답변 생성 LLM이 이걸 [자료 1][자료 2][자료 3]처럼 서로 다른 문서로 착각해
+    "3건 있습니다"라고 잘못 세는 문제가 있었다(2026-09-23, "SSL 인증서" 검색이 실제로는
+    파일 하나인데 "3건"으로 답함 — 사용자 지적: "누가 보더라도 문서 3개가 있는 걸로
+    오해하기 쉽다"). 프롬프트로 "조각이면 하나로 세라"고 지시하는 대신, 애초에 같은 파일
+    (데이터유형+원본ID+첨부파일명)의 조각들을 번호 순서대로 합쳐 [자료] 하나로 만들어서
+    LLM이 여러 문서로 볼 여지 자체를 없앤다 — 이 프로젝트에서 반복 확인된 패턴대로 프롬프트
+    지시보다 구조적으로 막는 쪽이 안정적이다."""
+    groups: dict[tuple, list[dict]] = {}
+    order: list[tuple] = []
+    single_counter = 0
+    for p in payloads:
+        filename = p.get("첨부파일명")
+        if not filename:
+            # 첨부가 아닌 메뉴1~4 본문은 원본ID당 청크 1개라 애초에 합칠 대상이 없다.
+            key = ("__single__", single_counter)
+            single_counter += 1
+        else:
+            key = (p["데이터유형"], p["원본ID"], filename)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(p)
+
+    merged_out: list[dict] = []
+    for key in order:
+        group = groups[key]
+        if len(group) == 1:
+            merged_out.append(group[0])
+            continue
+
+        def _frag_index(payload: dict) -> int:
+            m = _FRAGMENT_INDEX_RE.search(payload.get("text", ""))
+            return int(m.group(1)) if m else 0
+
+        group_sorted = sorted(group, key=_frag_index)
+        bodies = [_FRAGMENT_HEADER_RE.sub("", p.get("text", ""), count=1) for p in group_sorted]
+        data_type, source_id, filename = key
+        merged_payload = dict(group_sorted[0])
+        merged_payload["text"] = f"[{data_type} {source_id} / {filename}]\n" + "\n".join(bodies)
+        merged_out.append(merged_payload)
+    return merged_out
+
+
 def _search(
     analysis: QueryAnalysis, carried_over: list[dict], allowed_data_types: set[str] | None = None
 ) -> tuple[list[dict], bool]:
@@ -669,7 +719,7 @@ def _search(
     if scan_ran:
         possibly_truncated = scan_incomplete
 
-    return merged, possibly_truncated
+    return _merge_attachment_fragments(merged), possibly_truncated
 
 
 AGGREGATION_REFUSAL = (
