@@ -109,6 +109,13 @@ class QueryAnalysis(BaseModel):
     list_field: Optional[Literal["업체명", "담당자", "결재자"]] = Field(
         None, description="is_full_list_question이 true일 때, 어떤 항목의 목록인지"
     )
+    is_out_of_scope: bool = Field(
+        False,
+        description="질문이 이력관리시스템 자료(기관·이력·첨부 등)를 찾으려는 게 아니라"
+        "인사말·잡담·챗봇 자체에 대한 질문(예: '안녕', '고마워', '너는 누구야', '오늘 날씨 어때')이면"
+        "true. 검색 대상이 애매하거나 짧아도(예: '국가', '수수료') 실제로 자료를 찾으려는 의도가"
+        "있으면 false로 둬라 — 정말 검색 의도가 전혀 없을 때만 true로 한다",
+    )
 
 
 class AnswerGroup(BaseModel):
