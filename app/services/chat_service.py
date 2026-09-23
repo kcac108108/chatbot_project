@@ -161,13 +161,22 @@ _ATTACHMENT_TYPE_OF = {
 _BASE_TYPE_OF = {v: k for k, v in _ATTACHMENT_TYPE_OF.items()}
 
 
-def _find_related_attachments(data_type: str, source_id: str) -> list[RelatedAttachment]:
+def _find_related_attachments(
+    data_type: str, source_id: str, keyword: str | None = None
+) -> list[RelatedAttachment]:
     attachment_type = _ATTACHMENT_TYPE_OF.get(data_type)
     if not attachment_type:
         return []
     chunks = find_by_type_and_source(attachment_type, source_id)
+    # 키워드 검색으로 찾아온 답변인데 그 이력에 첨부가 여러 개(예: 보안점검 zip 8~9개)면,
+    # 전부 다 나열해서 사용자가 일일이 열어보며 그 안에서 진짜 관련된 걸 또 찾아야 하는
+    # 문제가 있었다(2026-09-23 사용자 지적: "저렇게 많으면 SSL 관련된 내용만 보여줄 수
+    # 없어?"). 키워드가 있으면 그 단어가 실제로 포함된 첨부만 추려서 보여준다 — 매칭이
+    # 하나도 없으면(요약·본문 표기가 애매해 놓친 경우 대비) 안전하게 전체 목록으로 폴백.
+    normalized_keyword = "".join(keyword.split()) if keyword else None
     seen_files: set[str] = set()
-    related = []
+    related: list[RelatedAttachment] = []
+    matched: list[RelatedAttachment] = []
     for chunk in chunks:
         filename = chunk.get("첨부파일명") or "첨부파일"
         if filename in seen_files:
@@ -180,22 +189,30 @@ def _find_related_attachments(data_type: str, source_id: str) -> list[RelatedAtt
             # (파일경로 필드 자체는 다운로드 링크 생성에 필요해 그대로 둠).
             file_path = chunk.get("파일경로")
             preview = "내용은 제공하지 않는 자료입니다. 아래에서 파일을 다운로드할 수 있습니다."
-            related.append(RelatedAttachment(첨부파일명=filename, 미리보기=preview, 파일경로=file_path))
+            item = RelatedAttachment(첨부파일명=filename, 미리보기=preview, 파일경로=file_path)
         else:
             # 원문 전체를 그대로 보여주면 "번잡스럽고 정리 안 된" 느낌이라는 피드백에 따라,
             # 적재 시점에 미리 만들어둔 요약(요약)을 우선 사용 — 옛 데이터라 요약이 없으면
             # (재적재 전) 원문 미리보기로 폴백.
             preview = chunk.get("요약") or _preview(chunk.get("text"), attachment_type) or ""
-            related.append(RelatedAttachment(첨부파일명=filename, 미리보기=preview))
+            item = RelatedAttachment(첨부파일명=filename, 미리보기=preview)
+        related.append(item)
+        if normalized_keyword:
+            haystack = "".join((chunk.get("text") or "").split()) + "".join((chunk.get("요약") or "").split())
+            if normalized_keyword in haystack:
+                matched.append(item)
+    if normalized_keyword and matched:
+        return matched
     return related
 
 
-def _build_source_item(payload: dict) -> SourceItem:
+def _build_source_item(payload: dict, keyword: str | None = None) -> SourceItem:
     """payload 하나를 그대로 SourceItem으로 만든다("부모로 승격"할지 여부는 호출자가
     이미 결정해서 넘긴 payload라고 가정) — 첨부가 "관련첨부"로 딸려 나올 때는 사전 생성
     요약을 우선 쓰도록 돼 있었는데(_find_related_attachments), 첨부가 주 출처일 때도
     같은 우선순위를 적용한다: 요약이 있으면 요약, 없으면(옛 데이터·경로전용 등) 원문
-    미리보기로 폴백(2026-09-21, "요점 정리가 아니라 전체를 다 보여주는 느낌" 버그 수정)."""
+    미리보기로 폴백(2026-09-21, "요점 정리가 아니라 전체를 다 보여주는 느낌" 버그 수정).
+    keyword가 있으면 관련첨부를 그 단어가 실제로 포함된 것만 추려서 보여준다."""
     data_type = payload["데이터유형"]
     source_id = payload["원본ID"]
     preview = payload.get("요약") or _preview(payload.get("text"), data_type)
@@ -205,11 +222,11 @@ def _build_source_item(payload: dict) -> SourceItem:
         기관명=payload.get("기관명"),
         미리보기=preview,
         세부항목=payload.get("세부항목") or [],
-        관련첨부=_find_related_attachments(data_type, source_id),
+        관련첨부=_find_related_attachments(data_type, source_id, keyword),
     )
 
 
-def _resolve_source(idx: int, results: list[dict]) -> SourceItem | None:
+def _resolve_source(idx: int, results: list[dict], keyword: str | None = None) -> SourceItem | None:
     if not (1 <= idx <= len(results)):
         return None
     payload = results[idx - 1]
@@ -224,13 +241,13 @@ def _resolve_source(idx: int, results: list[dict]) -> SourceItem | None:
     if base_type:
         parents = find_by_type_and_source(base_type, source_id, limit=1)
         if parents:
-            return _build_source_item(parents[0])
+            return _build_source_item(parents[0], keyword)
         # 부모 레코드를 못 찾으면(데이터 정합성 예외 상황) 기존처럼 첨부 자체를 보여준다.
 
-    return _build_source_item(payload)
+    return _build_source_item(payload, keyword)
 
 
-def _build_details(grounded: GroundedAnswer, results: list[dict]) -> list[AnswerDetail]:
+def _build_details(grounded: GroundedAnswer, results: list[dict], keyword: str | None = None) -> list[AnswerDetail]:
     if grounded.no_result:
         return []
 
@@ -242,7 +259,7 @@ def _build_details(grounded: GroundedAnswer, results: list[dict]) -> list[Answer
     seen: set[tuple[str, str]] = set()
     resolved: list[tuple] = []
     for group in grounded.groups:
-        source = _resolve_source(group.source_index, results)
+        source = _resolve_source(group.source_index, results, keyword)
         key = (source.데이터유형, source.원본ID) if source else None
         if key is not None:
             if key in seen:
@@ -920,13 +937,13 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     grounded = chat_parse(messages, GroundedAnswer, temperature=0.0)
     history_text = _render_history_text(grounded)
     bubble_text = "관련 이력을 찾지 못했습니다." if grounded.no_result else grounded.summary
-    details = _build_details(grounded, results)
+    details = _build_details(grounded, results, analysis.filters.키워드)
 
     sources = []
     used_payloads = []
     seen = set()
     for idx in grounded.used_indices:
-        source = _resolve_source(idx, results)
+        source = _resolve_source(idx, results, analysis.filters.키워드)
         if source is None:
             continue
         key = (source.데이터유형, source.원본ID)
