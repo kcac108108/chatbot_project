@@ -535,6 +535,45 @@ def _merge_attachment_fragments(payloads: list[dict]) -> list[dict]:
     return merged_out
 
 
+def _display_identity(payload: dict) -> tuple:
+    """이 payload가 화면에 카드 하나로 표시될 때의 최종 정체성 — 첨부는 부모 레코드로
+    승격되니(_resolve_source) 부모 기준으로, 그 외는 그대로."""
+    data_type = payload["데이터유형"]
+    base_type = _BASE_TYPE_OF.get(data_type)
+    return (base_type or data_type, payload["원본ID"])
+
+
+def _merge_by_display_identity(payloads: list[dict]) -> list[dict]:
+    """같은 이력(원본ID)에 딸린 서로 다른 첨부파일 여러 개(예: "점검사항 3.zip"과
+    "점검사항 5.zip" 둘 다 같은 내부자료 소속)가 검색 결과에 각각 [자료]로 올라오면,
+    화면에는 결국 부모 레코드 카드 하나로 합쳐져 보이는데(_resolve_source의 부모 승격)
+    답변 생성 LLM은 그 사실을 모른 채 [자료]별로 각각 그룹을 만들어서 summary의 "N건"과
+    실제 표시되는 카드 수가 어긋나는 문제가 있었다(2026-09-23 재현: "SSL 관련 내용 3건"
+    이라 답했는데 그중 2건이 같은 이력 소속이라 카드는 2장만 표시됨). LLM이 그룹을 만들기
+    전에, 화면에서 결국 같은 카드로 합쳐질 [자료]들을 미리 하나로 합쳐서 애초에 개수가
+    어긋날 여지를 없앤다 — `_merge_attachment_fragments`(같은 파일의 조각 병합)와 같은
+    원리를 "같은 이력의 다른 첨부파일"까지 확장한 것."""
+    groups: dict[tuple, list[dict]] = {}
+    order: list[tuple] = []
+    for p in payloads:
+        key = _display_identity(p)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(p)
+
+    merged_out: list[dict] = []
+    for key in order:
+        group = groups[key]
+        if len(group) == 1:
+            merged_out.append(group[0])
+            continue
+        merged_payload = dict(group[0])
+        merged_payload["text"] = "\n\n".join(p.get("text", "") for p in group)
+        merged_out.append(merged_payload)
+    return merged_out
+
+
 def _search(
     analysis: QueryAnalysis, carried_over: list[dict], allowed_data_types: set[str] | None = None
 ) -> tuple[list[dict], bool]:
@@ -740,7 +779,7 @@ def _search(
     if scan_ran:
         possibly_truncated = scan_incomplete
 
-    return _merge_attachment_fragments(merged), possibly_truncated
+    return _merge_by_display_identity(_merge_attachment_fragments(merged)), possibly_truncated
 
 
 AGGREGATION_REFUSAL = (
