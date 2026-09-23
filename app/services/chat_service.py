@@ -429,6 +429,24 @@ def _has_narrowing_filter(filters: FilterExtraction) -> bool:
     return any(field in _NARROWING_FILTER_FIELDS for field in values)
 
 
+def _pool_key(payload: dict) -> tuple:
+    """검색 결과 병합 단계(merged)에서 쓰는 중복 판단 키. 기본은 (데이터유형, 원본ID)지만,
+    첨부 청크는 이 조합이 "레코드" 단위가 아니라 "그 레코드에 딸린 파일 여러 개+파일 하나가
+    여러 조각으로 쪼개진 것"까지 뭉뚱그린다 — 같은 이력(원본ID)에 서로 다른 첨부파일이 여럿
+    있으면(예: 내부자료 보안점검 zip 8개) 전부 (데이터유형, 원본ID)가 같아서, 벡터 검색이
+    먼저 담은 파일 A 때문에 `seen`에 그 키가 채워지고, 정작 키워드가 실제로 들어있는 파일 B를
+    나중에 스캔이 찾아도 "이미 봤다"며 조용히 버려지는 문제가 재현됨(2026-09-23, "SSL 인증서"
+    스캔은 정확히 찾아내는데도 최종 답변엔 전혀 반영 안 됨 — 벡터 검색이 같은 원본ID의 다른
+    파일을 먼저 채워서 스캔 결과가 병합 단계에서 조용히 사라진 것). 첨부는 `첨부파일명`+본문
+    앞부분(같은 파일이 여러 조각으로 쪼개진 경우까지 구분)까지 키에 포함해 이 충돌을 막는다.
+    첨부가 아닌 메뉴1~4 본문(기관정보 등)은 원래도 원본ID당 청크 1개라 기존 방식 그대로 둔다."""
+    base = (payload["데이터유형"], payload["원본ID"])
+    filename = payload.get("첨부파일명")
+    if filename:
+        return base + (filename, payload.get("text", "")[:50])
+    return base
+
+
 def _search(
     analysis: QueryAnalysis, carried_over: list[dict], allowed_data_types: set[str] | None = None
 ) -> tuple[list[dict], bool]:
@@ -495,7 +513,7 @@ def _search(
 
     vector_payloads = []
     for r in results:
-        key = (r.payload["데이터유형"], r.payload["원본ID"])
+        key = _pool_key(r.payload)
         if key not in seen:
             seen.add(key)
             vector_payloads.append(r.payload)
@@ -504,7 +522,7 @@ def _search(
     for p in carried_over:
         if allowed_data_types is not None and p["데이터유형"] not in allowed_data_types:
             continue
-        key = (p["데이터유형"], p["원본ID"])
+        key = _pool_key(p)
         if key not in seen:
             seen.add(key)
             carried_payloads.append(p)
@@ -533,7 +551,7 @@ def _search(
         for payload in scan_results:
             if allowed_data_types is not None and payload["데이터유형"] not in allowed_data_types:
                 continue
-            key = (payload["데이터유형"], payload["원본ID"])
+            key = _pool_key(payload)
             scan_confirmed_keys.add(key)
             if key not in seen:
                 seen.add(key)
@@ -566,7 +584,7 @@ def _search(
         for payload in scan_results:
             if allowed_data_types is not None and payload["데이터유형"] not in allowed_data_types:
                 continue
-            key = (payload["데이터유형"], payload["원본ID"])
+            key = _pool_key(payload)
             scan_confirmed_keys.add(key)
             if key not in seen:
                 seen.add(key)
@@ -586,7 +604,7 @@ def _search(
     # scan_confirmed_keys(스캔이 실제로 확인한 키 전체)로 판단한다.
     merged = vector_payloads + carried_payloads + scan_payloads
     if filter_fully_relaxed and scan_confirmed_keys:
-        merged.sort(key=lambda p: (p["데이터유형"], p["원본ID"]) not in scan_confirmed_keys)
+        merged.sort(key=lambda p: _pool_key(p) not in scan_confirmed_keys)
 
     # "~정보 알려줘"처럼 기관명은 있는데 신청이력 의도가 불명확한 질문에서, 벡터 검색이
     # 기관명만 보고 유사도로 신청이력까지 섞어 보여주는 문제가 있었다(2026-09-21 발견,
@@ -622,7 +640,7 @@ def _search(
     org_name = analysis.filters.기관명
     if org_name and (allowed_data_types is None or "기관정보" in allowed_data_types):
         for payload in find_by_type_and_field("기관정보", "기관명", org_name):
-            key = ("기관정보", payload["원본ID"])
+            key = _pool_key(payload)
             if key not in seen:
                 seen.add(key)
                 merged.append(payload)
