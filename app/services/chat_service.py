@@ -74,14 +74,18 @@ QUERY_ANALYSIS_PROMPT = """너는 검색 전처리기다. 아래 대화 이력�
    (예: "전체 심의안건 다 보여줘"), **"국가 항목을 요청한 업체를 알려줘"처럼 특정 조건으로
    좁혀서 찾는 질문**(조건에 맞는 업체가 여러 개일 수 있어도 이건 검색이지 전체 목록이 아님)
 5. is_out_of_scope: 이력관리시스템 자료(기관·이력·첨부 등)를 찾으려는 의도가 전혀 없는
-   인사말·잡담·챗봇 자체에 대한 질문이면 true로 표시하라. 이런 질문은 벡터 검색을 돌려도
-   의미상 가장 가까운 걸 어떻게든 찾아버려서, "안녕"처럼 아무 정보 요청이 없는 말에도
+   인사말·잡담·챗봇 자체에 대한 질문이거나, 이 업무 시스템과 완전히 무관한 일반 요청(코드
+   작성, 일반 상식, 뉴스, 레시피, 계산 등)이면 true로 표시하라. 이런 질문은 벡터 검색을
+   돌려도 의미상 가장 가까운 걸 어떻게든 찾아버려서, 본문과 우연히 겹치는 단어(예: "피자
+   레시피 알려줘"가 회사명 "엘앤피자동차코리아"의 일부와 우연히 겹쳐 매칭되는 경우)만 보고
    엉뚱한 자료를 근거로 대며 답하는 문제가 있다 — 검색 자체를 아예 건너뛰기 위한 판단이다.
    예시(true): "안녕", "안녕하세요", "고마워", "수고했어", "너는 누구야", "뭘 할 수 있어?",
-   "오늘 날씨 어때"
-   예시(false): 검색 대상이 짧거나 애매해도 실제로 자료를 찾으려는 의도가 있으면 전부 false다
-   (예: "국가", "수수료", "한국환경공단"). 검색 의도가 조금이라도 있으면 false로 둬라 —
-   애매할 때 true로 잘못 판단하면 진짜 검색 질문을 거절하게 되니 이 판단은 보수적으로 하라.
+   "오늘 날씨 어때", "파이썬 코드 짜줘", "오늘 뉴스 알려줘", "피자 레시피 알려줘", "세종대왕이
+   누구야", "1+1은 얼마야"
+   예시(false): 검색 대상이 짧거나 애매해도 실제로 이 시스템 자료를 찾으려는 의도가 있으면
+   전부 false다(예: "국가", "수수료", "한국환경공단"). 검색 의도가 조금이라도 있으면 false로
+   둬라 — 애매할 때 true로 잘못 판단하면 진짜 검색 질문을 거절하게 되니 이 판단은 보수적으로
+   하라.
 6. is_mutation_request: 질문이 데이터를 삭제·수정·변경·등록·추가하라는 요청이면 true로
    표시하라. 이 챗봇은 조회 전용이라 삭제·수정 기능 자체가 없는데, "OO 관련 내용을 DB에서
    삭제해줘"처럼 삭제 대상을 검색어처럼 같이 말하면 검색만 정상 수행돼서 그 내용을 그대로
@@ -478,11 +482,27 @@ def _scope_only_filter(allowed_data_types: set[str]) -> qmodels.Filter:
     )
 
 
+def _clean_query_analysis(analysis: QueryAnalysis) -> QueryAnalysis:
+    """구조화 출력에서 LLM이 값 없음을 실제 None 대신 문자열 "null" 등으로 채우는 경우가
+    있다(2026-09-28 발견 — "파이썬 코드 짜줘"처럼 정의된 필터 스키마와 전혀 안 맞는 질문을
+    받으면, is_out_of_scope는 정확히 true로 판단하면서도 filters의 전 필드를 문자열 "null"로
+    채워버림. `model_dump(exclude_none=True)`로 "필터가 있는지" 판단하는 모든 코드가 이걸
+    "값이 채워진 필터"로 잘못 보고, is_out_of_scope 판단을 코드가 거꾸로 무시해 명백히 무관한
+    질문이 검색으로 새는 문제가 있었다). 여기서 한 번에 정리해서, 이후 모든 사용처가 실제
+    None만 보게 한다."""
+    cleaned = {
+        field: (None if isinstance(value, str) and value.strip().lower() in _NULLISH else value)
+        for field, value in analysis.filters.model_dump().items()
+    }
+    analysis.filters = FilterExtraction(**cleaned)
+    return analysis
+
+
 def _analyze_query(question: str, history: list[dict]) -> QueryAnalysis:
     messages = [{"role": "system", "content": QUERY_ANALYSIS_PROMPT}]
     messages.extend(history)
     messages.append({"role": "user", "content": question})
-    return chat_parse(messages, QueryAnalysis)
+    return _clean_query_analysis(chat_parse(messages, QueryAnalysis))
 
 
 KEYWORD_SCAN_LIMIT = 30
@@ -1096,7 +1116,8 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 반환해버려서, 답변 LLM이 그걸 근거인 것처럼 제시하는 문제가 있었다(2026-09-23 발견).
     # filters에 뭐라도 실제로 추출됐으면(기관명·키워드 등) 검색 의도가 있다는 뜻이니, LLM이
     # is_out_of_scope를 잘못 true로 판단해도 코드가 무시한다 — 애매할 때 거절 쪽으로
-    # 잘못 판단하면 진짜 검색 질문을 막아버리는 게 더 나쁘다.
+    # 잘못 판단하면 진짜 검색 질문을 막아버리는 게 더 나쁘다. (filters는 _analyze_query에서
+    # 이미 _clean_query_analysis로 "null" 문자열 등을 실제 None으로 정리한 뒤라 안전하다.)
     has_any_filter = bool(analysis.filters.model_dump(exclude_none=True))
     if analysis.is_out_of_scope and not has_any_filter:
         session_store.append_turn(session_id, question, OUT_OF_SCOPE_GREETING)
