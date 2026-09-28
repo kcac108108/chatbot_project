@@ -1162,7 +1162,24 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
 
     results, possibly_truncated = _search(analysis, carried_over, allowed_data_types)
 
-    context_blocks = [f"[자료 {i + 1}] {payload['text']}" for i, payload in enumerate(results)]
+    # 키워드 전수 스캔(최대 30건)이 첨부 청크(수천~1만 자 이상)와 겹치면 [자료] 전체 텍스트가
+    # 수만~10만 자를 넘어가 답변 생성 프롬프트가 지나치게 커진다(2026-09-28, "중소기업 수수료
+    # 면제 관련 지침" 질문에서 31건 합쳐 92,808자 → 63,422 프롬프트 토큰까지 커져 완성 토큰
+    # 한도(16,384)에 걸려 구조화 출력 파싱 자체가 실패, 요청이 통째로 크래시함). [자료] 개수를
+    # 줄이지 않고(검색 완전성은 그대로 유지) 총 글자수에 상한을 둬서, 상한을 넘기면 그 뒤
+    # 자료는 이번 답변 생성에서 제외한다 — 완전성 신호(possibly_truncated)에도 반영한다.
+    _CONTEXT_CHAR_BUDGET = 40000
+    context_blocks = []
+    context_chars = 0
+    context_truncated = False
+    for i, payload in enumerate(results):
+        text = payload["text"]
+        if context_blocks and context_chars + len(text) > _CONTEXT_CHAR_BUDGET:
+            context_truncated = True
+            break
+        context_blocks.append(f"[자료 {i + 1}] {text}")
+        context_chars += len(text)
+    possibly_truncated = possibly_truncated or context_truncated
     context_text = "\n\n".join(context_blocks) if context_blocks else "(검색된 자료 없음)"
 
     truncation_note = ""
@@ -1211,7 +1228,20 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 경계선 판단에서 편차를 만들어 답변이 실패했다 성공했다 갈리는 문제가 반복 재현됨
     # (동일 질문 6회 중 temperature=0.2는 실패 다수, temperature=0.0은 6회 전부 성공) —
     # 답변 문체 다양성은 프롬프트 지시로 이미 확보되므로 일관성을 우선해 0으로 낮춤
-    grounded = chat_parse(messages, GroundedAnswer, temperature=0.0)
+    # 위 컨텍스트 크기 상한으로 크게 줄였지만, 자료 개수가 많으면 모델이 그룹을 지나치게
+    # 많이 만들려다 완성 토큰 한도에 걸려 구조화 출력 파싱 자체가 실패하는 경우가 여전히
+    # 있을 수 있다(2026-09-28 실제 크래시 확인: LengthFinishReasonError로 요청 전체가 500
+    # 에러로 죽음) — 사용자에게 그대로 에러를 노출하지 않고 안전한 안내 문구로 대체한다.
+    try:
+        grounded = chat_parse(messages, GroundedAnswer, temperature=0.0)
+    except Exception as exc:
+        print(f"[chat_service] 답변 생성 실패, 안전 안내로 대체: {exc!r}")
+        fallback_answer = (
+            "검색된 자료가 너무 많아 답변을 정리하지 못했습니다. "
+            "기관명, 연도 등을 포함해 더 구체적으로 질문해 주세요."
+        )
+        session_store.append_turn(session_id, question, fallback_answer)
+        return ChatResponse(session_id=session_id, answer=fallback_answer, sources=[])
     history_text = _render_history_text(grounded)
     bubble_text = "관련 이력을 찾지 못했습니다." if grounded.no_result else grounded.summary
     details = _build_details(grounded, results, analysis.filters.키워드)
