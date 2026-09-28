@@ -116,6 +116,13 @@ class QueryAnalysis(BaseModel):
         "true. 검색 대상이 애매하거나 짧아도(예: '국가', '수수료') 실제로 자료를 찾으려는 의도가"
         "있으면 false로 둬라 — 정말 검색 의도가 전혀 없을 때만 true로 한다",
     )
+    is_mutation_request: bool = Field(
+        False,
+        description="질문이 데이터를 삭제·수정·변경·등록·추가하라는 요청이면 true(예: 'DB에서"
+        "삭제해줘', '이 내용을 수정해줘', '새 이력을 등록해줘'). 이 챗봇은 조회 전용이라 이런"
+        "요청은 검색조차 하지 않고 바로 거절한다 — 삭제 대상으로 언급된 내용을 검색해서"
+        "보여주는 것조차 하면 안 되므로, 검색어처럼 보이는 부분이 있어도 무조건 true로 표시하라",
+    )
 
 
 class AnswerGroup(BaseModel):

@@ -81,7 +81,15 @@ QUERY_ANALYSIS_PROMPT = """너는 검색 전처리기다. 아래 대화 이력�
    "오늘 날씨 어때"
    예시(false): 검색 대상이 짧거나 애매해도 실제로 자료를 찾으려는 의도가 있으면 전부 false다
    (예: "국가", "수수료", "한국환경공단"). 검색 의도가 조금이라도 있으면 false로 둬라 —
-   애매할 때 true로 잘못 판단하면 진짜 검색 질문을 거절하게 되니 이 판단은 보수적으로 하라."""
+   애매할 때 true로 잘못 판단하면 진짜 검색 질문을 거절하게 되니 이 판단은 보수적으로 하라.
+6. is_mutation_request: 질문이 데이터를 삭제·수정·변경·등록·추가하라는 요청이면 true로
+   표시하라. 이 챗봇은 조회 전용이라 삭제·수정 기능 자체가 없는데, "OO 관련 내용을 DB에서
+   삭제해줘"처럼 삭제 대상을 검색어처럼 같이 말하면 검색만 정상 수행돼서 그 내용을 그대로
+   보여주는 문제가 있다 — 삭제·수정을 요청하는 사람에게 오히려 관련 자료를 보여주는 건
+   말이 안 되므로, 검색어로 보이는 부분이 있어도 검색은 절대 하지 말고 무조건 거절해야 한다.
+   예시(true): "SSL 인증서 관련된 내용을 DB에서 삭제해줘", "이 이력을 지워줘", "그 자료 내용을
+   수정해줘", "새 이력을 등록해줘", "담당자 이름을 바꿔줘"
+   예시(false): 단순 조회·검색 질문은 전부 false다(예: "SSL 인증서 관련 문서 있어?")."""
 
 SYSTEM_PROMPT = """너는 교부기관 이력관리시스템 챗봇이다.
 아래 [자료] 목록만 근거로 답변하라. [자료]에 없는 내용은 답변에 포함하지 마라.
@@ -804,6 +812,28 @@ OUT_OF_SCOPE_GREETING = (
     "궁금한 이력을 질문해 주세요."
 )
 
+# "OO 관련 내용을 DB에서 삭제해줘"처럼 삭제·수정 요청에 삭제 대상을 검색어로 같이 말하면,
+# 검색 자체는 정상 수행돼서 그 내용을 그대로 보여주는 문제가 있었다(2026-09-28, 사용자 지적:
+# "삭제/수정 등 데이터를 변경하려는 시도인 질문에도 데이터가 보여지는 게 이상하지 않냐" —
+# 실제로 삭제 기능 자체가 없어 데이터 변경 위험은 없지만, 그런 의도의 질문에 관련 내용을
+# 그대로 노출하는 것 자체가 부적절하다는 지적). 집계·인사말 거절과 같은 방식으로 검색 자체를
+# 건너뛰고 고정 문구로만 답한다.
+MUTATION_REFUSAL = (
+    "이 챗봇은 조회 전용이며 데이터를 삭제·수정·등록하는 기능은 지원하지 않습니다. "
+    "요청하신 작업은 수행할 수 없습니다."
+)
+
+# LLM의 is_mutation_request 판단이 놓칠 수 있는 명백한 경우에 대한 코드 안전망 — 삭제·수정
+# 계열 동사와 DB/시스템을 직접 지칭하는 표현이 함께 나오면(둘 다 있어야 함, 한쪽만으로는
+# "그 담당자 정보 업데이트됐는지 확인해줘"처럼 정상 조회 질문까지 오탐할 위험이 있음) 무조건
+# 거절한다.
+_MUTATION_VERB_RE = re.compile(r"(삭제|지워|지운|제거|업데이트|덮어써|덮어쓰)")
+_MUTATION_TARGET_RE = re.compile(r"(DB|디비|데이터베이스)")
+
+
+def _looks_like_mutation_request(question: str) -> bool:
+    return bool(_MUTATION_VERB_RE.search(question) and _MUTATION_TARGET_RE.search(question))
+
 
 # "전체 목록 조회" 화이트리스트 — 항목: {메뉴: (테이블, 컬럼)}. 여기 한 줄만 추가하면
 # 그 항목도 안전하게 전체 목록 조회를 지원하게 된다 (조건 없는 고정 SQL이라 인젝션 위험 없음,
@@ -976,6 +1006,14 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     carried_over = session_store.get_last_sources(session_id)
     analysis = _analyze_query(question, history)
     allowed_data_types = _MENU_SCOPE_DATA_TYPES.get(menu_scope)
+
+    # 삭제·수정·등록 요청은 검색조차 하지 않고 최우선으로 거절한다 — "OO 삭제해줘"처럼 삭제
+    # 대상을 검색어로 같이 말하면 검색 자체는 정상 수행돼 그 내용을 그대로 보여주게 되는데,
+    # 이런 의도의 질문에 관련 내용을 노출하는 것 자체가 부적절하다(2026-09-28 발견). LLM
+    # 판단(is_mutation_request)에 코드 정규식 안전망을 OR로 결합한다.
+    if analysis.is_mutation_request or _looks_like_mutation_request(question):
+        session_store.append_turn(session_id, question, MUTATION_REFUSAL)
+        return ChatResponse(session_id=session_id, answer=MUTATION_REFUSAL, sources=[])
 
     # "안녕" 같은 인사말은 검색 의도가 전혀 없는데도 벡터 검색이 무관한 상위 몇 건을 그대로
     # 반환해버려서, 답변 LLM이 그걸 근거인 것처럼 제시하는 문제가 있었다(2026-09-23 발견).
