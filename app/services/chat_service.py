@@ -959,6 +959,15 @@ def get_record_detail(data_type: str, source_id: str) -> SourceItem | None:
 
 _FULL_HISTORY_ASK_WORDS = ("전체", "모든", "전부", "다 보여", "다보여", "다 알려")
 
+# 기관명+"이력"만 있고 다른 좁히는 조건(연도·심의결과 등)이 전혀 없는 질문은, "전체"라는
+# 단어가 없어도 완전성을 보장할 수 없는 일반 검색 경로(top-K 상한 + 답변생성 LLM이 매번
+# 다르게 요약하는 불안정성, 2026-09-29 실측 확인 — 검색은 23건 찾았는데 답변 LLM이 어떤
+# 실행에선 23건 전부, 어떤 실행에선 10건만 묘사)로 보낼 이유가 없다. 다른 조건이 하나라도
+# 있으면(예: "OO 기관 2020년 이력") 그 조건에 맞는 일반 검색을 그대로 써야 하므로 제외한다.
+_FULL_HISTORY_OTHER_FILTER_FIELDS = (
+    "연도", "통계종류", "수출입구분", "요청자", "제공자", "담당자", "결재자", "심의결과", "차수", "키워드",
+)
+
 
 def _looks_like_full_org_history_question(text: str, filters: FilterExtraction) -> bool:
     """기관명이 있고 "전체 이력"류 표현이면, 벡터 검색 top-K로는 완전성을 보장 못 해
@@ -968,7 +977,10 @@ def _looks_like_full_org_history_question(text: str, filters: FilterExtraction) 
     우선해서 정확한 전체 이력을 코드로 직접 가져와 보여준다."""
     if not filters.기관명 or "이력" not in text:
         return False
-    return any(w in text for w in _FULL_HISTORY_ASK_WORDS)
+    if any(w in text for w in _FULL_HISTORY_ASK_WORDS):
+        return True
+    has_other_filter = any(getattr(filters, f) for f in _FULL_HISTORY_OTHER_FILTER_FIELDS)
+    return not has_other_filter
 
 
 def _full_org_history_answer(org_name: str) -> tuple[str, list[SourceItem], list[dict]]:
