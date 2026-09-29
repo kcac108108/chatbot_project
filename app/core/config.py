@@ -37,3 +37,24 @@ ATTACHMENT_BASE_DIR = os.getenv("ATTACHMENT_BASE_DIR")
 # 드물게 멈추는 경우, 넘으면 강제로 포기하고 안전한 안내 문구를 반환한다(2026-09-28 발견,
 # 실제 1시간 넘게 응답이 안 오는 요청을 관찰함 — 운영 배포 전 반드시 필요한 방어).
 CHAT_REQUEST_TIMEOUT_SECONDS = int(os.getenv("CHAT_REQUEST_TIMEOUT_SECONDS", "45"))
+
+# 신규 이력 첨부파일 자동처리(2026-09-29) — 전산팀 OCR 서버(개발기간 외부망/운영 내부망
+# 경로가 다름, ATTACHMENT_BASE_DIR과 동일한 전환 방식)와의 SFTP 접속정보. 포트·계정은
+# 전산팀이 SFTP 호환성 조사 중이라 아직 확정 전 — 값이 없으면 자동처리 파이프라인이
+# 실행 시점에 명확한 에러로 즉시 알려주고(조용히 실패하지 않고), 나머지 로직은 이 값들과
+# 무관하게 먼저 완성해둔다.
+OCR_SFTP_HOST = os.getenv("OCR_SFTP_HOST")
+OCR_SFTP_PORT = int(os.getenv("OCR_SFTP_PORT", "22"))
+OCR_SFTP_USER = os.getenv("OCR_SFTP_USER")
+OCR_SFTP_PASSWORD = os.getenv("OCR_SFTP_PASSWORD")
+
+# OCR 트리거 API — 개발 기간 한정 외부망 주소를 기본값으로 두고, 운영 배포 시 내부망
+# 주소(http://193.1.2.43:9091)로 .env만 교체하면 된다.
+OCR_API_BASE_URL = os.getenv("OCR_API_BASE_URL", "https://ai.bandtrass.or.kr:9091")
+
+# OCR 서버(193.1.2.43)의 입력·출력 폴더 경로 — 전산팀 안내 그대로.
+OCR_REMOTE_PDF_DIR = os.getenv("OCR_REMOTE_PDF_DIR", "/DATA/backend/rag/data")
+OCR_REMOTE_IMAGE_DIR = os.getenv("OCR_REMOTE_IMAGE_DIR", "/DATA/backend/rag/data/images")
+# 이미지 결과 txt가 pdfToText와 같은 폴더에 나오는지는 전산팀에 명시적으로 확인받지
+# 못했다 — 일단 PDF와 동일 폴더로 가정, 실제 연동 시 재확인 필요.
+OCR_REMOTE_TEXT_DIR = os.getenv("OCR_REMOTE_TEXT_DIR", "/DATA/backend/rag/data/pdfToText")

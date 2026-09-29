@@ -67,17 +67,22 @@ def _is_path_only(filename: str) -> bool:
     return filename in _PATH_ONLY_FILENAMES or filename.lower().endswith(".sql")
 
 
-def _valid_attachments(docucd: str) -> list[dict]:
+def _valid_attachments(docucd: str, since=None) -> list[dict]:
+    """since를 주면 그 시각 이후 등록·수정된 첨부만 반환한다(신규 이력 자동처리 전용,
+    2026-09-29) — 기존 이력에 나중에 파일이 추가되는 경우도 잡아야 해서 부모 레코드가
+    아니라 TM_ATTFILE 자신의 등록·수정일시(CR_DTM/IN_DTM)를 기준으로 본다."""
     table, col, _ = _DOCUCD_MAP[docucd]
+    since_clause = "AND (A.CR_DTM > :since OR A.IN_DTM > :since)" if since else ""
     return fetch_all(
         f"""
         SELECT A.ATTFILE_ID, A.ATTFILE_NUM, A.ATTFILE_NM, A.FILE_PATH
         FROM TM_ATTFILE A
         WHERE A.DOCUCD = :docucd
           AND EXISTS (SELECT 1 FROM {table} T WHERE T.{col} = A.ATTFILE_ID)
+          {since_clause}
         ORDER BY A.ATTFILE_ID, A.ATTFILE_NUM
         """,
-        {"docucd": docucd},
+        {"docucd": docucd, "since": since} if since else {"docucd": docucd},
     )
 
 
@@ -191,6 +196,48 @@ def extract_for_review(docucd: str, out_dir: Path) -> list[dict]:
     return results
 
 
+def _build_entries_for_text(
+    parent_id: str, att_num, filename: str, text: str, data_type: str
+) -> list[tuple[str, dict]]:
+    """추출된 원문 텍스트 하나를 (쪽번호 제거→요약→토큰 기준 분할→payload 조립)까지
+    처리해 Qdrant에 넣을 (source_id, payload) 목록으로 만든다. 수동 파이프라인
+    (ingest_attachments)과 신규 이력 자동처리 파이프라인이 공용으로 쓴다."""
+    text = _strip_page_numbers(text)
+    summary = _summarize_attachment(text, filename)
+    chunks = _split_chunks(text)
+    entries: list[tuple[str, dict]] = []
+    for idx, chunk_text in enumerate(chunks):
+        source_id = f"{parent_id}:{att_num}:{idx}"
+        suffix = f" ({idx + 1}/{len(chunks)}번째 조각)" if len(chunks) > 1 else ""
+        body = f"[{data_type} {parent_id} / {filename}]{suffix}\n{chunk_text}"
+        payload = {
+            "text": body,
+            "데이터유형": data_type,
+            "원본ID": parent_id,
+            "첨부파일명": filename,
+            "요약": summary,
+        }
+        entries.append((source_id, payload))
+    return entries
+
+
+def _upsert_entries(data_type: str, entries: list[tuple[str, dict]], log_prefix: str) -> int:
+    """(source_id, payload) 목록을 배치로 임베딩해 Qdrant에 upsert. 수동·자동 파이프라인 공용."""
+    ensure_collection()
+    total = 0
+    for i in range(0, len(entries), BATCH_SIZE):
+        batch = entries[i : i + BATCH_SIZE]
+        vectors = embed_texts([payload["text"] for _, payload in batch])
+        points = [
+            qmodels.PointStruct(id=_point_id(data_type, source_id), vector=vector, payload=payload)
+            for (source_id, payload), vector in zip(batch, vectors)
+        ]
+        upsert_points(points)
+        total += len(points)
+        print(f"[{log_prefix}] {total}/{len(entries)} 청크 적재 완료")
+    return total
+
+
 def ingest_attachments(docucd: str, review_dir: Path | None = None) -> int:
     """2단계: 첨부 전체(직접추출+비전모델)를 실제로 청킹+임베딩+Qdrant 반영.
 
@@ -236,32 +283,6 @@ def ingest_attachments(docucd: str, review_dir: Path | None = None) -> int:
                 continue
             print(f"[attachment_ingest:{docucd}] 추출완료({len(text)}자): {filename}")
 
-        text = _strip_page_numbers(text)
-        summary = _summarize_attachment(text, filename)
-        chunks = _split_chunks(text)
-        for idx, chunk_text in enumerate(chunks):
-            source_id = f"{parent_id}:{att['ATTFILE_NUM']}:{idx}"
-            suffix = f" ({idx + 1}/{len(chunks)}번째 조각)" if len(chunks) > 1 else ""
-            body = f"[{data_type} {parent_id} / {filename}]{suffix}\n{chunk_text}"
-            payload = {
-                "text": body,
-                "데이터유형": data_type,
-                "원본ID": parent_id,
-                "첨부파일명": filename,
-                "요약": summary,
-            }
-            entries.append((source_id, payload))
+        entries += _build_entries_for_text(parent_id, att["ATTFILE_NUM"], filename, text, data_type)
 
-    total = 0
-    for i in range(0, len(entries), BATCH_SIZE):
-        batch = entries[i : i + BATCH_SIZE]
-        vectors = embed_texts([payload["text"] for _, payload in batch])
-        points = [
-            qmodels.PointStruct(id=_point_id(data_type, source_id), vector=vector, payload=payload)
-            for (source_id, payload), vector in zip(batch, vectors)
-        ]
-        upsert_points(points)
-        total += len(points)
-        print(f"[attachment_ingest:{docucd}] {total}/{len(entries)} 청크 적재 완료")
-
-    return total
+    return _upsert_entries(data_type, entries, f"attachment_ingest:{docucd}")
