@@ -32,3 +32,8 @@ CHAT_TOP_K = int(os.getenv("CHAT_TOP_K", "6"))
 
 # 2단계: 첨부파일 실물 루트 경로 (DOCUCD별 하위폴더를 담은 디렉터리)
 ATTACHMENT_BASE_DIR = os.getenv("ATTACHMENT_BASE_DIR")
+
+# /chat 요청 전체의 제한시간 — OpenAI 호출이 느려지거나(스키마 최초 컴파일, 큰 컨텍스트)
+# 드물게 멈추는 경우, 넘으면 강제로 포기하고 안전한 안내 문구를 반환한다(2026-09-28 발견,
+# 실제 1시간 넘게 응답이 안 오는 요청을 관찰함 — 운영 배포 전 반드시 필요한 방어).
+CHAT_REQUEST_TIMEOUT_SECONDS = int(os.getenv("CHAT_REQUEST_TIMEOUT_SECONDS", "45"))

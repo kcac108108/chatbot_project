@@ -1,19 +1,36 @@
+import asyncio
+import logging
 import re
+import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 
-from app.core.config import ATTACHMENT_BASE_DIR
+from app.core.config import ATTACHMENT_BASE_DIR, CHAT_REQUEST_TIMEOUT_SECONDS
 from app.models.schemas import ChatRequest, ChatResponse, OrganizationHistoryResponse, SourceItem
 from app.services import chat_service
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
+# OpenAI 호출이 드물게 매우 느려지거나 멈추는 경우를 대비해 요청 전체에 제한시간을 둔다
+# (2026-09-28 실제 1시간 넘게 응답이 안 오는 요청을 관찰함). session_id는 ask() 내부가
+# 아니라 여기서 먼저 확정해둬야, 타임아웃으로 ask()가 끝까지 못 가도 같은 session_id로
+# 안전한 안내를 돌려줄 수 있다. 타임아웃이 나도 백그라운드 스레드의 실제 OpenAI 호출
+# 자체는 계속 진행된다(파이썬 스레드는 강제 종료 불가) — 이 요청의 응답만 포기하는 것.
 @router.post("/chat", response_model=ChatResponse)
-def chat(request: ChatRequest) -> ChatResponse:
-    return chat_service.ask(request.question, request.session_id, request.menu_scope)
+async def chat(request: ChatRequest) -> ChatResponse:
+    session_id = request.session_id or str(uuid.uuid4())
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(chat_service.ask, request.question, session_id, request.menu_scope),
+            timeout=CHAT_REQUEST_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("chat 요청 타임아웃(%s초 초과): session_id=%s", CHAT_REQUEST_TIMEOUT_SECONDS, session_id)
+        return ChatResponse(session_id=session_id, answer=chat_service.REQUEST_TIMEOUT_ANSWER, sources=[])
 
 
 # 기관정보 카드의 "이력 보기" 버튼 — 그 기관의 신청이력 전체를 top-K 제한 없이, LLM 서술
