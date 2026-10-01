@@ -27,6 +27,7 @@ from app.services.attachment_ingest import (
     _build_entries_for_text,
     _is_path_only,
     _local_path,
+    _ocr_upload_name,
     _upsert_entries,
     _valid_attachments,
 )
@@ -115,7 +116,10 @@ def run_incremental_attachment_ingest(docucd: str) -> int:
     if ocr_targets:
         check_ocr_config()
         print(f"[attachment_auto:{docucd}] OCR 대상 {len(ocr_targets)}건 — 전산팀 서버로 전송")
-        succeeded, failed = run_ocr_batch([p for _, p in ocr_targets])
+        # 같은 파일명이 서로 다른 첨부 건에 중복 등록된 사례가 실제 53건 있어, 원본
+        # 파일명 그대로 보내면 같은 배치 안에서 충돌할 수 있다 — ATTFILE_ID__순번__원본명
+        # 규칙으로 리네임해서 보낸다(2026-10-01, 이 리네임 단계가 빠져있던 것을 발견해 추가).
+        succeeded, failed = run_ocr_batch([(p, _ocr_upload_name(att, p)) for att, p in ocr_targets])
         for att, path in ocr_targets:
             filename = att["ATTFILE_NM"]
             if path in failed:

@@ -40,6 +40,16 @@ def organization_history(organization_id: str) -> OrganizationHistoryResponse:
     return OrganizationHistoryResponse(items=chat_service.get_organization_history(organization_id))
 
 
+# "이력 보기" 표 안의 검색창(명시적 UI 컨트롤) — 채팅 자연어로 "그 중 OO만"류 의도를
+# 추론하려던 이전 시도가 무관한 새 검색까지 잘못 좁히는 오탐을 일으켜 폐기되고(2026-09-30),
+# 대신 이 표 전용 검색 엔드포인트로 대체됨.
+@router.get("/organization-history-search", response_model=OrganizationHistoryResponse)
+def organization_history_search(organization_id: str, keyword: str) -> OrganizationHistoryResponse:
+    return OrganizationHistoryResponse(
+        items=chat_service.search_organization_history(organization_id, keyword)
+    )
+
+
 # 이력 보기 표의 한 행을 클릭했을 때 — 그 건 하나만 메인 근거자료 카드와 같은 형태
 # (세부항목 표+관련첨부)로 상세 조회한다.
 @router.get("/record-detail", response_model=SourceItem)

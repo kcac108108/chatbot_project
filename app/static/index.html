@@ -264,13 +264,30 @@
     cursor: pointer; font-family: inherit; transition: background .15s, border-color .15s;
   }
   .history-toggle-btn:hover { background: rgba(255,255,255,.09); border-color: rgba(255,255,255,.3); }
-  .history-body { display: none; margin-top: 6px; color: var(--ink-dark-soft); }
+  .history-body { display: none; margin-top: 6px; font-size: 12px; color: var(--ink-dark-soft); }
   .history-wrap.open .history-body { display: block; }
   .history-count-label { font-size: 10px; margin-bottom: 4px; color: var(--ink-dark-soft); }
   .history-row { cursor: pointer; }
   .history-row:hover td { background: rgba(255,255,255,.07); }
   .history-row.open td { background: rgba(255,255,255,.09); }
   .history-detail-row td { padding: 10px 8px; background: rgba(255,255,255,.03); }
+
+  .history-search-bar { display: flex; gap: 6px; margin-bottom: 8px; }
+  .history-search-input {
+    flex: 1; min-width: 0; font-size: 11px; font-family: inherit; color: var(--ink-dark-soft);
+    background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.16);
+    border-radius: 999px; padding: 5px 11px; outline: none;
+  }
+  .history-search-input:focus { border-color: rgba(255,255,255,.35); }
+  .history-search-btn, .history-search-reset-btn {
+    font-size: 10.5px; background: rgba(255,255,255,.05); color: var(--ink-dark-soft);
+    border: 1px solid rgba(255,255,255,.16); border-radius: 999px; padding: 5px 11px;
+    cursor: pointer; font-family: inherit; transition: background .15s, border-color .15s;
+    white-space: nowrap;
+  }
+  .history-search-btn:hover, .history-search-reset-btn:hover {
+    background: rgba(255,255,255,.09); border-color: rgba(255,255,255,.3);
+  }
 
   .typing {
     display: flex; align-items: center; gap: 4px;
@@ -589,7 +606,7 @@ function buildSourceChip(s) {
         try {
           const res = await fetch(`/organization-history?organization_id=${encodeURIComponent(s.원본ID)}`);
           const data = await res.json();
-          renderHistoryTable(histBody, data.items || []);
+          renderHistoryPanel(histBody, data.items || [], s.원본ID);
         } catch (err) {
           histBody.textContent = "이력을 불러오지 못했습니다.";
         }
@@ -606,6 +623,85 @@ function buildSourceChip(s) {
     chip.style.cursor = "default";
   }
   return srow;
+}
+
+// "이력 보기" 표 안에 명시적 검색창을 둔다(2026-09-30) — 채팅 자연어로 "그 중 OO만"류
+// 의도를 추론하려던 이전 방식은, 완전히 새로운 무관한 질문까지 직전 목록 안으로 잘못
+// 좁혀버리는 오탐이 실사용에서 발견돼 폐기됨. 검색창에 입력하고 버튼을 누르는 행위 자체가
+// "이 목록 안에서 찾겠다"는 의도를 명확하게 하므로, 의도 추론이 필요 없는 이 방식으로 대체.
+function renderHistoryPanel(container, items, organizationId) {
+  container.innerHTML = "";
+
+  const tableHolder = document.createElement("div");
+
+  // 검색할 이력 자체가 0건이면 검색창을 보여줄 이유가 없다(2026-10-01, 사용자 지적) —
+  // 이력이 있을 때만 검색 UI를 만들어 붙인다.
+  if (items.length === 0) {
+    container.appendChild(tableHolder);
+    renderHistoryTable(tableHolder, items);
+    return;
+  }
+
+  const searchBar = document.createElement("div");
+  searchBar.className = "history-search-bar";
+
+  const input = document.createElement("input");
+  input.type = "text";
+  input.className = "history-search-input";
+  input.placeholder = "정확한 단어로 검색 (예: 수출 비중)";
+
+  const searchBtn = document.createElement("button");
+  searchBtn.type = "button";
+  searchBtn.className = "history-search-btn";
+  searchBtn.textContent = "검색";
+
+  const resetBtn = document.createElement("button");
+  resetBtn.type = "button";
+  resetBtn.className = "history-search-reset-btn";
+  resetBtn.textContent = "전체보기";
+  resetBtn.hidden = true;
+
+  searchBar.appendChild(input);
+  searchBar.appendChild(searchBtn);
+  searchBar.appendChild(resetBtn);
+  container.appendChild(searchBar);
+
+  container.appendChild(tableHolder);
+  renderHistoryTable(tableHolder, items);
+
+  async function runSearch() {
+    const keyword = input.value.trim();
+    if (!keyword) return;
+    tableHolder.textContent = "검색 중...";
+    try {
+      const res = await fetch(
+        `/organization-history-search?organization_id=${encodeURIComponent(organizationId)}&keyword=${encodeURIComponent(keyword)}`
+      );
+      const data = await res.json();
+      renderHistoryTable(tableHolder, data.items || []);
+      resetBtn.hidden = false;
+    } catch (err) {
+      tableHolder.textContent = "검색하지 못했습니다.";
+    }
+  }
+
+  searchBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    runSearch();
+  });
+  input.addEventListener("click", (e) => e.stopPropagation());
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      runSearch();
+    }
+  });
+  resetBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    input.value = "";
+    resetBtn.hidden = true;
+    renderHistoryTable(tableHolder, items);
+  });
 }
 
 function renderHistoryTable(container, items) {

@@ -1009,16 +1009,48 @@ def _history_date(payload: dict) -> str:
     return detail.get("신청일") or ""
 
 
-def get_organization_history(organization_id: str) -> list[HistoryItem]:
-    """특정 기관의 신청이력 전체를 top-K 제한 없이 정확히 가져온다 — LLM 서술 없이 코드가
-    직접 날짜+제목+원본ID 표로 렌더링한다("이력 보기" 버튼 클릭 시 호출). 신청이력 청크
-    payload에 이미 부모 기관ID가 들어있어 별도 Oracle 조회 없이 Qdrant만으로 완결된다."""
+def _payloads_to_history_items(payloads: list[dict]) -> list[HistoryItem]:
     items = []
-    for p in _get_organization_history_payloads(organization_id):
+    for p in payloads:
         detail = {f["label"]: f["value"] for f in (p.get("세부항목") or [])}
         items.append(HistoryItem(원본ID=p["원본ID"], 신청일=detail.get("신청일"), 사업명=detail.get("사업명")))
     items.sort(key=lambda x: x.신청일 or "", reverse=True)
     return items
+
+
+def get_organization_history(organization_id: str) -> list[HistoryItem]:
+    """특정 기관의 신청이력 전체를 top-K 제한 없이 정확히 가져온다 — LLM 서술 없이 코드가
+    직접 날짜+제목+원본ID 표로 렌더링한다("이력 보기" 버튼 클릭 시 호출). 신청이력 청크
+    payload에 이미 부모 기관ID가 들어있어 별도 Oracle 조회 없이 Qdrant만으로 완결된다."""
+    return _payloads_to_history_items(_get_organization_history_payloads(organization_id))
+
+
+def search_organization_history(organization_id: str, keyword: str) -> list[HistoryItem]:
+    """"이력 보기" 표 안의 검색창에서 명시적으로 입력한 키워드로, 그 기관의 전체 이력
+    안에서 코드가 직접 텍스트 매칭한다(2026-09-30). 채팅 자연어로 "그 중 OO 관련된 것만"
+    같은 의도를 추론하려던 이전 시도는, 키워드가 있고 직전에 전체이력을 봤다는 조건만으로
+    무조건 그 목록 안으로 좁혀버려서 완전히 무관한 새 검색("한국개발연구원 이력" 다음
+    "보안 관련 문서 있어?")까지 잘못 좁히는 오탐이 실사용에서 재현되어 폐기됨. 사용자가
+    이 검색창에 입력하고 버튼을 눌렀다는 것 자체가 "이 목록 안에서 찾겠다"는 의도를
+    명확히 하므로, 더 이상 의도를 추론할 필요가 없다.
+
+    입력한 문구 전체가 글자 그대로 본문에 있어야 하는 완전탐색 방식이라, 자연스러운 문장
+    입력("~과 관련된 이력")은 실패할 수 있다(2026-10-01 발견) — 단어를 뒤에서부터 떼어내며
+    더 느슨하게 매칭하는 보정을 시도했으나, 같은 기관의 여러 이력이 거의 같은 사유로
+    등록되는 경우가 흔해서(예: 한국환경공단 83건 전부가 같은 제공목적을 공유) "부담금"/
+    "제품" 같은 평범한 단어조차 그 기관 안에서는 거의 모든 문서에 등장하는 상투어가
+    돼버려, 하나 고치면 다른 데서 또 틀리는 문제가 반복 재현됨(2026-10-01, "부담금 관련
+    이력" → 83건 중 83건 전부 매칭되는 식으로 재현). 기관마다 다른 상투어를 고정 규칙으로
+    다 예측할 수 없어 단순 정확매칭으로 되돌림(사용자 판단, "정확하지 않은 걸 알려주는건
+    없는거보다 못하다") — 자연스러운 문장으로 찾고 싶으면 일반 채팅(LLM이 키워드를 먼저
+    추출해 훨씬 유연하게 찾아줌, 실측 확인됨)을 쓰도록 안내하는 쪽으로 역할을 나눈다."""
+    payloads = _get_organization_history_payloads(organization_id)
+    normalized_keyword = "".join(keyword.split())
+    matched = [
+        p for p in payloads
+        if normalized_keyword in "".join(p["text"].split()) + "".join((p.get("요약") or "").split())
+    ]
+    return _payloads_to_history_items(matched)
 
 
 def get_record_detail(data_type: str, source_id: str) -> SourceItem | None:
@@ -1058,21 +1090,17 @@ def _looks_like_full_org_history_question(text: str, filters: FilterExtraction) 
     return not has_other_filter
 
 
-def _full_org_history_answer(org_name: str) -> tuple[str, list[SourceItem], list[dict], list[dict]]:
+def _full_org_history_answer(org_name: str) -> tuple[str, list[SourceItem], list[dict]]:
     """get_organization_history()와 동일한 데이터 소스 — "이력 보기" 버튼을 자연어
     질문으로도 쓸 수 있게 한다. 같은 기관명이 여러 원본ID로 중복 등록돼 있을 수 있어
     (예: 대한무역투자진흥공사 4건) 전부 찾아 이력을 합친다.
     신청이력은 기관정보 없이 존재할 수 없다(사용자 지적, 2026-09-22) — 신청이력이
     0건이어도 기관정보 자체는 있으면 먼저 보여줘야 한다. 처음엔 신청이력 개수만 문장으로
     답하고 sources를 비워뒀다가, "그럼 기관정보는 왜 안 보여주냐"는 지적을 받고 수정:
-    항상 기관정보를 sources에 채우고, 신청이력 목록은 그 뒤에 텍스트로 붙인다.
-
-    4번째 반환값(history_payloads)은 신청이력 전체의 실제 payload(HistoryItem으로
-    축소하기 전 원본) — 후속 키워드 필터링(2026-09-30)이 세션에 저장해뒀다가 코드로
-    직접 텍스트 매칭할 때 쓴다."""
+    항상 기관정보를 sources에 채우고, 신청이력 목록은 그 뒤에 텍스트로 붙인다."""
     org_payloads = find_by_type_and_field("기관정보", "기관명", org_name)
     if not org_payloads:
-        return f"'{org_name}' 기관 정보를 찾지 못했습니다.", [], [], []
+        return f"'{org_name}' 기관 정보를 찾지 못했습니다.", [], []
 
     sources = [_build_source_item(p) for p in org_payloads]
 
@@ -1092,30 +1120,7 @@ def _full_org_history_answer(org_name: str) -> tuple[str, list[SourceItem], list
         answer = f"{org_name}의 기관정보는 아래와 같으며, 등록된 신청이력은 없습니다."
     else:
         answer = f"{org_name}의 기관정보는 아래와 같으며, 전체 신청이력은 총 {len(history_payloads)}건입니다."
-    return answer, sources, org_payloads, history_payloads
-
-
-def _filter_full_history_answer(
-    org_name: str, payloads: list[dict], keyword: str
-) -> tuple[str, list[SourceItem], list[dict]] | None:
-    """직전 턴에서 보여준 "전체 이력" 목록 안에서, 이번 턴 후속 질문의 키워드로 코드가
-    직접 텍스트 매칭해 필터링한다(2026-09-30). LLM에게 "이 중 관련된 것만 답해라"를
-    맡기면 몇 건을 답할지 매번 달라지는 문제가 실측 확인됐기 때문에(21건이라 답했는데
-    실제 15건), 여기서는 완전탐색 텍스트 매칭으로 정확한 건수를 보장한다.
-    매칭이 하나도 없으면 None을 반환한다 — 이건 "그 목록엔 없다"고 확정할 근거가 아니라
-    애초에 이 후속 질문이 그 목록과 무관한 완전히 새로운 검색일 수도 있기 때문에, 호출부가
-    일반 검색 경로로 안전하게 넘어가도록 한다."""
-    normalized_keyword = "".join(keyword.split())
-    matched = [
-        p for p in payloads
-        if normalized_keyword in "".join(p["text"].split()) + "".join((p.get("요약") or "").split())
-    ]
-    if not matched:
-        return None
-    matched.sort(key=_history_date, reverse=True)
-    sources = [_build_source_item(p) for p in matched]
-    answer = f"{org_name}의 전체 이력 중 '{keyword}' 관련 내용은 총 {len(matched)}건입니다."
-    return answer, sources, matched
+    return answer, sources, org_payloads
 
 
 def ask(question: str, session_id: str | None, menu_scope: str | None = None) -> ChatResponse:
@@ -1155,27 +1160,10 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     if _looks_like_full_org_history_question(analysis.standalone_question, analysis.filters) and (
         allowed_data_types is None or "신청이력" in allowed_data_types
     ):
-        answer_text, sources, org_payloads, history_payloads = _full_org_history_answer(analysis.filters.기관명)
+        answer_text, sources, org_payloads = _full_org_history_answer(analysis.filters.기관명)
         session_store.append_turn(session_id, question, answer_text)
         session_store.set_last_sources(session_id, org_payloads)
-        session_store.set_last_full_history(session_id, analysis.filters.기관명, history_payloads)
         return ChatResponse(session_id=session_id, answer=answer_text, sources=sources)
-
-    # 직전 턴에 "전체 이력" 목록을 보여준 상태에서 키워드가 있는 후속 질문이 오면, 그
-    # 목록 안에서 코드가 직접 텍스트 매칭으로 필터링한다(2026-09-30, `_filter_full_history_answer`
-    # 참고 — 일반 검색(top-K+답변생성 LLM 요약)은 완전성을 보장 못 하는 문제가 실측 확인됨).
-    # 매칭이 하나도 없으면 이 후속 질문이 그 목록과 무관한 새 검색일 수 있으니 아래 일반
-    # 검색 경로로 그대로 넘어간다.
-    if analysis.filters.키워드:
-        last_full_history = session_store.get_last_full_history(session_id)
-        if last_full_history:
-            history_org_name, history_payloads = last_full_history
-            filtered = _filter_full_history_answer(history_org_name, history_payloads, analysis.filters.키워드)
-            if filtered is not None:
-                answer_text, sources, matched_payloads = filtered
-                session_store.append_turn(session_id, question, answer_text)
-                session_store.set_last_sources(session_id, matched_payloads)
-                return ChatResponse(session_id=session_id, answer=answer_text, sources=sources)
 
     resolved_field = _resolve_list_field(analysis.standalone_question, analysis.filters)
     # is_aggregation_question을 LLM이 이미 true로 확신했으면, 코드 휴리스틱(놓친 케이스를

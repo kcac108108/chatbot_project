@@ -38,23 +38,27 @@ ATTACHMENT_BASE_DIR = os.getenv("ATTACHMENT_BASE_DIR")
 # 실제 1시간 넘게 응답이 안 오는 요청을 관찰함 — 운영 배포 전 반드시 필요한 방어).
 CHAT_REQUEST_TIMEOUT_SECONDS = int(os.getenv("CHAT_REQUEST_TIMEOUT_SECONDS", "45"))
 
-# 신규 이력 첨부파일 자동처리(2026-09-29) — 전산팀 OCR 서버(개발기간 외부망/운영 내부망
-# 경로가 다름, ATTACHMENT_BASE_DIR과 동일한 전환 방식)와의 SFTP 접속정보. 포트·계정은
-# 전산팀이 SFTP 호환성 조사 중이라 아직 확정 전 — 값이 없으면 자동처리 파이프라인이
-# 실행 시점에 명확한 에러로 즉시 알려주고(조용히 실패하지 않고), 나머지 로직은 이 값들과
-# 무관하게 먼저 완성해둔다.
-OCR_SFTP_HOST = os.getenv("OCR_SFTP_HOST")
-OCR_SFTP_PORT = int(os.getenv("OCR_SFTP_PORT", "22"))
-OCR_SFTP_USER = os.getenv("OCR_SFTP_USER")
-OCR_SFTP_PASSWORD = os.getenv("OCR_SFTP_PASSWORD")
+# 신규 이력 첨부파일 자동처리 — 전산팀 OCR 연동(2026-10-01 설계 확정).
+# 당초(9/29) SFTP로 193.1.2.43에 파일을 올리는 방식을 시도했으나 32번 서버(첨부 원본)
+# ↔193.1.2.43(OCR 서버) 간 SFTP 버전 호환 문제로 막힘 — 이후 대화에서 핵심 사실 확인:
+# 우리 운영서버(챗봇 앱 배포 위치)와 이 OCR 서버가 물리적으로 같은 서버(43번 서버,
+# 193.1.2.43)임. 그래서 SFTP/네트워크 전송 자체가 불필요해지고, 아래 경로들은 전부
+# "로컬 파일시스템 경로"로 취급한다(ATTACHMENT_BASE_DIR과 같은 패턴) — OCR_SFTP_* 설정은
+# 더 이상 필요 없어 제거함.
 
 # OCR 트리거 API — 개발 기간 한정 외부망 주소를 기본값으로 두고, 운영 배포 시 내부망
-# 주소(http://193.1.2.43:9091)로 .env만 교체하면 된다.
+# 주소(http://193.1.2.43:9091)로 .env만 교체하면 된다. 같은 서버에 배포되면
+# localhost 주소로 바꿔도 된다(코드 변경 없이 .env만 교체).
 OCR_API_BASE_URL = os.getenv("OCR_API_BASE_URL", "https://ai.bandtrass.or.kr:9091")
 
-# OCR 서버(193.1.2.43)의 입력·출력 폴더 경로 — 전산팀 안내 그대로.
+# OCR 서버(같은 43번 서버)의 입력·출력 폴더 — 전산팀 안내 그대로, 전부 로컬 경로.
 OCR_REMOTE_PDF_DIR = os.getenv("OCR_REMOTE_PDF_DIR", "/DATA/backend/rag/data")
 OCR_REMOTE_IMAGE_DIR = os.getenv("OCR_REMOTE_IMAGE_DIR", "/DATA/backend/rag/data/images")
 # 이미지 결과 txt가 pdfToText와 같은 폴더에 나오는지는 전산팀에 명시적으로 확인받지
 # 못했다 — 일단 PDF와 동일 폴더로 가정, 실제 연동 시 재확인 필요.
 OCR_REMOTE_TEXT_DIR = os.getenv("OCR_REMOTE_TEXT_DIR", "/DATA/backend/rag/data/pdfToText")
+
+# 전산팀이 신규 첨부파일을 매일 가져다주는 위치 — DOCUCD/ATTFILE_ID/파일명 폴더 구조를
+# 그대로 유지해서 전달해주기로 함(2026-10-01 전산팀 수락). 정확한 경로는 아직 전산팀과
+# 확정 전이라 임시값 — 확정되는 대로 .env에 반영할 것.
+ATTACHMENT_DROP_DIR = os.getenv("ATTACHMENT_DROP_DIR", "/new_attachments")

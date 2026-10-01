@@ -24,7 +24,6 @@ olefile==0.47
 openai==1.51.0
 openpyxl==3.1.5
 oracledb==2.4.1
-paramiko==5.0.0
 portalocker==2.10.1
 protobuf==7.35.1
 pycparser==3.0
