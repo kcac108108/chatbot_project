@@ -1018,52 +1018,11 @@ def _payloads_to_history_items(payloads: list[dict]) -> list[HistoryItem]:
     return items
 
 
-def _resolve_org_name(organization_id: str) -> str | None:
-    """"이력 보기" 버튼은 기관정보 카드의 원본ID(기관ID)만 넘겨받는다 — 그 기관정보의
-    기관명을 먼저 찾아야, 같은 이름으로 중복 등록된 다른 기관정보(예: 대한무역투자진흥공사
-    4건)까지 전부 찾아 이력을 합칠 수 있다."""
-    orgs = find_by_type_and_source("기관정보", organization_id, limit=1)
-    return orgs[0].get("기관명") if orgs else None
-
-
-def _merged_history_payloads(org_payloads: list[dict]) -> list[dict]:
-    """같은 기관명으로 중복 등록된 기관정보 레코드들(예: 대한무역투자진흥공사 4건)이
-    주어지면, 그 신청이력을 원본ID 기준 중복 없이 합친다 — "이력 보기"/"이력 검색"
-    버튼과 _full_org_history_answer가 이 로직을 공유한다(2026-10-06). 기존엔 "이력
-    보기"가 클릭한 기관정보 카드 하나(기관ID 1개)의 이력만 보여줘서, 같은 기관명인데
-    카드가 다르면 결과가 달라 보이는 문제가 있었다(10/2 "KOTRA" 사례로 발견 — 버그는
-    아니었지만 사용자 혼란 유발)."""
-    history_payloads: list[dict] = []
-    seen: set[str] = set()
-    for org in org_payloads:
-        for payload in _get_organization_history_payloads(org["원본ID"]):
-            if payload["원본ID"] in seen:
-                continue
-            seen.add(payload["원본ID"])
-            history_payloads.append(payload)
-    history_payloads.sort(key=_history_date, reverse=True)
-    return history_payloads
-
-
-def _merged_history_payloads_by_name(org_name: str) -> list[dict]:
-    return _merged_history_payloads(find_by_type_and_field("기관정보", "기관명", org_name))
-
-
-def _history_payloads_for_history_view(organization_id: str) -> list[dict]:
-    """"이력 보기"/"이력 검색" 버튼 공용 조회 — 기관명을 찾을 수 있으면 같은 이름의
-    기관정보를 전부 합쳐서(_merged_history_payloads_by_name), 못 찾으면(예외적 상황)
-    원래대로 그 기관ID 하나의 이력만 반환한다."""
-    org_name = _resolve_org_name(organization_id)
-    if org_name:
-        return _merged_history_payloads_by_name(org_name)
-    return _get_organization_history_payloads(organization_id)
-
-
 def get_organization_history(organization_id: str) -> list[HistoryItem]:
     """특정 기관의 신청이력 전체를 top-K 제한 없이 정확히 가져온다 — LLM 서술 없이 코드가
-    직접 날짜+제목+원본ID 표로 렌더링한다("이력 보기" 버튼 클릭 시 호출). 같은 기관명으로
-    중복 등록된 기관정보가 있으면 전부 합쳐서 보여준다(2026-10-06, 아래 설명 참고)."""
-    return _payloads_to_history_items(_history_payloads_for_history_view(organization_id))
+    직접 날짜+제목+원본ID 표로 렌더링한다("이력 보기" 버튼 클릭 시 호출). 신청이력 청크
+    payload에 이미 부모 기관ID가 들어있어 별도 Oracle 조회 없이 Qdrant만으로 완결된다."""
+    return _payloads_to_history_items(_get_organization_history_payloads(organization_id))
 
 
 def search_organization_history(organization_id: str, keyword: str) -> list[HistoryItem]:
@@ -1084,11 +1043,8 @@ def search_organization_history(organization_id: str, keyword: str) -> list[Hist
     이력" → 83건 중 83건 전부 매칭되는 식으로 재현). 기관마다 다른 상투어를 고정 규칙으로
     다 예측할 수 없어 단순 정확매칭으로 되돌림(사용자 판단, "정확하지 않은 걸 알려주는건
     없는거보다 못하다") — 자연스러운 문장으로 찾고 싶으면 일반 채팅(LLM이 키워드를 먼저
-    추출해 훨씬 유연하게 찾아줌, 실측 확인됨)을 쓰도록 안내하는 쪽으로 역할을 나눈다.
-
-    검색 대상도 "이력 보기"가 보여주는 것과 똑같이 같은 기관명의 기관정보를 전부 합친
-    범위로 맞춘다(2026-10-06) — 그래야 표에 보이는 목록과 검색 결과 범위가 항상 일치한다."""
-    payloads = _history_payloads_for_history_view(organization_id)
+    추출해 훨씬 유연하게 찾아줌, 실측 확인됨)을 쓰도록 안내하는 쪽으로 역할을 나눈다."""
+    payloads = _get_organization_history_payloads(organization_id)
     normalized_keyword = "".join(keyword.split())
     matched = [
         p for p in payloads
@@ -1147,7 +1103,16 @@ def _full_org_history_answer(org_name: str) -> tuple[str, list[SourceItem], list
         return f"'{org_name}' 기관 정보를 찾지 못했습니다.", [], []
 
     sources = [_build_source_item(p) for p in org_payloads]
-    history_payloads = _merged_history_payloads(org_payloads)
+
+    history_payloads: list[dict] = []
+    seen: set[str] = set()
+    for org in org_payloads:
+        for payload in _get_organization_history_payloads(org["원본ID"]):
+            if payload["원본ID"] in seen:
+                continue
+            seen.add(payload["원본ID"])
+            history_payloads.append(payload)
+    history_payloads.sort(key=_history_date, reverse=True)
 
     # 건별 목록은 "이력 보기" 버튼을 누르면 표로 바로 아래에 나오므로, 여기 답변 문장에
     # 또 나열하면 같은 내용이 중복된다(사용자 지적, 2026-09-22) — 건수만 요약해서 안내.
