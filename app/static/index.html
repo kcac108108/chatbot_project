@@ -138,6 +138,14 @@
   .msg-row { display: flex; gap: 9px; max-width: min(640px, 86%); animation: fadeIn .22s ease; }
   .msg-row.user { align-self: flex-end; flex-direction: row-reverse; }
   .msg-row.bot { align-self: flex-start; }
+  /* 근거자료(sources/details)가 붙은 답변은 말풍선 자체가 내용물 중 제일 넓은 걸 보고
+     스스로 폭을 정하는(shrink-to-fit) 성질 때문에, 카드 안쪽 요소를 아무리 100%로
+     맞춰도 안쪽 내용(첨부 미리보기, 펼친 이력 표)이 많아지면 말풍선 전체가 늘어난다
+     (2026-10-06, 실사용 피드백 — 카드/표 레벨 고정만으로는 해결 안 됨). 근거자료가 있는
+     메시지만 폭을 미리 고정해 이 체인을 끊는다. 단순 답변(근거자료 없음)은 지금처럼
+     내용 길이에 맞춰 자연스럽게 좁게 유지한다. */
+  .msg-row.bot.has-sources { width: min(640px, 86%); }
+  .msg-row.bot.has-sources .msg-col { width: 100%; }
   @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
   @keyframes flashHighlight { 0% { box-shadow: 0 0 0 0 rgba(59,91,219,.6); } 100% { box-shadow: 0 0 0 9px rgba(59,91,219,0); } }
   .msg-row.flash .bubble { animation: flashHighlight .9s ease; }
@@ -218,14 +226,14 @@
   }
   .source-chip:hover { background: rgba(52,201,163,.22); border-color: rgba(52,201,163,.55); }
   .source-preview {
-    display: none; margin-top: 4px; padding: 9px 11px;
+    display: none; margin-top: 4px; padding: 9px 11px; width: 100%;
     background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.08);
     border-radius: 10px; font-size: 11.8px; color: var(--ink-dark-soft); line-height: 1.55; white-space: pre-wrap;
   }
   .source-row.open .source-preview { display: block; }
 
   .field-list {
-    display: none; margin-top: 4px;
+    display: none; margin-top: 4px; width: 100%;
     border: 1px solid rgba(255,255,255,.08); border-radius: 10px; overflow: hidden;
   }
   .source-row.open .field-list { display: block; }
@@ -239,7 +247,7 @@
   .field-value { flex: 1; min-width: 0; color: var(--ink-dark-soft); line-height: 1.55; white-space: pre-wrap; }
 
   .attachment-list {
-    display: none; margin-top: 8px; padding-top: 8px;
+    display: none; margin-top: 8px; padding-top: 8px; width: 100%;
     border-top: 1px dashed rgba(255,255,255,.14);
   }
   .source-row.open .attachment-list { display: block; }
@@ -250,8 +258,9 @@
   .attachment-item { margin-bottom: 6px; }
   .attachment-item:last-child { margin-bottom: 0; }
   .attachment-chip {
+    display: block; width: 100%; text-align: left;
     font-size: 10.5px; background: rgba(255,255,255,.05); color: var(--ink-dark-soft);
-    border: 1px solid rgba(255,255,255,.16); border-radius: 999px; padding: 3px 9px;
+    border: 1px solid rgba(255,255,255,.16); border-radius: 8px; padding: 4px 9px;
     cursor: pointer; font-family: inherit; transition: background .15s, border-color .15s;
   }
   .attachment-chip:hover { background: rgba(255,255,255,.09); border-color: rgba(255,255,255,.3); }
@@ -278,7 +287,14 @@
   .extracted-table td { color: var(--ink-dark-soft); }
   .extracted-table tr:nth-child(even) td { background: rgba(255,255,255,.02); }
 
-  .history-wrap { margin-top: 8px; padding-top: 8px; border-top: 1px dashed rgba(255,255,255,.14); }
+  /* "이력 보기" 표 전용 — 칼럼폭을 고정해서, 행을 펼쳤을 때 그 안의 상세내용(특히
+     첨부파일 미리보기)이 길어져도 표 전체가 넓어지지 않게 한다(2026-10-06, 실사용
+     피드백). 마크다운 표 렌더링(buildTableElement)은 칼럼 수·내용이 제각각이라
+     이 고정폭을 적용하면 안 돼서, 전역 .extracted-table이 아니라 이 전용 클래스로
+     범위를 좁힌다. */
+  .extracted-table.history-table { table-layout: fixed; }
+
+  .history-wrap { margin-top: 8px; padding-top: 8px; width: 100%; border-top: 1px dashed rgba(255,255,255,.14); }
   .history-toggle-btn {
     font-size: 10.5px; background: rgba(255,255,255,.05); color: var(--ink-dark-soft);
     border: 1px solid rgba(255,255,255,.16); border-radius: 999px; padding: 3px 9px;
@@ -641,7 +657,10 @@ function buildSourceChip(s, orgGroupMeta) {
   }
 
   if (hasToggleContent) {
-    chip.addEventListener("click", () => srow.classList.toggle("open"));
+    chip.addEventListener("click", (e) => {
+      e.stopPropagation();
+      srow.classList.toggle("open");
+    });
   } else {
     chip.style.cursor = "default";
   }
@@ -704,7 +723,18 @@ function renderHistoryTable(container, items) {
   container.appendChild(countLabel);
 
   const table = document.createElement("table");
-  table.className = "extracted-table";
+  table.className = "extracted-table history-table";
+
+  // 칼럼폭을 미리 고정해둔다(table-layout:fixed는 내용이 아니라 이 비율만 본다) —
+  // 신청일(짧은 고정 길이)·원본ID(고정 길이)는 좁게, 사업명(가변 길이)은 넓게.
+  const colgroup = document.createElement("colgroup");
+  [13, 63, 24].forEach(pct => {
+    const col = document.createElement("col");
+    col.style.width = pct + "%";
+    colgroup.appendChild(col);
+  });
+  table.appendChild(colgroup);
+
   const thead = document.createElement("thead");
   const headRow = document.createElement("tr");
   ["신청일", "사업명", "원본ID"].forEach(h => {
@@ -853,7 +883,8 @@ function pushRecentQuestion(q, rowEl) {
 
 function addMessage(role, text, sources, isError, retryQuestion, details) {
   const row = document.createElement("div");
-  row.className = "msg-row " + role;
+  const hasEvidence = (sources && sources.length > 0) || (details && details.length > 0);
+  row.className = "msg-row " + role + (hasEvidence ? " has-sources" : "");
 
   const avatar = document.createElement("div");
   avatar.className = "avatar " + role;
