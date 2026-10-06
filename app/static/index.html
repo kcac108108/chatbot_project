@@ -187,8 +187,29 @@
   .detail-row.open .detail-body { display: block; }
 
   .sources-label { font-size: 10.5px; color: var(--ink-dark-soft); margin-top: 2px; }
-  .sources { display: flex; flex-direction: column; gap: 6px; width: 100%; }
+  .sources { display: flex; flex-direction: column; gap: 8px; width: 100%; }
   .source-row { display: flex; flex-direction: column; align-items: flex-start; }
+
+  /* 기관정보 카드는 "이력 보기"까지 한 상자 안에 담아, 칩과 이력보기 사이의 점선이
+     다음 카드와의 경계처럼 보이던 문제를 없앤다(2026-10-06, 사용자 피드백으로 개선).
+     같은 기관명이 여러 건으로 중복 등록된 경우에는 묶음 안내 띠 + 순번 배지도 더한다. */
+  .source-row.org-boxed {
+    background: rgba(255,255,255,.035); border: 1px solid rgba(255,255,255,.1);
+    border-radius: 12px; padding: 11px 12px; width: 100%;
+  }
+  .source-row.org-boxed .history-wrap { border-top: none; margin-top: 8px; padding-top: 0; }
+  .chip-with-badge { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; }
+  .chip-with-badge .source-chip { flex: 1; }
+  .org-idx-badge {
+    font-size: 10px; font-weight: 700; color: var(--mint); background: rgba(52,201,163,.14);
+    border-radius: 999px; padding: 2px 8px; flex-shrink: 0;
+  }
+  .org-group-banner {
+    background: rgba(52,201,163,.08); border: 1px solid rgba(52,201,163,.25);
+    border-radius: 10px; padding: 9px 12px; width: 100%;
+  }
+  .org-group-banner-text { font-size: 11.3px; color: var(--ink-dark); font-weight: 600; }
+  .org-group-banner-sub { font-size: 10.3px; color: var(--ink-dark-soft); margin-top: 2px; }
   .detail-source-row { margin-top: 8px; }
   .source-chip {
     font-size: 10.8px; background: rgba(52,201,163,.12); color: var(--mint);
@@ -472,7 +493,7 @@ function renderRichText(container, text) {
   }
 }
 
-function buildSourceChip(s) {
+function buildSourceChip(s, orgGroupMeta) {
   const srow = document.createElement("div");
   srow.className = "source-row";
 
@@ -480,7 +501,26 @@ function buildSourceChip(s) {
   chip.className = "source-chip";
   chip.type = "button";
   chip.textContent = `[${s.데이터유형}] ${s.원본ID}` + (s.기관명 ? ` · ${s.기관명}` : "");
-  srow.appendChild(chip);
+
+  // 기관정보 카드는 "이력 보기"까지 하나의 상자에 담는다(아래 해당 분기 참고). 같은
+  // 기관명이 여러 건 중복 등록돼 있으면(orgGroupMeta.total > 1) 순번 배지도 붙인다.
+  if (s.데이터유형 === "기관정보") {
+    srow.classList.add("org-boxed");
+    if (orgGroupMeta && orgGroupMeta.total > 1) {
+      const chipRow = document.createElement("div");
+      chipRow.className = "chip-with-badge";
+      chipRow.appendChild(chip);
+      const badge = document.createElement("span");
+      badge.className = "org-idx-badge";
+      badge.textContent = `${orgGroupMeta.index} / ${orgGroupMeta.total}`;
+      chipRow.appendChild(badge);
+      srow.appendChild(chipRow);
+    } else {
+      srow.appendChild(chip);
+    }
+  } else {
+    srow.appendChild(chip);
+  }
 
   let hasToggleContent = false;
 
@@ -606,6 +646,50 @@ function buildSourceChip(s) {
     chip.style.cursor = "default";
   }
   return srow;
+}
+
+// 같은 기관명으로 중복 등록된 기관정보 카드들 바로 위에 붙는 안내 띠 — "왜 같은 기관명
+// 카드가 여러 장 나오는지"를 화면에서 바로 설명한다(2026-10-06, 사용자 피드백 반영).
+function buildOrgGroupBanner(orgName, count) {
+  const banner = document.createElement("div");
+  banner.className = "org-group-banner";
+
+  const title = document.createElement("div");
+  title.className = "org-group-banner-text";
+  title.textContent = `${orgName} · 중복 등록 ${count}건`;
+  banner.appendChild(title);
+
+  const sub = document.createElement("div");
+  sub.className = "org-group-banner-sub";
+  sub.textContent = "같은 기관이 서로 다른 목적으로 각각 등록된 건입니다";
+  banner.appendChild(sub);
+
+  return banner;
+}
+
+// 기관명이 같은 기관정보 카드가 여러 개(중복 등록)면, 원래 순서와 무관하게 한데 모아
+// 묶음 안내 띠 밑에 순서대로 배치한다 — 그 외(단독 기관정보, 다른 데이터유형)는 원래
+// 순서 그대로 둔다(2026-10-06).
+function appendGroupedSources(box, sources) {
+  const orgNameCounts = {};
+  sources.forEach(s => {
+    if (s.데이터유형 === "기관정보" && s.기관명) {
+      orgNameCounts[s.기관명] = (orgNameCounts[s.기관명] || 0) + 1;
+    }
+  });
+
+  const renderedGroups = new Set();
+  sources.forEach(s => {
+    if (s.데이터유형 === "기관정보" && s.기관명 && orgNameCounts[s.기관명] > 1) {
+      if (renderedGroups.has(s.기관명)) return; // 이미 묶어서 출력한 그룹
+      renderedGroups.add(s.기관명);
+      const group = sources.filter(x => x.데이터유형 === "기관정보" && x.기관명 === s.기관명);
+      box.appendChild(buildOrgGroupBanner(s.기관명, group.length));
+      group.forEach((g, i) => box.appendChild(buildSourceChip(g, { index: i + 1, total: group.length })));
+    } else {
+      box.appendChild(buildSourceChip(s));
+    }
+  });
 }
 
 function renderHistoryTable(container, items) {
@@ -856,7 +940,7 @@ function addMessage(role, text, sources, isError, retryQuestion, details) {
 
     const box = document.createElement("div");
     box.className = "sources";
-    sources.forEach(s => box.appendChild(buildSourceChip(s)));
+    appendGroupedSources(box, sources);
     col.appendChild(box);
   }
 
