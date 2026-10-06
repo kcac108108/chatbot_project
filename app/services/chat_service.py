@@ -1025,34 +1025,6 @@ def get_organization_history(organization_id: str) -> list[HistoryItem]:
     return _payloads_to_history_items(_get_organization_history_payloads(organization_id))
 
 
-def search_organization_history(organization_id: str, keyword: str) -> list[HistoryItem]:
-    """"이력 보기" 표 안의 검색창에서 명시적으로 입력한 키워드로, 그 기관의 전체 이력
-    안에서 코드가 직접 텍스트 매칭한다(2026-09-30). 채팅 자연어로 "그 중 OO 관련된 것만"
-    같은 의도를 추론하려던 이전 시도는, 키워드가 있고 직전에 전체이력을 봤다는 조건만으로
-    무조건 그 목록 안으로 좁혀버려서 완전히 무관한 새 검색("한국개발연구원 이력" 다음
-    "보안 관련 문서 있어?")까지 잘못 좁히는 오탐이 실사용에서 재현되어 폐기됨. 사용자가
-    이 검색창에 입력하고 버튼을 눌렀다는 것 자체가 "이 목록 안에서 찾겠다"는 의도를
-    명확히 하므로, 더 이상 의도를 추론할 필요가 없다.
-
-    입력한 문구 전체가 글자 그대로 본문에 있어야 하는 완전탐색 방식이라, 자연스러운 문장
-    입력("~과 관련된 이력")은 실패할 수 있다(2026-10-01 발견) — 단어를 뒤에서부터 떼어내며
-    더 느슨하게 매칭하는 보정을 시도했으나, 같은 기관의 여러 이력이 거의 같은 사유로
-    등록되는 경우가 흔해서(예: 한국환경공단 83건 전부가 같은 제공목적을 공유) "부담금"/
-    "제품" 같은 평범한 단어조차 그 기관 안에서는 거의 모든 문서에 등장하는 상투어가
-    돼버려, 하나 고치면 다른 데서 또 틀리는 문제가 반복 재현됨(2026-10-01, "부담금 관련
-    이력" → 83건 중 83건 전부 매칭되는 식으로 재현). 기관마다 다른 상투어를 고정 규칙으로
-    다 예측할 수 없어 단순 정확매칭으로 되돌림(사용자 판단, "정확하지 않은 걸 알려주는건
-    없는거보다 못하다") — 자연스러운 문장으로 찾고 싶으면 일반 채팅(LLM이 키워드를 먼저
-    추출해 훨씬 유연하게 찾아줌, 실측 확인됨)을 쓰도록 안내하는 쪽으로 역할을 나눈다."""
-    payloads = _get_organization_history_payloads(organization_id)
-    normalized_keyword = "".join(keyword.split())
-    matched = [
-        p for p in payloads
-        if normalized_keyword in "".join(p["text"].split()) + "".join((p.get("요약") or "").split())
-    ]
-    return _payloads_to_history_items(matched)
-
-
 def get_record_detail(data_type: str, source_id: str) -> SourceItem | None:
     """"이력 보기" 표의 한 행(원본ID)을 클릭했을 때, 그 건 하나만 상세 조회한다 —
     메인 근거자료 카드와 완전히 같은 형태(세부항목 표+관련첨부)로 보여주기 위해
