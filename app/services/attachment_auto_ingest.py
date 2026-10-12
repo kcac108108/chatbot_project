@@ -104,7 +104,13 @@ def run_incremental_attachment_ingest(docucd: str) -> int:
             pending_dtms.append(_attachment_effective_dtm(att))
             continue
 
-        text = result_path.read_text(encoding="utf-8", errors="replace")
+        # 결과 파일 인코딩은 UTF-8로 전산팀에 확인됨(2026-10-12) — errors="replace"로 깨진
+        # 글자를 조용히 대체문자로 덮지 않는다. 예상과 달리 UTF-8이 아닌 파일이 섞여 있으면
+        # 조용히 깨진 데이터를 적재하는 것보다, 여기서 예외로 드러나 그 건이 눈에 띄는 게
+        # 낫다(건별 try/except 없이 run_incremental_attachment_ingest_all()의 메뉴 단위
+        # catch-all로 올라가 그 메뉴 전체가 "오류로 중단"되는 점은 감수 — 과거 SQL 파일
+        # CP949 오독 버그처럼 "조용히 깨지는 것"이 가장 위험하다는 교훈 반영).
+        text = result_path.read_text(encoding="utf-8")
         if not text.strip():
             print(f"[attachment_auto:{docucd}] 결과파일 비어있음(건너뜀): {filename}")
             continue
