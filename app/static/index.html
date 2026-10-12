@@ -64,17 +64,26 @@
     background: #eef1f4 url("/static/bot-avatar.png") center / cover no-repeat;
   }
   .sidebar-brand b { font-size: 13.5px; letter-spacing: -.01em; }
-  .sidebar h3 { font-size: 11.5px; font-weight: 700; color: var(--ink); margin: 0 0 8px; }
-  .side-section { margin-bottom: 22px; }
-  .side-list { display: flex; flex-direction: column; gap: 2px; }
+
+  /* 구역(빠른 메뉴/자주 묻는 질문/최근 검색) 시인성 개선(2026-10-12) — 제목에 아이콘+포인트색을
+     주고, 구역 사이에 얇은 구분선을 넣어 스크롤 중에도 구역 경계가 눈에 띄게 한다. */
+  .sec-title-row { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
+  .sec-title-row svg { flex-shrink: 0; }
+  .sidebar h3 { font-size: 10.5px; font-weight: 800; letter-spacing: .03em; text-transform: uppercase; margin: 0; }
+  .sidebar h3.sec-menu { color: var(--accent); }
+  .sidebar h3.sec-faq { color: #1d7a5f; }
+  .sidebar h3.sec-recent { color: var(--ink-soft); }
+  .side-section { margin-bottom: 18px; padding-top: 14px; border-top: 1px solid var(--rule); }
+  .side-section:first-of-type { padding-top: 0; border-top: none; }
+  .side-list { display: flex; flex-direction: column; gap: 4px; }
   .side-item {
     font-family: inherit; font-size: 12.5px; text-align: left; line-height: 1.45;
-    background: transparent; border: none; color: var(--ink-soft);
-    padding: 8px 10px; border-radius: 7px; cursor: pointer;
-    transition: background .15s, color .15s;
+    background: #fff; border: 1px solid var(--rule); color: var(--ink-soft);
+    padding: 7px 10px; border-radius: 8px; cursor: pointer;
+    transition: background .15s, color .15s, border-color .15s;
   }
-  .side-item:hover { background: var(--accent-soft); color: var(--accent); }
-  .side-item.active { background: var(--accent-soft); color: var(--accent); font-weight: 700; }
+  .side-item:hover { background: var(--accent-soft); color: var(--accent); border-color: rgba(59,91,219,.3); }
+  .side-item.active { background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 700; }
   #faq-list.side-list { gap: 7px; }
   .faq-item {
     background: var(--page-bg);
@@ -83,12 +92,13 @@
   }
   .faq-item:hover { background: var(--accent-soft); border-color: rgba(59,91,219,.3); }
   .side-recent {
-    font-size: 12px; text-align: left; width: 100%; background: transparent; border: none;
-    font-family: inherit; color: var(--ink-faint); cursor: pointer;
-    padding: 6px 9px; line-height: 1.5; border-left: 2px solid var(--rule);
-    transition: border-color .15s, color .15s;
+    font-size: 11.3px; text-align: left; width: 100%; background: #fff; color: var(--ink);
+    font-family: inherit; cursor: pointer;
+    padding: 6px 9px; line-height: 1.5;
+    border: 1px solid var(--rule); border-left: 3px solid var(--mint); border-radius: 0 8px 8px 0;
+    transition: border-color .15s, color .15s, background .15s;
   }
-  .side-recent:hover { border-color: var(--accent); color: var(--ink-soft); }
+  .side-recent:hover { background: var(--accent-soft); border-left-color: var(--mint); border-color: rgba(59,91,219,.3); border-left-width: 3px; }
   .side-empty { font-size: 11.5px; color: var(--ink-faint); padding: 4px 9px; }
 
   /* ---------------- widget (right) ---------------- */
@@ -372,17 +382,26 @@
       </div>
 
       <div class="side-section">
-        <h3>빠른 메뉴</h3>
+        <div class="sec-title-row">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" style="color:var(--accent)"><rect x="3" y="3" width="8" height="8" rx="1.5"/><rect x="13" y="3" width="8" height="8" rx="1.5"/><rect x="3" y="13" width="8" height="8" rx="1.5"/><rect x="13" y="13" width="8" height="8" rx="1.5"/></svg>
+          <h3 class="sec-menu">빠른 메뉴</h3>
+        </div>
         <div class="side-list" id="menu-list"></div>
       </div>
 
       <div class="side-section">
-        <h3>자주 묻는 질문</h3>
+        <div class="sec-title-row">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" style="color:#1d7a5f"><circle cx="12" cy="12" r="9"/><path d="M9.5 9a2.5 2.5 0 0 1 5 0c0 1.7-2.5 2-2.5 3.5" stroke-linecap="round"/><circle cx="12" cy="16.3" r=".4" fill="#1d7a5f" stroke="none"/></svg>
+          <h3 class="sec-faq">자주 묻는 질문</h3>
+        </div>
         <div class="side-list" id="faq-list"></div>
       </div>
 
       <div class="side-section">
-        <h3>최근 검색</h3>
+        <div class="sec-title-row">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" style="color:var(--ink-soft)"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <h3 class="sec-recent">최근 검색</h3>
+        </div>
         <div class="side-list" id="recent-list">
           <div class="side-empty">아직 검색 기록이 없습니다</div>
         </div>
