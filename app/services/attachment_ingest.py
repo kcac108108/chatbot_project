@@ -70,12 +70,14 @@ def _is_path_only(filename: str) -> bool:
 def _valid_attachments(docucd: str, since=None) -> list[dict]:
     """since를 주면 그 시각 이후 등록·수정된 첨부만 반환한다(신규 이력 자동처리 전용,
     2026-09-29) — 기존 이력에 나중에 파일이 추가되는 경우도 잡아야 해서 부모 레코드가
-    아니라 TM_ATTFILE 자신의 등록·수정일시(CR_DTM/IN_DTM)를 기준으로 본다."""
+    아니라 TM_ATTFILE 자신의 등록·수정일시(CR_DTM/IN_DTM)를 기준으로 본다. CR_DTM/IN_DTM도
+    같이 반환해서(2026-10-12), 결과 파일이 아직 안 생긴 건을 다음 실행에 재시도할 때
+    기준시각을 어디까지 되돌릴지 계산할 수 있게 한다."""
     table, col, _ = _DOCUCD_MAP[docucd]
     since_clause = "AND (A.CR_DTM > :since OR A.IN_DTM > :since)" if since else ""
     return fetch_all(
         f"""
-        SELECT A.ATTFILE_ID, A.ATTFILE_NUM, A.ATTFILE_NM, A.FILE_PATH
+        SELECT A.ATTFILE_ID, A.ATTFILE_NUM, A.ATTFILE_NM, A.FILE_PATH, A.CR_DTM, A.IN_DTM
         FROM TM_ATTFILE A
         WHERE A.DOCUCD = :docucd
           AND EXISTS (SELECT 1 FROM {table} T WHERE T.{col} = A.ATTFILE_ID)
@@ -89,6 +91,14 @@ def _valid_attachments(docucd: str, since=None) -> list[dict]:
 def _local_path(file_path_db: str, docucd: str, attfile_id: str) -> Path:
     filename = file_path_db.split("/")[-1]
     return Path(ATTACHMENT_BASE_DIR) / docucd / attfile_id / filename
+
+
+def _result_text_path(file_path_db: str, docucd: str, attfile_id: str) -> Path:
+    """전산팀 야간 배치가 만드는 OCR/추출 결과 파일 경로(2026-10-12) — 원본과 같은
+    폴더·같은 파일명, 확장자만 `.txt`로 바뀐다(스캔본·엑셀·한글·zip 등 형식 무관하게
+    전산팀이 전부 이 규칙으로 결과를 생성해줌, zip은 내부 파일들을 합쳐 결과 1개).
+    전산팀 OCR API를 우리가 직접 호출하던 기존 방식(`ocr_remote.py`)은 이걸로 대체됨."""
+    return _local_path(file_path_db, docucd, attfile_id).with_suffix(".txt")
 
 
 def _review_filename(att: dict, path: Path) -> str:
