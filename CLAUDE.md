@@ -498,6 +498,7 @@ Python(pip, requests, httpx, openai SDK 등)은 이 사설 루트 인증서를 �
 3. 실제 전산팀 결과 `.txt` 파일로 end-to-end 테스트(배치가 실제로 도는 환경에서)
 4. 매뉴얼(사용자용/운영자용) 작성
 5. **죽은 코드 정리**(2026-10-13 발견, 사용자가 내일로 미룸): `app/services/ocr_remote.py`와 관련 환경변수 4개(`OCR_API_BASE_URL`/`OCR_REMOTE_PDF_DIR`/`OCR_REMOTE_IMAGE_DIR`/`OCR_REMOTE_TEXT_DIR`)가 10/12 설계 전환(전산팀이 결과파일까지 생성) 이후 어디서도 호출되지 않는 죽은 코드로 확인됨 — 삭제하거나 `.env.example`에서 제거해 배포 시 운영 담당자 혼동 방지
+6. **`.env.example` 누락 2건**(2026-10-13 발견): 코드(`app/core/config.py`)는 `CHAT_REQUEST_TIMEOUT_SECONDS`(기본 45초)와 `CHAT_TOP_K`(기본 6)를 환경변수로 읽는데 `.env.example`엔 둘 다 없음 — 기본값이 있어 당장 작동엔 문제없으나, 운영 담당자가 이 값을 조정 가능한지 자체를 알 수 없음. `.env.example`에 추가할 것
 
 **② 계속 진행**
 - 계속 브라우저로 종합 테스트(지난번 이월된 "상세내역 간헐적 토글 오류" 포함)
