@@ -6,7 +6,13 @@ from qdrant_client.http import models as qmodels
 from app.core.config import CHAT_TOP_K
 from app.core.db import fetch_all
 from app.core.openai_client import chat_parse, embed_texts
-from app.core.vectordb import find_by_type_and_field, find_by_type_and_source, scan_field_contains, scan_text_contains
+from app.core.vectordb import (
+    find_by_type_and_field,
+    find_by_type_and_fields,
+    find_by_type_and_source,
+    scan_field_contains,
+    scan_text_contains,
+)
 from app.core.vectordb import search as vector_search
 from app.models.schemas import (
     AnswerDetail,
@@ -403,20 +409,46 @@ def _build_filter(
 
     conditions = []
 
-    # 첨부 청크는 payload에 "기관명" 필드 자체가 없다(부모 이력에만 있고, 첨부는 원본ID로만
-    # 연결됨) — 그래서 resolved_types가 전부 첨부류일 때 기관명을 그대로 걸면 항상 0건이 되고,
-    # 그 뒤 "필터 다 지우고 재검색" 단계까지 떨어져 무관한 다른 기관의 첨부가 섞여 들어오는
-    # 문제가 있었다(2026-10-13 발견 — "첨부파일" 전용 메뉴에서 "OO기관 관련 첨부파일 있어?"로
-    # 물으면 정보통신기획평가원 등 엉뚱한 기관이 결과에 섞임). 기관명을 직접 거는 대신, 그
-    # 기관명의 부모 레코드를 먼저 찾아 원본ID로 바꿔서 건다.
-    if "기관명" in values and resolved_types and resolved_types <= set(_BASE_TYPE_OF.keys()):
-        org_name = values.pop("기관명")
+    # 첨부 청크는 payload에 "데이터유형/원본ID/첨부파일명/요약/text" 외의 메타데이터 필드가
+    # 전혀 없다(기관명·연도·요청자·제공자·담당자·결재자·심의결과·차수 전부 부모 레코드에만
+    # 있음, 2026-10-13 전수 확인) — resolved_types가 전부 첨부류일 때 이런 필드가 남아있으면
+    # 그대로 걸면 항상 0건이 되고, 그 뒤 "필터 다 지우고 재검색" 단계까지 떨어져 무관한 다른
+    # 기관·사람의 첨부가 섞여 들어오는 문제가 있었다(2026-10-13 발견 — "첨부파일" 전용
+    # 메뉴에서 "OO기관 관련 첨부파일 있어?"로 물으면 정보통신기획평가원 등 엉뚱한 기관이
+    # 결과에 섞임). 처음엔 기관명만 처리했다가, 첨부 청크 전체를 전수 확인한 결과 연도·
+    # 요청자 등 다른 필드도 똑같이 없는 걸 확인해 전부 일반화함 — 남은 필드 전부를 부모
+    # 레코드 조회로 바꿔 원본ID로 건다.
+    if resolved_types and values and resolved_types <= set(_BASE_TYPE_OF.keys()):
+        parent_only_values = dict(values)
+        for field in parent_only_values:
+            values.pop(field)
         base_types = {_BASE_TYPE_OF[t] for t in resolved_types}
-        source_ids = {
-            payload["원본ID"]
-            for base_type in base_types
-            for payload in find_by_type_and_field(base_type, "기관명", org_name)
-        }
+
+        # 역할 필드(요청자/제공자/담당자/결재자)는 한 필드에 여러 사람이 콤마로 같이 저장된
+        # 경우가 있어서(예: 담당자="김인태, 전봉석") 정확매칭(find_by_type_and_fields)으로
+        # 찾으면 "김인태"만으로는 못 찾는다(2026-10-13 재현 확인 — 비첨부 스코프에서는 이미
+        # 2026-09-21에 같은 이유로 scan_field_contains를 만들어 쓰고 있었는데, 이 부모조회
+        # 경로는 처음에 그걸 빠뜨렸었음). 역할 필드가 있으면 부분 문자열 스캔으로, 역할
+        # 필드끼리 중복 추출됐으면(예: "박다은이 담당한 자료" → 요청자·담당자 둘 다 "박다은")
+        # 전부 OR로 합친다. 역할 필드가 아닌 조건(기관명 등)은 스캔 결과에 대해 추가로
+        # AND 필터링한다.
+        role_only = {f: v for f, v in parent_only_values.items() if f in _PERSON_ROLE_FIELDS}
+        non_role = {f: v for f, v in parent_only_values.items() if f not in _PERSON_ROLE_FIELDS}
+
+        source_ids = set()
+        if role_only:
+            for role_field, role_value in role_only.items():
+                for payload in scan_field_contains(role_field, role_value, limit=200):
+                    if payload.get("데이터유형") not in base_types:
+                        continue
+                    if any(payload.get(f) != v for f, v in non_role.items()):
+                        continue
+                    source_ids.add(payload["원본ID"])
+        else:
+            for base_type in base_types:
+                matches = find_by_type_and_fields(base_type, non_role)
+                source_ids.update(p["원본ID"] for p in matches)
+
         if source_ids:
             conditions.append(
                 qmodels.FieldCondition(key="원본ID", match=qmodels.MatchValue(value=next(iter(source_ids))))
@@ -424,9 +456,9 @@ def _build_filter(
                 else qmodels.FieldCondition(key="원본ID", match=qmodels.MatchAny(any=list(source_ids)))
             )
         else:
-            # 그 기관명의 부모 레코드 자체가 없으면(오탈자 등) 존재할 수 없는 값으로 걸어 0건이
-            # 되게 한다 — 기관명 조건이 조용히 사라져 무관한 결과가 섞이는 걸 막기 위함.
-            conditions.append(qmodels.FieldCondition(key="원본ID", match=qmodels.MatchValue(value="__no_such_org__")))
+            # 그 조건에 맞는 부모 레코드 자체가 없으면 존재할 수 없는 값으로 걸어 0건이
+            # 되게 한다 — 조건이 조용히 사라져 무관한 결과가 섞이는 걸 막기 위함.
+            conditions.append(qmodels.FieldCondition(key="원본ID", match=qmodels.MatchValue(value="__no_such_parent__")))
 
     # 방어: 요청자/제공자/담당자/결재자는 서로 다른 데이터유형에만 존재해 한 청크에서
     # 동시에 만족될 수 없다. 같은 이름이 질문 분석 단계에서 여러 역할 필드에 중복

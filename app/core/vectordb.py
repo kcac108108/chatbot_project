@@ -71,6 +71,27 @@ def find_by_type_and_field(data_type: str, field: str, value: str, limit: int = 
     return [p.payload for p in points]
 
 
+def find_by_type_and_fields(data_type: str, fields: dict[str, str], limit: int = 200) -> list[dict]:
+    """(데이터유형, 필드1=값1 AND 필드2=값2 ...)으로 정확히 매칭되는 payload를 전부
+    가져온다. 첨부 청크엔 데이터유형/원본ID/첨부파일명/요약/text 외의 메타데이터 필드가
+    없어서(기관명·연도·요청자 등 전부 부모 레코드에만 있음), 첨부류 스코프에서 이런
+    필드로 좁히려면 먼저 부모 레코드를 이 함수로 찾아 원본ID로 바꿔야 한다(2026-10-13,
+    app/services/chat_service.py의 _build_filter 참고)."""
+    if not fields:
+        return []
+    points, _ = _client.scroll(
+        collection_name=QDRANT_COLLECTION,
+        limit=limit,
+        with_payload=True,
+        with_vectors=False,
+        scroll_filter=qmodels.Filter(
+            must=[qmodels.FieldCondition(key="데이터유형", match=qmodels.MatchValue(value=data_type))]
+            + [qmodels.FieldCondition(key=field, match=qmodels.MatchValue(value=value)) for field, value in fields.items()]
+        ),
+    )
+    return [p.payload for p in points]
+
+
 def scan_text_contains(keyword: str, limit: int) -> list[dict]:
     """벡터 유사도가 아니라 본문에 특정 단어가 실제로 포함됐는지 전수 스캔한다.
     한글은 조사·복합어 때문에 Qdrant 내장 전문검색 토크나이저로는 매칭이 불안정해,
