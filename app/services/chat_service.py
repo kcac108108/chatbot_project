@@ -852,6 +852,7 @@ PROMPT_INJECTION_REFUSAL = (
 INTERNAL_INFO_PROBE_REFUSAL = (
     "시스템 내부 정보는 제공하지 않습니다. 이력관리시스템 검색과 관련된 질문을 해주세요."
 )
+EMPTY_QUESTION_ANSWER = "질문을 입력해 주세요."
 
 # 삭제요청 판단 — 어제 버전은 "삭제류 동사 + DB/데이터베이스 언급"을 AND로 봤는데, 이
 # 시스템 자체가 통계 데이터·DB 관련 업무를 다루다 보니 "데이터베이스 변경사항을 협의한
@@ -1103,6 +1104,15 @@ def _full_org_history_answer(org_name: str) -> tuple[str, list[SourceItem], list
 
 def ask(question: str, session_id: str | None, menu_scope: str | None = None) -> ChatResponse:
     session_id = session_id or str(uuid.uuid4())
+
+    # 빈 질문(또는 공백만)을 질문분석 LLM에 그대로 넘기면, "검색할 게 없다"고 보는 대신
+    # 예시 템플릿을 다루듯 "OO기관의 수수료는 얼마인가요?" 같은 가짜 질문을 스스로 지어내고
+    # (2026-10-13 실측 확인, 5/5 재현), 그 가짜 질문으로 검색·답변까지 진행돼 자료에도 없는
+    # 금액을 지어내는 심각한 결과로 이어짐. LLM까지 갈 필요가 전혀 없는 입력이므로 코드에서
+    # 바로 걸러낸다.
+    if not question or not question.strip():
+        return ChatResponse(session_id=session_id, answer=EMPTY_QUESTION_ANSWER, sources=[])
+
     history = session_store.get_history(session_id)
     carried_over = session_store.get_last_sources(session_id)
 
