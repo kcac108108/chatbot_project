@@ -973,7 +973,11 @@ def _list_field_answer(field: str, menu: str | None) -> str:
     rows = fetch_all(f"SELECT DISTINCT {column} FROM {table} WHERE {column} IS NOT NULL ORDER BY {column}")
     values = [r[column] for r in rows]
     particle = _FIELD_TOPIC_PARTICLE.get(field, "은")
-    return f"{_MENU_LABELS[chosen_menu]}의 {field}{particle} 총 {len(values)}개입니다.\n\n" + ", ".join(values)
+    # 값 자체가 콤마로 여러 사람을 묶어 저장된 경우("김인태, 전봉석" 등, 담당자 필드에서
+    # 흔함)가 있어 ", "로 이어붙이면 실제 고유값 10개인데 11명이 있는 것처럼 헷갈리게
+    # 읽힌다(2026-10-13 실측 확인: "총 10개"인데 목록을 세면 11개로 보임). 콤마와 뚜렷이
+    # 구분되는 구분자를 써서, 값 내부의 콤마와 목록 구분용 콤마를 혼동하지 않게 한다.
+    return f"{_MENU_LABELS[chosen_menu]}의 {field}{particle} 총 {len(values)}개입니다.\n\n" + " · ".join(values)
 
 
 # 웹 화면 드릴다운에서 사용자가 메뉴를 명시적으로 고정했을 때(menu_scope), 그 메뉴에 해당하는
