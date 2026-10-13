@@ -497,6 +497,7 @@ Python(pip, requests, httpx, openai SDK 등)은 이 사설 루트 인증서를 �
 2. 스케줄링 설정 — `run_incremental_ingest()`(이력 본문)와 `run_incremental_attachment_ingest_all()`(첨부, 전산팀 결과파일이 오전 9시 이후 안정적으로 준비된다고 가정)을 cron 등으로 자동화. 배치 로직 자체는 완성, 스케줄 등록만 남음
 3. 실제 전산팀 결과 `.txt` 파일로 end-to-end 테스트(배치가 실제로 도는 환경에서)
 4. 매뉴얼(사용자용/운영자용) 작성
+5. **죽은 코드 정리**(2026-10-13 발견, 사용자가 내일로 미룸): `app/services/ocr_remote.py`와 관련 환경변수 4개(`OCR_API_BASE_URL`/`OCR_REMOTE_PDF_DIR`/`OCR_REMOTE_IMAGE_DIR`/`OCR_REMOTE_TEXT_DIR`)가 10/12 설계 전환(전산팀이 결과파일까지 생성) 이후 어디서도 호출되지 않는 죽은 코드로 확인됨 — 삭제하거나 `.env.example`에서 제거해 배포 시 운영 담당자 혼동 방지
 
 **② 계속 진행**
 - 계속 브라우저로 종합 테스트(지난번 이월된 "상세내역 간헐적 토글 오류" 포함)
