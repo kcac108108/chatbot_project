@@ -401,6 +401,33 @@ def _build_filter(
         for field in _MENU1_ONLY_FIELDS:
             values.pop(field, None)
 
+    conditions = []
+
+    # 첨부 청크는 payload에 "기관명" 필드 자체가 없다(부모 이력에만 있고, 첨부는 원본ID로만
+    # 연결됨) — 그래서 resolved_types가 전부 첨부류일 때 기관명을 그대로 걸면 항상 0건이 되고,
+    # 그 뒤 "필터 다 지우고 재검색" 단계까지 떨어져 무관한 다른 기관의 첨부가 섞여 들어오는
+    # 문제가 있었다(2026-10-13 발견 — "첨부파일" 전용 메뉴에서 "OO기관 관련 첨부파일 있어?"로
+    # 물으면 정보통신기획평가원 등 엉뚱한 기관이 결과에 섞임). 기관명을 직접 거는 대신, 그
+    # 기관명의 부모 레코드를 먼저 찾아 원본ID로 바꿔서 건다.
+    if "기관명" in values and resolved_types and resolved_types <= set(_BASE_TYPE_OF.keys()):
+        org_name = values.pop("기관명")
+        base_types = {_BASE_TYPE_OF[t] for t in resolved_types}
+        source_ids = {
+            payload["원본ID"]
+            for base_type in base_types
+            for payload in find_by_type_and_field(base_type, "기관명", org_name)
+        }
+        if source_ids:
+            conditions.append(
+                qmodels.FieldCondition(key="원본ID", match=qmodels.MatchValue(value=next(iter(source_ids))))
+                if len(source_ids) == 1
+                else qmodels.FieldCondition(key="원본ID", match=qmodels.MatchAny(any=list(source_ids)))
+            )
+        else:
+            # 그 기관명의 부모 레코드 자체가 없으면(오탈자 등) 존재할 수 없는 값으로 걸어 0건이
+            # 되게 한다 — 기관명 조건이 조용히 사라져 무관한 결과가 섞이는 걸 막기 위함.
+            conditions.append(qmodels.FieldCondition(key="원본ID", match=qmodels.MatchValue(value="__no_such_org__")))
+
     # 방어: 요청자/제공자/담당자/결재자는 서로 다른 데이터유형에만 존재해 한 청크에서
     # 동시에 만족될 수 없다. 같은 이름이 질문 분석 단계에서 여러 역할 필드에 중복
     # 추출되면(예: "박다은이 담당한 자료" → 요청자·담당자 둘 다 "박다은"), AND로 걸면
@@ -408,7 +435,6 @@ def _build_filter(
     person_values = {f: v for f, v in values.items() if f in _PERSON_ROLE_FIELDS}
     role_conflict = len(set(person_values.values())) < len(person_values)
 
-    conditions = []
     role_conditions = []
     for field, value in values.items():
         if field == "통계종류":
