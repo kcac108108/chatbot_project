@@ -59,7 +59,7 @@ _FILE_PATH_RE = re.compile(r"^/attfiles/([A-Za-z0-9]+)/([A-Za-z0-9]+)/([^/\\]+)$
 
 
 @router.get("/attachment-download")
-def download_attachment(file_path: str) -> FileResponse:
+def download_attachment(file_path: str, display_name: str | None = None) -> FileResponse:
     match = _FILE_PATH_RE.match(file_path)
     if not match:
         raise HTTPException(400, "잘못된 파일 경로입니다")
@@ -67,4 +67,13 @@ def download_attachment(file_path: str) -> FileResponse:
     local_path = Path(ATTACHMENT_BASE_DIR) / docucd / attfile_id / filename
     if not local_path.exists():
         raise HTTPException(404, "파일을 찾을 수 없습니다")
-    return FileResponse(local_path, filename=filename)
+    # local_path(물리 저장 파일명, 예: 1727073212442_2.xlsx)를 그대로 내려주면 사용자가
+    # 받은 파일을 알아볼 수 없다(2026-10-13 테스트 중 발견) — 화면에 이미 표시 중인 원본
+    # 파일명(display_name)이 있으면 그걸 다운로드 파일명으로 쓴다. display_name은 경로
+    # 조립에 전혀 쓰이지 않으므로(local_path는 이미 위에서 안전하게 확정됨) 검증 없이
+    # 그대로 받아도 path traversal 위험이 없다 — 확장자가 원본과 다르면(손상된 값 등)
+    # 안전하게 물리 파일명으로 폴백한다.
+    download_name = filename
+    if display_name and Path(display_name).suffix.lower() == Path(filename).suffix.lower():
+        download_name = display_name
+    return FileResponse(local_path, filename=download_name)

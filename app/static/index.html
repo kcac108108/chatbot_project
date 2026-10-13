@@ -619,7 +619,7 @@ function buildSourceChip(s, orgGroupMeta) {
       if (att.파일경로) {
         const downloadLink = document.createElement("a");
         downloadLink.className = "attachment-download-link";
-        downloadLink.href = `/attachment-download?file_path=${encodeURIComponent(att.파일경로)}`;
+        downloadLink.href = `/attachment-download?file_path=${encodeURIComponent(att.파일경로)}&display_name=${encodeURIComponent(att.첨부파일명 || "")}`;
         downloadLink.textContent = "파일 다운로드";
         downloadLink.addEventListener("click", (e) => e.stopPropagation());
         attPreview.appendChild(downloadLink);
