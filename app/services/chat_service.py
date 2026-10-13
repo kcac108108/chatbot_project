@@ -1161,6 +1161,21 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
 
     results, possibly_truncated = _search(analysis, carried_over, allowed_data_types)
 
+    # 키워드 질문인데 매칭된 자료가 있으면, 매칭 안 된 자료는 컨텍스트에서 아예 제거한다.
+    # 예전엔 "[자료 N]은 이미 키워드 포함이 확인됐다"고 LLM에게 안내만 하고 나머지는 그대로
+    # 보여줬는데, LLM이 그 안내를 무시하고 매칭 안 된 다른 번호를 엉뚱하게 인용하는 사례가
+    # 재현됨(2026-10-13, "프로토콜" 질문 — 세션 후속질문 5회 중 2회, 확인된 [자료 3][자료 5]
+    # 대신 매칭 안 된 [자료 1][자료 2]를 근거로 들어 없는 내용을 지어냄). 안내 문구로 유도하는
+    # 대신, 매칭 안 된 자료를 LLM이 애초에 볼 수 없게 만들어 잘못 인용할 여지 자체를 없앤다.
+    if analysis.filters.키워드:
+        _kw_normalized = "".join(analysis.filters.키워드.split())
+        _matched_results = [
+            r for r in results
+            if _kw_normalized in "".join(r["text"].split()) + "".join((r.get("요약") or "").split())
+        ]
+        if _matched_results:
+            results = _matched_results
+
     # 키워드 전수 스캔(최대 30건)이 첨부 청크(수천~1만 자 이상)와 겹치면 [자료] 전체 텍스트가
     # 수만~10만 자를 넘어가 답변 생성 프롬프트가 지나치게 커진다(2026-09-28, "중소기업 수수료
     # 면제 관련 지침" 질문에서 31건 합쳐 92,808자 → 63,422 프롬프트 토큰까지 커져 완성 토큰
@@ -1206,6 +1221,16 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
                 f"{', '.join(f'[자료 {n}]' for n in matched)}. 이 자료들은 질문의 다른 조건(예: 특정 항목명과의 "
                 "정확한 일치)을 완벽히 만족하지 않아도 관련 있는 것으로 간주하고 반드시 no_result=false로, "
                 "groups에 포함해서 답하라. 이 안내를 무시하고 no_result=true로 답하지 마라."
+            )
+        else:
+            # matched가 비어있다는 건 아래 [자료] 어디에도 키워드가 문자 그대로 없다는 뜻이다.
+            # 이 안내 없이는 LLM이 막연히 주제가 비슷해 보인다는 이유로 "포함되어 있다"고
+            # 근거 없이 단정하는 사례가 실측 확인됨(2026-10-13, "프로토콜" 질문 — 본문에
+            # 그 단어가 전혀 없는데도 4/4 재현으로 "포함되어 있습니다"라고 답함).
+            keyword_note = (
+                f"\n\n[안내] 질문의 '{keyword}'라는 단어는 아래 [자료] 어디에도 본문 그대로 등장하지 "
+                "않는다. 주제가 막연히 비슷해 보인다는 이유로 관련 있다고 추측해서 답하지 말고, "
+                "그 단어나 명확히 같은 의미의 내용을 실제로 다루는 근거가 없으면 no_result=true로 답하라."
             )
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
