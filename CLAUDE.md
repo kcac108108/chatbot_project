@@ -522,8 +522,8 @@ Python(pip, requests, httpx, openai SDK 등)은 이 사설 루트 인증서를 �
 2. 스케줄링 설정 — `run_incremental_ingest()`(이력 본문)와 `run_incremental_attachment_ingest_all()`(첨부, 전산팀 결과파일이 오전 9시 이후 안정적으로 준비된다고 가정)을 cron 등으로 자동화. 배치 로직 자체는 완성, 스케줄 등록만 남음
 3. 실제 전산팀 결과 `.txt` 파일로 end-to-end 테스트(배치가 실제로 도는 환경에서)
 4. 매뉴얼(사용자용/운영자용) 작성
-5. **죽은 코드 정리**(2026-10-13 발견, 사용자가 내일로 미룸): `app/services/ocr_remote.py`와 관련 환경변수 4개(`OCR_API_BASE_URL`/`OCR_REMOTE_PDF_DIR`/`OCR_REMOTE_IMAGE_DIR`/`OCR_REMOTE_TEXT_DIR`)가 10/12 설계 전환(전산팀이 결과파일까지 생성) 이후 어디서도 호출되지 않는 죽은 코드로 확인됨 — 삭제하거나 `.env.example`에서 제거해 배포 시 운영 담당자 혼동 방지
-6. **`.env.example` 누락 2건**(2026-10-13 발견): 코드(`app/core/config.py`)는 `CHAT_REQUEST_TIMEOUT_SECONDS`(기본 45초)와 `CHAT_TOP_K`(기본 6)를 환경변수로 읽는데 `.env.example`엔 둘 다 없음 — 기본값이 있어 당장 작동엔 문제없으나, 운영 담당자가 이 값을 조정 가능한지 자체를 알 수 없음. `.env.example`에 추가할 것
+5. ✅ (2026-10-14) **죽은 코드 정리 완료**: `app/services/ocr_remote.py` 삭제(어디서도 import 안 됨 확인), `attachment_ingest.py`의 `_ocr_upload_name()`(ocr_remote 전용, 호출부 없음) 삭제, `config.py`/`.env.example`에서 `OCR_API_BASE_URL`/`OCR_REMOTE_PDF_DIR`/`OCR_REMOTE_IMAGE_DIR`/`OCR_REMOTE_TEXT_DIR` 제거. 정리 중 **`ATTACHMENT_DROP_DIR`도 같은 범주의 죽은 설정임을 추가 발견**(10/12 설계가 전산팀 OCR 결과를 `ATTACHMENT_BASE_DIR` 트리 안에 원본과 같은 경로로 바로 생성하는 방식으로 확정되면서, 별도 drop 경로 개념 자체가 필요 없어짐 — 코드 어디서도 참조 안 함, 함께 제거). 서버 기동·전체 회귀·`run_incremental_attachment_ingest_all()` 정상 실행 확인. 커밋 `a7e7f39`.
+6. ✅ (2026-10-14) **`.env.example` 누락 2건 추가 완료**: `CHAT_TOP_K`(기본 6)/`CHAT_REQUEST_TIMEOUT_SECONDS`(기본 45초) 추가. 커밋 `a7e7f39`.
 
 **② 계속 진행**
 - 계속 브라우저로 종합 테스트(지난번 이월된 "상세내역 간헐적 토글 오류" 포함)
