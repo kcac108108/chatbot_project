@@ -205,6 +205,35 @@ _ATTACHMENT_TYPE_OF = {
 }
 _BASE_TYPE_OF = {v: k for k, v in _ATTACHMENT_TYPE_OF.items()}
 
+# 첨부 청크는 원본 문서를 있는 그대로 추출한 것이라 기관명·담당자 등 메타데이터가 본문에
+# 전혀 없을 수 있다(메뉴 본문 청크는 템플릿이 "(담당: 김인태, ...)"처럼 직접 써넣지만,
+# 첨부는 그런 라벨이 없음 — 2026-10-14 발견: 보안점검 체크리스트 본문엔 담당자 이름이
+# 안 적혀있어서, 담당자=김인태로 메타데이터는 정확히 찾았는데도 답변 생성 LLM이 "본문에
+# 그 이름이 없다"며 no_result로 거절함). 검색이 메타데이터로 이미 보장한 사실을 LLM에게
+# "믿어라"라고 프롬프트로 설득하는 대신(이 프로젝트에서 반복 확인된 대로 불안정), 그
+# 사실 자체를 자료 텍스트 앞에 명시적으로 붙여서 보여준다.
+_ATTACHMENT_METADATA_FIELDS = (
+    "기관명", "연도", "통계종류", "수출입구분", "요청자", "제공자", "담당자", "결재자", "심의결과", "차수",
+)
+
+
+def _attachment_metadata_header(payload: dict, cache: dict) -> str:
+    base_type = _BASE_TYPE_OF.get(payload.get("데이터유형"))
+    if not base_type:
+        return ""
+    source_id = payload.get("원본ID")
+    cache_key = (base_type, source_id)
+    if cache_key not in cache:
+        parents = find_by_type_and_source(base_type, source_id, limit=1)
+        cache[cache_key] = parents[0] if parents else None
+    parent = cache[cache_key]
+    if not parent:
+        return ""
+    parts = [f"{field}={parent[field]}" for field in _ATTACHMENT_METADATA_FIELDS if parent.get(field)]
+    if not parts:
+        return ""
+    return f"[이 자료는 검색 조건으로 이미 확인됨: {', '.join(parts)}]\n"
+
 
 def _find_related_attachments(
     data_type: str, source_id: str, keyword: str | None = None
@@ -1304,8 +1333,9 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     context_blocks = []
     context_chars = 0
     context_truncated = False
+    _metadata_header_cache: dict = {}
     for i, payload in enumerate(results):
-        text = payload["text"]
+        text = _attachment_metadata_header(payload, _metadata_header_cache) + payload["text"]
         if context_blocks and context_chars + len(text) > _CONTEXT_CHAR_BUDGET:
             context_truncated = True
             break
