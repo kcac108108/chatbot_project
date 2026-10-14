@@ -105,16 +105,6 @@ def _review_filename(att: dict, path: Path) -> str:
     return f"{att['ATTFILE_ID']}__{att['ATTFILE_NUM']}__{path.stem}.txt"
 
 
-def _ocr_upload_name(att: dict, path: Path) -> str:
-    """OCR 서버에 올릴 때 쓸 파일명 — 같은 파일명이 서로 다른 첨부 건에 중복 등록된
-    사례가 실제 53건 확인된 바 있어, 원본 파일명 그대로 보내면 같은 배치 안에서
-    충돌할 위험이 있다(2026-10-01, `attachment_auto_ingest.py`에 이 리네임 단계가
-    빠져있던 것을 발견해 추가). `_review_filename`과 같은 접두 규칙이지만, 그쪽은
-    결과 파일(.txt로 고정)을 찾기 위한 것이고 이건 OCR에 "보낼" 파일이라 원본
-    확장자를 그대로 유지한다."""
-    return f"{att['ATTFILE_ID']}__{att['ATTFILE_NUM']}__{path.name}"
-
-
 # OCR/비전모델 추출 결과에 페이지 하단 쪽번호("- 1 -", "- 12 -" 등)가 그대로 한 줄로
 # 섞여 나오는 경우가 실측으로 아주 흔함(2026-09-21, 전체 3,135개 청크 중 2,022줄에서
 # 발견) — 실제 내용이 아니라 순수 잡음이라 안전하게 제거 가능.
