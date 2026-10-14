@@ -581,7 +581,15 @@ _FRAGMENT_INDEX_RE = re.compile(r"\((\d+)/(\d+)번째 조각\)")
 _FRAGMENT_HEADER_RE = re.compile(r"^\[.+?\](?: \(\d+/\d+번째 조각\))?\n")
 
 
-def _merge_attachment_fragments(payloads: list[dict]) -> list[dict]:
+# 조각 많은 첨부 하나가 키워드로 안 좁혀진 채(기관명·담당자 등 메타데이터로만) 전부
+# 합쳐지면 10만자 넘는 거대 텍스트가 되어 답변 생성 LLM이 처리를 못 하고 no_result로
+# 잘못 답하는 문제가 있었다(2026-10-13 발견 — 916건 중 61건·~7%가 합치면 이 크기를
+# 넘김). 기존 `_CONTEXT_CHAR_BUDGET`(여러 자료를 합칠 때의 전체 예산)과 같은 값으로,
+# 한 문서를 병합하는 시점부터 미리 상한을 둔다.
+_MERGED_DOC_CHAR_LIMIT = 40000
+
+
+def _merge_attachment_fragments(payloads: list[dict]) -> tuple[list[dict], bool]:
     """큰 첨부파일 하나가 토큰 한도 때문에 여러 조각으로 쪼개져 검색 결과에 여러 개
     올라오면, 답변 생성 LLM이 이걸 [자료 1][자료 2][자료 3]처럼 서로 다른 문서로 착각해
     "3건 있습니다"라고 잘못 세는 문제가 있었다(2026-09-23, "SSL 인증서" 검색이 실제로는
@@ -589,7 +597,11 @@ def _merge_attachment_fragments(payloads: list[dict]) -> list[dict]:
     오해하기 쉽다"). 프롬프트로 "조각이면 하나로 세라"고 지시하는 대신, 애초에 같은 파일
     (데이터유형+원본ID+첨부파일명)의 조각들을 번호 순서대로 합쳐 [자료] 하나로 만들어서
     LLM이 여러 문서로 볼 여지 자체를 없앤다 — 이 프로젝트에서 반복 확인된 패턴대로 프롬프트
-    지시보다 구조적으로 막는 쪽이 안정적이다."""
+    지시보다 구조적으로 막는 쪽이 안정적이다.
+
+    두 번째 반환값은 "조각을 전부 못 담고 중간에 잘랐는지" 여부 — 호출부가 이걸
+    possibly_truncated 신호에 반영해, 답변이 "이게 전체 내용"이라고 확정적으로 말하지
+    않고 "일부일 수 있다"고 정직하게 안내하도록 한다."""
     groups: dict[tuple, list[dict]] = {}
     order: list[tuple] = []
     single_counter = 0
@@ -607,6 +619,7 @@ def _merge_attachment_fragments(payloads: list[dict]) -> list[dict]:
         groups[key].append(p)
 
     merged_out: list[dict] = []
+    any_truncated = False
     for key in order:
         group = groups[key]
         if len(group) == 1:
@@ -621,9 +634,19 @@ def _merge_attachment_fragments(payloads: list[dict]) -> list[dict]:
         bodies = [_FRAGMENT_HEADER_RE.sub("", p.get("text", ""), count=1) for p in group_sorted]
         data_type, source_id, filename = key
         merged_payload = dict(group_sorted[0])
-        merged_payload["text"] = f"[{data_type} {source_id} / {filename}]\n" + "\n".join(bodies)
+
+        included: list[str] = []
+        total_chars = 0
+        for body in bodies:
+            if included and total_chars + len(body) > _MERGED_DOC_CHAR_LIMIT:
+                any_truncated = True
+                break
+            included.append(body)
+            total_chars += len(body)
+
+        merged_payload["text"] = f"[{data_type} {source_id} / {filename}]\n" + "\n".join(included)
         merged_out.append(merged_payload)
-    return merged_out
+    return merged_out, any_truncated
 
 
 def _display_identity(payload: dict) -> tuple:
@@ -634,7 +657,7 @@ def _display_identity(payload: dict) -> tuple:
     return (base_type or data_type, payload["원본ID"])
 
 
-def _merge_by_display_identity(payloads: list[dict]) -> list[dict]:
+def _merge_by_display_identity(payloads: list[dict]) -> tuple[list[dict], bool]:
     """같은 이력(원본ID)에 딸린 서로 다른 첨부파일 여러 개(예: "점검사항 3.zip"과
     "점검사항 5.zip" 둘 다 같은 내부자료 소속)가 검색 결과에 각각 [자료]로 올라오면,
     화면에는 결국 부모 레코드 카드 하나로 합쳐져 보이는데(_resolve_source의 부모 승격)
@@ -643,7 +666,12 @@ def _merge_by_display_identity(payloads: list[dict]) -> list[dict]:
     이라 답했는데 그중 2건이 같은 이력 소속이라 카드는 2장만 표시됨). LLM이 그룹을 만들기
     전에, 화면에서 결국 같은 카드로 합쳐질 [자료]들을 미리 하나로 합쳐서 애초에 개수가
     어긋날 여지를 없앤다 — `_merge_attachment_fragments`(같은 파일의 조각 병합)와 같은
-    원리를 "같은 이력의 다른 첨부파일"까지 확장한 것."""
+    원리를 "같은 이력의 다른 첨부파일"까지 확장한 것.
+
+    `_merge_attachment_fragments`가 파일 하나씩은 이미 40,000자 이내로 잘라놨어도, 같은
+    이력에 그런 파일이 여러 개(예: "점검사항" 1~8) 딸려있으면 여기서 다시 전부 이어붙이며
+    도로 거대해지는 문제가 있었다(2026-10-14 발견 — 9개 파일 합쳐 105,451자로 재현).
+    같은 상한(`_MERGED_DOC_CHAR_LIMIT`)을 여기서도 적용한다."""
     groups: dict[tuple, list[dict]] = {}
     order: list[tuple] = []
     for p in payloads:
@@ -654,15 +682,25 @@ def _merge_by_display_identity(payloads: list[dict]) -> list[dict]:
         groups[key].append(p)
 
     merged_out: list[dict] = []
+    any_truncated = False
     for key in order:
         group = groups[key]
         if len(group) == 1:
             merged_out.append(group[0])
             continue
         merged_payload = dict(group[0])
-        merged_payload["text"] = "\n\n".join(p.get("text", "") for p in group)
+        included: list[str] = []
+        total_chars = 0
+        for p in group:
+            body = p.get("text", "")
+            if included and total_chars + len(body) > _MERGED_DOC_CHAR_LIMIT:
+                any_truncated = True
+                break
+            included.append(body)
+            total_chars += len(body)
+        merged_payload["text"] = "\n\n".join(included)
         merged_out.append(merged_payload)
-    return merged_out
+    return merged_out, any_truncated
 
 
 def _search(
@@ -870,7 +908,9 @@ def _search(
     if scan_ran:
         possibly_truncated = scan_incomplete
 
-    return _merge_by_display_identity(_merge_attachment_fragments(merged)), possibly_truncated
+    merged_fragments, fragments_truncated = _merge_attachment_fragments(merged)
+    merged_identity, identity_truncated = _merge_by_display_identity(merged_fragments)
+    return merged_identity, possibly_truncated or fragments_truncated or identity_truncated
 
 
 AGGREGATION_REFUSAL = (
