@@ -784,7 +784,6 @@ def _search(
 
     results = vector_search(vector, query_filter, search_limit)
     limit_used = search_limit
-    filter_fully_relaxed = False
 
     # 데이터유형은 LLM이 "이력 알려줘" 같은 표현만 보고 과도하게 단정하는 경우가 많다
     # (예: 이력 자체가 없는 기관에도 "신청이력"으로 채워서, 기관명은 맞는데 데이터유형과의
@@ -821,7 +820,6 @@ def _search(
         fallback_filter = _scope_only_filter(allowed_data_types) if allowed_data_types else None
         results = vector_search(vector, fallback_filter, search_limit)
         limit_used = search_limit
-        filter_fully_relaxed = True
 
     # 검색 결과 수가 이번에 사용한 상한과 같으면, 실제로는 더 있는데 상한에 걸려 잘렸을 수
     # 있다는 뜻이다("관세청 8건" 버그를 상한을 올려 고쳤더니, 68건짜리 큰 기관에서는 여전히
@@ -924,20 +922,25 @@ def _search(
                 seen.add(key)
                 scan_payloads.append(payload)
 
-    # 병합 순서: 평소엔 벡터 검색 결과(유사도로 이미 정렬된 신뢰할 수 있는 후보)를 먼저 두고
-    # 스캔 결과·이전 턴 근거는 보조 신호로 뒤에 붙인다. 하지만 위에서 필터를 전부 지우는
-    # 최종 폴백까지 갔다면(filter_fully_relaxed), 그 벡터 결과는 사실상 질문과 무관한 상위
-    # 유사도 청크일 뿐이다 — 이름·키워드가 실제로 그 필드에 있다고 스캔으로 이미 확인된
-    # 결과가 있는데도, 그게 노이즈 20건 뒤에 묻혀 답변 LLM이 "찾지 못함"으로 잘못 판단하는
-    # 문제가 재현됨(2026-09-22, "김인태, 전봉석"처럼 콤마로 여러 명이 저장된 담당자 필드 —
-    # 정확매칭 실패로 폴백까지 갔지만 scan_field_contains는 정확히 찾아냄에도 노이즈 뒤에
-    # 묻혀 답변에서 무시됨). 이럴 땐 스캔으로 확인된 건을 앞으로 끌어올리고 노이즈성 벡터
-    # 결과를 뒤로 보낸다 — 안정 정렬(stable sort)이라 그 외 상대 순서는 그대로 유지된다.
+    # 병합 순서: 원래는 "필터를 전부 지우는 최종 폴백까지 갔을 때만(filter_fully_relaxed)"
+    # 스캔으로 확인된 건을 앞으로 끌어올렸다 — 그 상황의 벡터 결과는 사실상 질문과 무관한
+    # 상위 유사도 청크일 뿐인데, 이름·키워드가 실제로 그 필드에 있다고 스캔으로 이미 확인된
+    # 결과가 노이즈 뒤에 묻혀 답변 LLM이 "찾지 못함"으로 잘못 판단하는 문제가 재현됐었음
+    # (2026-09-22, "김인태, 전봉석"처럼 콤마로 여러 명이 저장된 담당자 필드 — 정확매칭 실패로
+    # 폴백까지 갔지만 scan_field_contains는 정확히 찾아냄에도 노이즈 뒤에 묻혀 무시됨).
+    #
+    # ⚠️ filter_fully_relaxed가 아닌 "정상" 검색에서도 같은 문제가 재현됨(2026-10-14,
+    # 사용자 브라우저 제보 — "SSL 인증서" 키워드는 정확히 찾았는데 같은 이력 소속의 무관한
+    # 벡터 매치가 먼저 와서 어제 추가한 40,000자 예산(`_merge_by_display_identity`)을
+    # 먼저 채워버려 진짜 정답이 잘림). 예산 제한이 생긴 이상, 필터가 "정상"이었는지와
+    # 무관하게 스캔으로 확인된 건은 항상 우선돼야 한다 — 벡터 유사도는 "관련 있어 보임"일
+    # 뿐이지만 스캔 확인은 질문이 요구한 조건(키워드·이름)을 문자 그대로 만족한다는 뜻이라
+    # 항상 더 신뢰할 수 있다. 안정 정렬(stable sort)이라 그 외 상대 순서는 그대로 유지된다.
     # 스캔으로 확인된 건이 우연히 vector_payloads 안에 먼저 들어있던 경우(무관한 상위
     # 유사도 20건 중 낮은 순위로 끼어있던 경우)까지 잡아야 해서, "새로 추가됐는지"가 아니라
     # scan_confirmed_keys(스캔이 실제로 확인한 키 전체)로 판단한다.
     merged = vector_payloads + carried_payloads + scan_payloads
-    if filter_fully_relaxed and scan_confirmed_keys:
+    if scan_confirmed_keys:
         merged.sort(key=lambda p: _pool_key(p) not in scan_confirmed_keys)
 
     # "~정보 알려줘"처럼 기관명은 있는데 신청이력 의도가 불명확한 질문에서, 벡터 검색이
@@ -1403,12 +1406,20 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
             "일부를 안내드리며, 실제로는 더 있을 수 있습니다')."
         )
 
+    # ⚠️ 반드시 context_blocks 범위 안에서만 세야 한다(results 전체가 아니라) — 큰 자료
+    # 하나가 예산을 거의 다 채워버리면 뒤쪽 자료는 context_text에 실제로 포함되지 않는데도,
+    # keyword_note가 "[자료 N]까지 전부 확인됨, 반드시 groups에 포함하라"고 results 기준
+    # 번호를 그대로 안내하면 LLM이 받아보지도 못한 번호의 내용을 통째로 지어내는 심각한
+    # 사례가 재현됨(2026-10-14, 사용자 세션에서 "trass" 검색 — 25건 매칭됐는데 실제 context엔
+    # 자료 1개(36,711자)만 들어갔고, 나머지 2~25번은 LLM이 "SSL 인증서 설치 가이드" 등으로
+    # 완전히 지어냄). 이 budget 초과 상황 자체는 possibly_truncated로 이미 안내되니, 여기서는
+    # 실제로 전달된 자료에 대해서만 "확인됨"이라고 말한다.
     keyword_note = ""
     if analysis.filters.키워드:
         keyword = analysis.filters.키워드
         normalized_keyword = "".join(keyword.split())
         matched = [
-            i + 1 for i, payload in enumerate(results)
+            i + 1 for i, payload in enumerate(results[: len(context_blocks)])
             if normalized_keyword in "".join(payload["text"].split()) + "".join((payload.get("요약") or "").split())
         ]
         if matched:
