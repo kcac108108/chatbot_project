@@ -422,8 +422,19 @@ def _build_filter(
     # 후보 범위다. LLM이 뽑은 데이터유형이 그 범위 안이면 더 구체적이니 그대로 쓰고,
     # 범위 밖이거나 못 뽑았으면 스코프 전체를 OR로 건다 — 스코프는 사용자가 고른 것이라
     # LLM의 추측보다 항상 우선한다.
+    # `FilterExtraction.데이터유형`은 기본 5개 메뉴 타입만 추출 가능(LLM이 "*첨부" 변형
+    # 자체를 모름) — "첨부파일" 스코프는 allowed_data_types가 전부 *첨부 타입이라, 이 매핑
+    # 없이는 "심의위원회 첨부파일만"처럼 submenu를 좁히는 질문이 항상 구조적으로 전체
+    # 5개 첨부타입으로 폴백되는 버그가 있었다(2026-10-14 발견). 추출된 기본 타입을 첨부
+    # 변형으로도 먼저 변환해 범위 소속을 확인한다.
     if allowed_data_types is not None:
-        resolved_types = {data_type_value} if data_type_value in allowed_data_types else allowed_data_types
+        mapped_type = _ATTACHMENT_TYPE_OF.get(data_type_value, data_type_value)
+        if mapped_type in allowed_data_types:
+            resolved_types = {mapped_type}
+        elif data_type_value in allowed_data_types:
+            resolved_types = {data_type_value}
+        else:
+            resolved_types = allowed_data_types
     elif data_type_value:
         resolved_types = {data_type_value}
     else:
