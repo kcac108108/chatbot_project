@@ -617,6 +617,19 @@ def _pool_key(payload: dict) -> tuple:
     return base
 
 
+def _file_identity(payload: dict) -> tuple:
+    """`_pool_key`에서 본문 앞부분(조각 구분용)을 뺀, 파일 단위 식별자 — (데이터유형,
+    원본ID, 첨부파일명) 또는 (데이터유형, 원본ID). `_merge_attachment_fragments`가 같은
+    파일의 조각 여러 개를 하나로 합치면 그 결과물의 `_pool_key`(본문 앞부분 포함)는 원본
+    조각 어느 것과도 더 이상 일치하지 않는다 — scan_confirmed_keys(조각 단위로 기록됨)를
+    병합 이후 단계(`_merge_by_display_identity`)에서 그대로 비교하면 항상 불일치해 "스캔이
+    확인한 파일"이라는 신호 자체가 사라지는 문제가 있었다(2026-10-14 발견). 이 식별자는
+    조각 병합 전후로 안정적이라 그 비교에 쓴다."""
+    base = (payload["데이터유형"], payload["원본ID"])
+    filename = payload.get("첨부파일명")
+    return base + (filename,) if filename else base
+
+
 _FRAGMENT_INDEX_RE = re.compile(r"\((\d+)/(\d+)번째 조각\)")
 _FRAGMENT_HEADER_RE = re.compile(r"^\[.+?\](?: \(\d+/\d+번째 조각\))?\n")
 
@@ -697,7 +710,9 @@ def _display_identity(payload: dict) -> tuple:
     return (base_type or data_type, payload["원본ID"])
 
 
-def _merge_by_display_identity(payloads: list[dict]) -> tuple[list[dict], bool]:
+def _merge_by_display_identity(
+    payloads: list[dict], scan_confirmed_files: set | None = None
+) -> tuple[list[dict], bool]:
     """같은 이력(원본ID)에 딸린 서로 다른 첨부파일 여러 개(예: "점검사항 3.zip"과
     "점검사항 5.zip" 둘 다 같은 내부자료 소속)가 검색 결과에 각각 [자료]로 올라오면,
     화면에는 결국 부모 레코드 카드 하나로 합쳐져 보이는데(_resolve_source의 부모 승격)
@@ -711,7 +726,22 @@ def _merge_by_display_identity(payloads: list[dict]) -> tuple[list[dict], bool]:
     `_merge_attachment_fragments`가 파일 하나씩은 이미 40,000자 이내로 잘라놨어도, 같은
     이력에 그런 파일이 여러 개(예: "점검사항" 1~8) 딸려있으면 여기서 다시 전부 이어붙이며
     도로 거대해지는 문제가 있었다(2026-10-14 발견 — 9개 파일 합쳐 105,451자로 재현).
-    같은 상한(`_MERGED_DOC_CHAR_LIMIT`)을 여기서도 적용한다."""
+    같은 상한(`_MERGED_DOC_CHAR_LIMIT`)을 여기서도 적용한다.
+
+    ⚠️ 이 상한 자체가 또 다른 버그를 만들었다(2026-10-14, 같은 날 바로 발견): 같은 그룹
+    안에 "벡터 유사도로만 걸린 무관한 파일"(예: 점검사항 3 — 보안체계 일반 설명)과 "키워드
+    스캔이 실제로 찾아낸 진짜 정답"(예: 점검사항 5 — SSL 인증서 내용)이 같이 들어오면,
+    `payloads` 순서가 항상 벡터 결과를 먼저 두기 때문에 무관한 파일이 예산을 먼저 채우고
+    진짜 정답이 통째로 잘려나가는 사례가 재현됨("SSL 인증서 관련 문서 있어?"는 성공하는데
+    "첨부파일 중 SSL 인증서와 관련된 내용이 있으면 알려줘"는 실패 — 질문 표현에 따라 벡터
+    순위가 달라지면서 어느 파일이 "먼저"인지가 바뀌었을 뿐인데 결과가 갈림).
+
+    처음엔 `_pool_key`(조각 구분용 본문 앞부분 포함)로 비교했는데 효과가 없었다 — 이
+    함수가 받는 `payloads`는 이미 `_merge_attachment_fragments`를 거쳐 같은 파일의 조각
+    여러 개가 하나로 합쳐진 뒤라, 합쳐진 결과물의 `_pool_key`(합쳐진 본문 기준)는 원래
+    스캔이 확인했던 개별 조각의 `_pool_key`와 더 이상 일치하지 않아 "확인됨" 신호 자체가
+    사라졌기 때문(2026-10-14, 같은 날 바로 발견·재수정). 조각 병합 전후로 안정적인
+    `_file_identity`(파일명까지만, 조각 구분용 본문 앞부분은 제외)로 비교해야 한다."""
     groups: dict[tuple, list[dict]] = {}
     order: list[tuple] = []
     for p in payloads:
@@ -728,6 +758,8 @@ def _merge_by_display_identity(payloads: list[dict]) -> tuple[list[dict], bool]:
         if len(group) == 1:
             merged_out.append(group[0])
             continue
+        if scan_confirmed_files:
+            group = sorted(group, key=lambda p: _file_identity(p) not in scan_confirmed_files)
         merged_payload = dict(group[0])
         included: list[str] = []
         total_chars = 0
@@ -837,6 +869,10 @@ def _search(
     # `seen` 때문에 scan_payloads에 새로 안 담기더라도, 이 집합엔 반드시 남겨서 아래
     # 재정렬 로직이 "스캔으로 검증된 건"임을 놓치지 않게 한다.
     scan_confirmed_keys = set()
+    # 파일 단위 식별자(_file_identity) — `_pool_key`와 달리 조각 병합 전후로 안정적이라
+    # `_merge_by_display_identity`(병합 이후 단계)에 넘길 때 이걸 쓴다(2026-10-14, 위
+    # `_file_identity` docstring 참고).
+    scan_confirmed_files = set()
 
     keyword = analysis.filters.키워드
     if keyword:
@@ -849,6 +885,7 @@ def _search(
                 continue
             key = _pool_key(payload)
             scan_confirmed_keys.add(key)
+            scan_confirmed_files.add(_file_identity(payload))
             if key not in seen:
                 seen.add(key)
                 scan_payloads.append(payload)
@@ -882,6 +919,7 @@ def _search(
                 continue
             key = _pool_key(payload)
             scan_confirmed_keys.add(key)
+            scan_confirmed_files.add(_file_identity(payload))
             if key not in seen:
                 seen.add(key)
                 scan_payloads.append(payload)
@@ -949,7 +987,7 @@ def _search(
         possibly_truncated = scan_incomplete
 
     merged_fragments, fragments_truncated = _merge_attachment_fragments(merged)
-    merged_identity, identity_truncated = _merge_by_display_identity(merged_fragments)
+    merged_identity, identity_truncated = _merge_by_display_identity(merged_fragments, scan_confirmed_files)
     return merged_identity, possibly_truncated or fragments_truncated or identity_truncated
 
 
