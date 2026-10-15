@@ -75,7 +75,11 @@ Python(pip, requests, httpx, openai SDK 등)은 이 사설 루트 인증서를 �
 - 해결: `combined_ca_bundle.pem`(프로젝트 루트, pip 내장 certifi + MonitorApp 루트 인증서 병합) 사용
 - pip: `venv/pip.ini`에 `cert = .../combined_ca_bundle.pem` 이미 설정되어 있어 별도 옵션 불필요
 - **OpenAI API 등 앱 코드에서 HTTPS 호출 시에도 동일 문제 발생 가능** — `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE` 환경변수를 이 파일로 지정하거나, httpx 클라이언트 생성 시 `verify=combined_ca_bundle.pem` 지정 필요 (`.env.example`의 `SSL_CERT_FILE` 참고)
-- **npm도 동일 문제 있음** — `npm config get cafile`이 비어있어 Playwright 등 브라우저 바이너리 다운로드 불가 확인(2026-07-30). 웹 UI 브라우저 자동화 테스트가 필요하면 npm cafile도 `combined_ca_bundle.pem`으로 지정 필요
+- ✅ **(2026-10-15) 브라우저 자동화 도구(Playwright) 설치 완료 — 더 이상 "브라우저 테스트 불가"가 아님**: 예전(2026-07-30)엔 `npm config get cafile`이 비어있어 Playwright 브라우저 바이너리 다운로드가 막혔었는데, 실제로 해결함. `npm config set cafile`만으로는 안 되고(Playwright 자체 다운로더가 npm 설정을 안 씀), **`NODE_EXTRA_CA_CERTS` 환경변수**로 `combined_ca_bundle.pem`을 지정해야 함(Node 프로세스 전체의 TLS 신뢰를 이걸로 확장하는 방식 — npm 패키지 설치 자체는 cafile 설정만으로도 됨, Playwright의 브라우저 바이너리 다운로드 단계만 추가로 이게 필요).
+  - 설치 위치: 프로젝트 루트의 `browser_test/`(Node 프로젝트, `node_modules`는 `.gitignore` 처리 — 배포 대상 코드가 아니라 이 개발 PC 전용 테스트 도구). 브라우저 바이너리 자체는 `C:\Users\park\AppData\Local\ms-playwright\`에 전역 캐시되어 한 번만 받으면 됨.
+  - **다음 세션에서 바로 쓰려면**: `browser_test/node_modules`가 없어졌을 경우에만 재설치 필요 — `cd browser_test && npm config set cafile <repo>/combined_ca_bundle.pem && NODE_EXTRA_CA_CERTS=<repo>/combined_ca_bundle.pem npx playwright install chromium`(브라우저 바이너리가 이미 캐시돼 있으면 이 명령도 즉시 끝남, 재다운로드 안 함). 설치 후엔 평범한 Playwright Node 스크립트(`const { chromium } = require('playwright'); ...`)로 `http://127.0.0.1:8000/`(로컬 챗봇 서버)에 실제 접속·클릭·스크린샷 가능 — `page.screenshot()`으로 저장한 PNG는 Read 툴로 직접 볼 수 있음.
+  - **실전 검증 완료**: 실제 화면 로드, 질문 전송→답변 수신, "이력 보기" 버튼 클릭→표 렌더링, 아코디언(`.detail-head`)·이력표 행(`.history-row`) 토글 클릭(빠른 연속 클릭 포함, 총 35회) 전부 Playwright로 정상 작동 확인 — 지금까지 "도구 제약으로 확인 불가"라고 적어뒀던 많은 항목들이 이제 직접 검증 가능해짐.
+  - **아코디언 간헐적 토글 버그(여러 세션 미해결 이월 건) 재현 시도 결과**: `.detail-head`(상세 아코디언) 15회, `.history-row`(이력표 행, 빠른 3연속 클릭 포함) 20회 전부 정상 토글 — **재현 안 됨**. 코드 자체의 토글 로직(단순 `classList.toggle`, 중첩 레이어마다 `stopPropagation` 처리됨)은 Playwright/Chromium 기준으론 견고해 보임. 실제 버그가 다시 재현되면, 이제 Playwright로 그 정확한 조작을 그대로 재현해볼 수 있음 — 사용자가 재현 조건(브라우저 종류, 정확한 클릭 순서·타이밍)을 더 구체적으로 알려주면 도움이 됨.
 - 운영(폐쇄망)은 이 문제가 없을 가능성 높음 — 배포 시 재확인 필요
 
 ## 현재 진행 상태

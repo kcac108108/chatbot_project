@@ -9,3 +9,8 @@ monitorapp_root*.pem
 .DS_Store
 *.log
 .claude/settings.local.json
+
+# 브라우저 자동화 테스트 도구(개발 PC 전용, 배포 대상 아님) — CLAUDE.md "브라우저 자동화" 참고
+browser_test/node_modules/
+browser_test/*.png
+browser_test/package-lock.json
