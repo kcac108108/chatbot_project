@@ -1370,9 +1370,16 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 표현 때문에 목록 요청으로 오탐되는 문제 방지. 키워드가 추출됐으면 이미 조건으로 좁힌
     # 검색이라는 뜻이라("국가 항목을 요청한 업체" 등), LLM이 is_full_list_question을 true로
     # 잘못 판단해도(프롬프트 지시로 5회 재현 5회 다 안 고쳐짐) 코드가 무시한다
+    #
+    # 기관명이 추출됐으면 같은 이유로 무시한다 — "한국환경공단의 담당자는 누구야?"처럼
+    # 특정 기관으로 좁힌 후속질문인데도 LLM이 is_full_list_question=True로 잘못 판단해서,
+    # 그 기관과 전혀 무관하게 "내부자료 전체 담당자 10명"을 답해버리는 버그가 재현됨
+    # (2026-10-15, 브라우저로 자연스러운 대화 흐름을 테스트하다가 발견). `_list_field_answer`는
+    # 애초에 기관명으로 좁혀서 조회하는 기능 자체가 없어 구조적으로 무관한 답만 낼 수 있다.
     is_list_question = (
         not analysis.is_aggregation_question
         and not analysis.filters.키워드
+        and not analysis.filters.기관명
         and (analysis.is_full_list_question or _looks_like_list_question(analysis.standalone_question, analysis.filters))
     )
     if is_list_question:
