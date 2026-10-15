@@ -1591,19 +1591,25 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     bubble_text = "관련 이력을 찾지 못했습니다." if grounded.no_result else grounded.summary
     details = _build_details(grounded, results, analysis.filters.키워드)
 
+    # no_result=true인데도 used_indices는 비우지 않는 경우가 있음("나머지 필드는
+    # 비워둬라" 지시를 LLM이 안정적으로 안 지킴, 2026-10-15 "그거 다운로드 할 수
+    # 있어?" 재현 — 답변 말풍선은 "찾지 못했습니다"인데 근거자료 칩은 그대로 붙어
+    # 나오는 자기모순 발견). _build_details는 이미 no_result를 보고 빈 배열을
+    # 반환하므로, sources도 동일하게 맞춘다.
     sources = []
     used_payloads = []
-    seen = set()
-    for idx in grounded.used_indices:
-        source = _resolve_source(idx, results, analysis.filters.키워드)
-        if source is None:
-            continue
-        key = (source.데이터유형, source.원본ID)
-        if key in seen:
-            continue
-        seen.add(key)
-        sources.append(source)
-        used_payloads.append(results[idx - 1])
+    if not grounded.no_result:
+        seen = set()
+        for idx in grounded.used_indices:
+            source = _resolve_source(idx, results, analysis.filters.키워드)
+            if source is None:
+                continue
+            key = (source.데이터유형, source.원본ID)
+            if key in seen:
+                continue
+            seen.add(key)
+            sources.append(source)
+            used_payloads.append(results[idx - 1])
 
     session_store.append_turn(session_id, question, history_text)
     session_store.set_last_sources(session_id, used_payloads)
