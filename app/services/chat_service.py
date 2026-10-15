@@ -1166,6 +1166,27 @@ def _looks_like_internal_info_probe(question: str) -> bool:
     return bool(_INTERNAL_INFO_PROBE_RE.search(question))
 
 
+# "요즘 등록된 거 뭐 있어?"/"최근에 새로 추가된 이력 알려줘"류 — 이 시스템은 각 레코드가
+# 언제 Qdrant에 적재됐는지 전혀 추적하지 않는데, 이런 질문을 받으면 벡터 유사도로 아무
+# 자료나 찾아놓고 "이게 최근 추가된 것"이라고 확신에 차서 지어내는 버그가 재현됨(2026-10-15,
+# 즉흥 브라우저 테스트 중 발견 — "최근 등록"을 "2016년 수출입 계약"처럼 무관한 과거 레코드와
+# 엮어 답함, 8회 중 6회 재현). 프롬프트 지시만으로 두 차례 시도했으나 매번 다른 방향의
+# 회귀를 일으켜서(①원래 버그는 고쳤지만 "2024년에 등록된 이력"류 정상 날짜질문까지 집계
+# 거절로 오염 ②재시도 후에도 동일 회귀 잔존) 코드로 직접 막는다. 질문에 구체적인 연도(4자리
+# 숫자+"년")가 있으면 정상 날짜 필터 검색이므로 건드리지 않고, 연도 없이 "최근/요즘/최신" +
+# "등록/추가/올라온/업데이트/적재" 조합만 있을 때만 집계 거절로 강제한다.
+_RECENT_INGESTION_RE = re.compile(
+    r"(요즘|최근|최신).{0,12}(새로\s*)?(등록|추가|올라온|올라온거|들어온|업데이트|적재)"
+)
+_YEAR_MENTION_RE = re.compile(r"\d{4}\s*년")
+
+
+def _looks_like_recent_ingestion_question(question: str) -> bool:
+    if _YEAR_MENTION_RE.search(question):
+        return False
+    return bool(_RECENT_INGESTION_RE.search(question))
+
+
 # "전체 목록 조회" 화이트리스트 — 항목: {메뉴: (테이블, 컬럼)}. 여기 한 줄만 추가하면
 # 그 항목도 안전하게 전체 목록 조회를 지원하게 된다 (조건 없는 고정 SQL이라 인젝션 위험 없음,
 # DB에서 직접 가져오므로 항상 정확 — LLM/벡터검색을 거치지 않음)
@@ -1409,6 +1430,14 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
 
     analysis = _analyze_query(question, history)
     allowed_data_types = _MENU_SCOPE_DATA_TYPES.get(menu_scope)
+
+    # 프롬프트 지시만으로 두 차례 시도했으나 매번 다른 회귀를 일으켜서(주석 참고) 코드로
+    # 직접 강제. standalone_question(대명사 해석된 재작성 질문)과 원문 둘 다 확인 — 후속
+    # 질문에서 "거기" 같은 대명사가 풀리면서 패턴이 드러나는 경우까지 잡기 위함.
+    if _looks_like_recent_ingestion_question(question) or _looks_like_recent_ingestion_question(
+        analysis.standalone_question
+    ):
+        analysis.is_aggregation_question = True
 
     # "안녕" 같은 인사말은 검색 의도가 전혀 없는데도 벡터 검색이 무관한 상위 몇 건을 그대로
     # 반환해버려서, 답변 LLM이 그걸 근거인 것처럼 제시하는 문제가 있었다(2026-09-23 발견).
