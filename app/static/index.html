@@ -47,7 +47,12 @@
   }
 
   /* ---------------- sidebar ---------------- */
+  /* 배경을 명시해야 함 — 모바일(720px 이하)에서 .sidebar가 position:fixed로 떠서
+     .shell의 grid 배경을 더 이상 상속받지 못해 뒤 콘텐츠가 비쳐 보이는 버그가 있었음
+     (2026-10-15 즉흥 모바일 테스트로 발견, 데스크톱은 우연히 부모 배경이 그 자리를
+     채워줘서 안 드러났음) */
   .sidebar {
+    background: var(--sidebar-bg);
     padding: 20px 16px;
     border-right: 1px solid var(--rule);
     overflow-y: auto;
