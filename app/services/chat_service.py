@@ -1384,6 +1384,15 @@ def _looks_like_full_org_history_question(text: str, filters: FilterExtraction) 
         return True
     if any(w in text for w in _SINGLE_ITEM_SELECTOR_WORDS):
         return False
+    # "2020년부터 2022년 사이에 신청한 거 있어?"처럼 연도 범위 조건은 filters.연도가
+    # 단일 문자열이라 담을 수 없어 LLM이 그냥 비워버리는 경우가 있다(2026-10-15 즉흥
+    # 테스트로 재현 — 범위 조건이 명백히 있는데도 "다른 조건 없음"으로 오판해 직전과
+    # 동일한 "전체 83건" 답변이 그대로 반복됨). standalone_question 본문에 연도 표현
+    # 자체가 있으면(필드 추출 성공 여부와 무관하게) 조건이 있는 것으로 보고 전체이력
+    # 경로로 새지 않게 막는다 — 완벽한 범위 필터링까지는 보장 못 해도, 최소한 질문을
+    # 완전히 무시한 반복 답변만큼은 피한다.
+    if _YEAR_MENTION_RE.search(text):
+        return False
     has_other_filter = any(getattr(filters, f) for f in _FULL_HISTORY_OTHER_FILTER_FIELDS)
     return not has_other_filter
 
