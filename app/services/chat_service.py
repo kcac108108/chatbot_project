@@ -39,8 +39,21 @@ QUERY_ANALYSIS_PROMPT = """너는 검색 전처리기다. 아래 대화 이력�
    있다"고 답했고 그중 A만 자세히 설명한 뒤 "다른 건도 알려줘"라고 물으면, "B안건에 대해
    알려주세요"로 재작성하라 — "A안건의 다른 내용"으로 재작성하지 마라.
    맥락 의존이 없는 질문이면 원문 그대로 둔다.
+   **대상(기관명·원본ID 등)만 보충하고, 조건(연도·차수·통계종류 등 세부사실)은 함부로
+   덧붙이지 마라**: 챗봇이 이전에 답변한 내용에 연도·차수 같은 세부사실이 등장했다고 해서
+   이번 질문에도 그 조건이 이어지는 것처럼 재작성하지 마라. 예: 챗봇이 "2024년 1차 위원회에서
+   한국은행 안건이 심의됐다"고 답한 뒤 사용자가 그냥 "결과가 어떻게 나왔어?"라고만 물으면,
+   "한국은행 관련 안건의 결과는 어떻게 되었나요?"로만 재작성하라 — 사용자가 말하지 않은
+   "2024년 1차"를 끼워 넣지 마라(대상이 여러 건이면 그중 일부만으로 좁혀지는 결과가 된다).
 2. filters: 현재 질문(과 필요 시 대화 이력)에서 검색 필터로 쓸 값을 추출해라.
    해당 정보가 명시적으로 없으면 반드시 null로 둬라. 추측하거나 지어내지 마라.
+   **대화 이력 중 챗봇(assistant)이 이전에 답변한 내용에 등장하는 세부사실(통계종류·수출입
+   구분·요청자·제공자·심의결과·차수 등)은 이미 보여준 결과일 뿐, 사용자가 그 값으로 다시
+   좁혀달라고 요청한 게 아니다** — 사용자가 이번 질문이나 과거 자신의 발언에서 직접 그 조건을
+   언급한 경우에만 필터를 채워라. 예: 챗봇이 "2024년 1차 위원회에서 수수료 면제가 심의됐다"고
+   답한 뒤 사용자가 "결과가 어떻게 나왔어?"라고만 물으면, 이 질문 자체는 연도·차수 등을
+   지정한 적이 없으니 이전 답변에 그 값들이 등장했다는 이유만으로 연도=2024·차수=1을 채우지
+   마라(기존 기관명 등 대상 자체를 좁히는 필터만 이어서 유지).
    요청자/제공자/담당자/결재자는 서로 다른 역할이다. 질문에 사람 이름이 하나만 나와도, 그
    이름을 여러 역할 필드에 동시에 채우지 마라 — 질문에 명시된 역할(요청/제공/담당/결재) 하나
    에만 넣어라. 예: "OO이 담당한 자료"는 담당자에만 넣고 요청자는 null로 둬라. 역할이
@@ -577,11 +590,47 @@ def _clean_query_analysis(analysis: QueryAnalysis) -> QueryAnalysis:
     return analysis
 
 
+# 대화 이력에 챗봇이 이전에 언급한 세부사실(연도·통계종류·수출입구분·요청자·제공자·
+# 심의결과·담당자·결재자·차수 등)이 있으면, 이번 질문이 그 값으로 좁혀달라고 한 게 아닌데도
+# LLM이 "이미 아는 사실"로 착각해 필터에 채워버리는 경우가 있다(2026-10-15 "결과가 어떻게
+# 나왔어?" 후속질문에서 실제 재현 — 직전 답변에 등장했던 연도=2024/통계종류="수출입 통계"/
+# 차수=1 등 여러 필드가 지어낸 듯 채워져 무관한 레코드까지 섞여 들어옴, 같은 질문 8회 중 2회
+# 재발로 확인). 처음엔 standalone_question(규칙 1에 따라 대명사·생략까지 풀어 쓴 재작성
+# 질문) 본문에 흔적이 없으면 걸러내는 방식을 시도했으나, standalone_question 자체도 같은
+# 방식으로 "2024년 1차 위원회에서..."처럼 없는 조건을 끌어와 재작성해버리는 사례가 재현돼
+# (그러면 그 안에 지어낸 값이 들어있으니 이 검사를 그대로 통과함) 신뢰할 수 없었다.
+# **사용자가 실제로 작성한 텍스트(이번 턴 질문 + 과거 자신의 turn, assistant 턴 제외)에만
+# 그 값의 흔적이 있는지**로 기준을 바꿨다 — 챗봇이 과거에 뭐라고 답했는지는 무관하고, 사용자가
+# 그 조건을 한 번이라도 직접 말했는지만 본다. 차수는 숫자 하나짜리라 아무 문장에나 우연히
+# 섞여있을 위험이 커서 이 검사에서 제외(여전히 새어나갈 수 있지만, 기관명 등 핵심 필터는
+# 이 검사로 막히므로 피해가 좁은 범위로 제한됨).
+_TEXT_TRACE_FILTER_FIELDS = (
+    "연도", "통계종류", "수출입구분", "요청자", "제공자", "담당자", "결재자", "심의결과",
+)
+
+
+def _strip_untraceable_filters(analysis: QueryAnalysis, question: str, history: list[dict]) -> QueryAnalysis:
+    user_texts = [question] + [m["content"] for m in history if m.get("role") == "user"]
+    normalized_user_text = "".join("".join(t.split()) for t in user_texts)
+    updates = {}
+    for field in _TEXT_TRACE_FILTER_FIELDS:
+        value = getattr(analysis.filters, field, None)
+        if not value:
+            continue
+        normalized_value = "".join(str(value).split())
+        if normalized_value and normalized_value not in normalized_user_text:
+            updates[field] = None
+    if updates:
+        analysis.filters = analysis.filters.model_copy(update=updates)
+    return analysis
+
+
 def _analyze_query(question: str, history: list[dict]) -> QueryAnalysis:
     messages = [{"role": "system", "content": QUERY_ANALYSIS_PROMPT}]
     messages.extend(history)
     messages.append({"role": "user", "content": question})
-    return _clean_query_analysis(chat_parse(messages, QueryAnalysis))
+    analysis = _clean_query_analysis(chat_parse(messages, QueryAnalysis))
+    return _strip_untraceable_filters(analysis, question, history)
 
 
 KEYWORD_SCAN_LIMIT = 30
