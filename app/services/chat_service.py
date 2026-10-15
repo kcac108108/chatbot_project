@@ -771,6 +771,22 @@ def _merge_by_display_identity(
             included.append(body)
             total_chars += len(body)
         merged_payload["text"] = "\n\n".join(included)
+
+        # ⚠️ 본문(text)은 그룹 전체를 합치면서 요약(요약)은 group[0] 것만 남아있던 버그가
+        # 있었다(2026-10-15 발견 — "김인태가 담당한 자료" 재현 실패: 9개 파일이 합쳐진
+        # 레코드인데 요약은 그중 1개(152자, 서버실 출입통제 내용)만 남아 담당자 관련 맥락이
+        # 거의 다 사라짐). 답변 생성 시 원문 대신 요약을 우선 쓰도록 바꾼 변경(2026-10-15,
+        # 아래 ask()) 때문에 이 간극이 실제로 영향을 주기 시작했다 — 본문처럼 그룹 내 서로
+        # 다른 파일들의 요약도 전부 모아 합친다(완전 동일한 요약은 중복 제거 — 같은 파일의
+        # 조각들은 요약이 복제돼 있어 그대로 두면 불필요하게 반복됨).
+        seen_summaries: list[str] = []
+        for p in group:
+            s = p.get("요약")
+            if s and s not in seen_summaries:
+                seen_summaries.append(s)
+        if seen_summaries:
+            merged_payload["요약"] = "\n\n".join(seen_summaries)
+
         merged_out.append(merged_payload)
     return merged_out, any_truncated
 
@@ -1381,13 +1397,37 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 한도(16,384)에 걸려 구조화 출력 파싱 자체가 실패, 요청이 통째로 크래시함). [자료] 개수를
     # 줄이지 않고(검색 완전성은 그대로 유지) 총 글자수에 상한을 둬서, 상한을 넘기면 그 뒤
     # 자료는 이번 답변 생성에서 제외한다 — 완전성 신호(possibly_truncated)에도 반영한다.
+    #
+    # ⚠️ 상한만으로는 부족했다(2026-10-15, "trass" 키워드 — 31건이 매칭됐는데 원문을 그대로
+    # 쓰면 합계 168,294자라 첫 번째 자료(36,648자) 하나가 예산 대부분을 먹어버려 나머지
+    # 30건이 전부 AI에게 아예 안 보여주는 문제). 화면에 "보여줄 때"는 이미 사전 생성된 요약
+    # (`_resolve_source` 등, 2026-09-21)을 우선 쓰고 있었는데, 정작 답변을 "만드는" AI에게는
+    # 여전히 원문 전체를 주고 있어서 둘이 불일치했다.
+    #
+    # 처음엔 "요약이 있으면 항상 요약"으로 바꿨는데, 그러자 결과가 1건뿐인 경우(예: "김인태가
+    # 담당한 자료")까지 영향을 받아 회귀가 생겼다 — 메타데이터 헤더("담당자=김인태")만으로
+    # 본문 연관성을 판단해야 하는 상황에서, 답변 생성 LLM이 분량 많은 원문은 신뢰하면서도
+    # (3회 재현 3/3 성공) 사실 관계는 동일한 요약은 이상하게 더 의심하는(5회 재현 0/5 성공)
+    # 경향이 실측으로 확인됨 — 내용은 같아도 "원문 그대로"라는 형태 자체가 LLM에게 더 신뢰를
+    # 준다고 추정됨. **결과 개수가 적어 원문을 전부 넣어도 예산이 남는 평소 상황에서는 원문을
+    # 그대로 쓰고, "trass"처럼 결과가 많아 원문 총합이 예산을 넘칠 때만 전체적으로 요약 우선
+    # 으로 전환**하도록 2단계로 수정 — 평소엔 기존에 검증된 동작 그대로, 예산 압박이 실제로
+    # 있을 때만 완전성을 위해 요약으로 압축한다(요약 없는 레코드는 그래도 원문 그대로 사용).
     _CONTEXT_CHAR_BUDGET = 40000
+    _metadata_header_cache: dict = {}
+    _full_texts = [
+        _attachment_metadata_header(p, _metadata_header_cache) + p["text"] for p in results
+    ]
+    _use_summary = sum(len(t) for t in _full_texts) > _CONTEXT_CHAR_BUDGET
+
     context_blocks = []
     context_chars = 0
     context_truncated = False
-    _metadata_header_cache: dict = {}
     for i, payload in enumerate(results):
-        text = _attachment_metadata_header(payload, _metadata_header_cache) + payload["text"]
+        if _use_summary and payload.get("요약"):
+            text = _attachment_metadata_header(payload, _metadata_header_cache) + payload["요약"]
+        else:
+            text = _full_texts[i]
         if context_blocks and context_chars + len(text) > _CONTEXT_CHAR_BUDGET:
             context_truncated = True
             break
