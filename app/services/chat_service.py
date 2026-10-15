@@ -1561,7 +1561,12 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     )
     if is_list_question:
         field = resolved_field or analysis.list_field or "업체명"
-        menu = _MENU_SCOPE_LIST_MENU.get(menu_scope) or _resolve_list_menu(analysis.standalone_question)
+        # 질문 텍스트에 메뉴 이름이 명시적으로 있으면(예: FAQ 버튼 "외부요청으로 등록된
+        # 업체명을 알려줘") 그게 사용자의 가장 명확한 의도이므로 스코프보다 우선한다 —
+        # 스코프를 먼저 보면 "심의위원회" 스코프를 고정한 채 저 FAQ를 눌러도 엉뚱하게
+        # 심의위원회 업체명이 나오는 버그가 있었다(2026-10-15 즉흥 테스트로 발견). 텍스트에
+        # 메뉴 언급이 전혀 없는 질문("업체 목록 알려줘")에서만 스코프로 폴백한다.
+        menu = _resolve_list_menu(analysis.standalone_question) or _MENU_SCOPE_LIST_MENU.get(menu_scope)
         answer_text = _list_field_answer(field, menu)
         session_store.append_turn(session_id, question, answer_text)
         return ChatResponse(session_id=session_id, answer=answer_text, sources=[])
