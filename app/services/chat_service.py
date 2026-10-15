@@ -975,7 +975,19 @@ def _search(
     # 협회처럼 기관정보 레코드 자체가 없고 외부요청·심의위원회에만 존재하는 기관(실측 33개)
     # 검색을 필터가 0건으로 깨뜨려서, 결과 병합 단계에서 걸러내는 이 방식으로 대체함.
     _history_signal_fields = {"연도", "통계종류", "수출입구분", "차수"}
-    _mentions_history = any(w in analysis.standalone_question for w in ("이력", "신청"))
+    # "수수료는 얼마야?"처럼 신청이력에만 있는 "내용" 필드(구조화 필터가 아니라 자유 텍스트
+    # 질문으로만 나타남)를 물으면, standalone_question에 "이력"/"신청"이라는 단어가 없어서
+    # 이 조건에 안 걸리고 신청이력이 통째로 제거돼 "찾지 못함"으로 잘못 답하는 버그가 있었다
+    # (2026-10-15, 브라우저로 자연스럽게 "한국환경공단 이력 있어?" → "수수료는 얼마야?"
+    # 후속질문을 해보다가 발견 — 스크립트로 미리 짠 시나리오가 아니라 실제 화면에서 자연스럽게
+    # 이어 물어보다가 나온 사례). Qdrant 세부항목 라벨을 직접 조회해 신청이력에만 있고
+    # 기관정보엔 없는 필드명(수수료/수출입구분/신청일/요청구분/요청내용/전송방식/제공주기/
+    # 제공항목/통계종류)을 확인해 신호 단어로 추가 — 수출입구분·통계종류는 이미
+    # _history_signal_fields로 커버되니 나머지만 추가한다.
+    _history_only_content_fields = ("수수료", "신청일", "요청구분", "요청내용", "전송방식", "제공주기", "제공항목")
+    _mentions_history = any(
+        w in analysis.standalone_question for w in ("이력", "신청") + _history_only_content_fields
+    )
     if (
         analysis.filters.기관명
         and not analysis.filters.키워드
