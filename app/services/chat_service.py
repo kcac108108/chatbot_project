@@ -985,8 +985,13 @@ def _search(
     # 제공항목/통계종류)을 확인해 신호 단어로 추가 — 수출입구분·통계종류는 이미
     # _history_signal_fields로 커버되니 나머지만 추가한다.
     _history_only_content_fields = ("수수료", "신청일", "요청구분", "요청내용", "전송방식", "제공주기", "제공항목")
+    # ⚠️ 띄어쓰기 때문에 또 뚫림(2026-10-15, 같은 날 바로 발견) — LLM이 standalone_question을
+    # 재작성할 때 "제공주기"를 "제공 주기"로(띄어쓰기 있게) 쓰는 경우가 있어, 단순 포함 검사로는
+    # 매칭이 빗나감. 2026-08-11에 키워드 검색에서 "자료 제공"/"자료제공" 문제를 고쳤던 것과
+    # 같은 방식으로, 양쪽 다 공백을 제거하고 비교한다.
+    _normalized_question = "".join(analysis.standalone_question.split())
     _mentions_history = any(
-        w in analysis.standalone_question for w in ("이력", "신청") + _history_only_content_fields
+        w in _normalized_question for w in ("이력", "신청") + _history_only_content_fields
     )
     if (
         analysis.filters.기관명

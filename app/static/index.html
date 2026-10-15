@@ -1063,6 +1063,12 @@ function submitQuestion(question) {
 }
 
 function sendQuestion() {
+  // 전송 버튼은 요청 처리 중 disabled=true로 막히지만, Enter 키 제출 경로(아래
+  // keydown 핸들러)는 이 상태를 확인하지 않아서 응답을 기다리는 도중에도 Enter로
+  // 다음 질문을 연달아 보낼 수 있었다(2026-10-15, 브라우저 자동화로 빠르게 연속
+  // 질문하다가 발견 — 같은 세션에 두 요청이 겹쳐 들어가며 대화 기록이 꼬여 보이는
+  // 증상 재현). 버튼 클릭이든 Enter든 전부 이 함수를 거치니 여기서 한 번만 막으면 된다.
+  if (sendEl.disabled) return;
   const question = questionEl.value.trim();
   if (!question) return;
   questionEl.value = "";
