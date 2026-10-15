@@ -1310,6 +1310,17 @@ def get_record_detail(data_type: str, source_id: str) -> SourceItem | None:
 
 _FULL_HISTORY_ASK_WORDS = ("전체", "모든", "전부", "다 보여", "다보여", "다 알려")
 
+# "거기서 제일 최근 거 자세히 알려줘"처럼 목록 중 **딱 하나**를 콕 집어 묻는 후속질문은
+# standalone_question 재작성 과정에서 "이력"이라는 단어가 자연스럽게 섞여 들어가(규칙 1이
+# 대명사를 풀어 쓰면서 "~이력에 대해 자세히 알려주세요"로 재작성함) 아래 함수가 "전체 이력"
+# 요청으로 오판하는 버그가 있었다(2026-10-15 발견 — "전체 신청이력은 총 68건입니다"라는
+# 동일한 통짜 답을 반복하며 "제일 최근 거"라는 실제 요청을 무시함). 선택어가 있으면 이
+# 함수 자체를 거치지 않고 일반 검색으로 넘겨 그 선택어에 맞는 좁은 답을 하도록 한다.
+_SINGLE_ITEM_SELECTOR_WORDS = (
+    "제일 최근", "가장 최근", "가장 최신", "최신 거", "최신 것", "최신 건",
+    "하나만", "한 건만", "한 개만", "그 중 하나", "첫 번째", "두 번째", "세 번째",
+)
+
 # 기관명+"이력"만 있고 다른 좁히는 조건(연도·심의결과 등)이 전혀 없는 질문은, "전체"라는
 # 단어가 없어도 완전성을 보장할 수 없는 일반 검색 경로(top-K 상한 + 답변생성 LLM이 매번
 # 다르게 요약하는 불안정성, 2026-09-29 실측 확인 — 검색은 23건 찾았는데 답변 LLM이 어떤
@@ -1330,6 +1341,8 @@ def _looks_like_full_org_history_question(text: str, filters: FilterExtraction) 
         return False
     if any(w in text for w in _FULL_HISTORY_ASK_WORDS):
         return True
+    if any(w in text for w in _SINGLE_ITEM_SELECTOR_WORDS):
+        return False
     has_other_filter = any(getattr(filters, f) for f in _FULL_HISTORY_OTHER_FILTER_FIELDS)
     return not has_other_filter
 
