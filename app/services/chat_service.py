@@ -394,6 +394,21 @@ _PERSON_ROLE_FIELDS = {"요청자", "제공자", "담당자", "결재자"}
 _MENU1_ONLY_FIELDS = {"통계종류", "수출입구분"}
 _MENU1_DATA_TYPES = {"기관정보", "신청이력"}
 
+# 역할 필드는 각자 정해진 메뉴에만 존재한다(요청자·제공자→외부요청, 담당자·결재자→내부자료).
+# "류수안이 결재한 자료 뭐야?"에서 결재자='류수안'은 정확히 뽑혔는데 데이터유형이 엉뚱하게
+# "기관정보"로 추측돼 교집합이 항상 0건이 되는 버그가 즉흥 테스트로 재현됨(2026-10-15) —
+# 이름+역할 조합은 LLM이 비교적 안정적으로 뽑는 신호라, 데이터유형 추측보다 신뢰도가 높다고
+# 보고 반대로 처리한다(이 데이터유형 추측이 틀렸다고 보고 제거) — _MENU1_ONLY_FIELDS와는
+# 정반대 우선순위. 단, 사용자가 사이드바에서 메뉴를 직접 고정한 경우(allowed_data_types)는
+# 그 스코프를 벗어나면 안 되므로 건드리지 않는다 — 순수하게 LLM의 데이터유형 추측만 못 믿을
+# 때(스코프 없음)만 적용.
+_ROLE_FIELD_DATA_TYPES = {
+    "요청자": {"외부요청"},
+    "제공자": {"외부요청"},
+    "담당자": {"내부자료"},
+    "결재자": {"내부자료"},
+}
+
 # 통계종류는 사람이 손으로 입력한 자유 텍스트라 같은 개념인데 표기가 갈라져 있다(실측 확인,
 # 2026-09-21) — 정확매칭만 쓰면 사용자가 하나를 물어도 나머지 동의어로 저장된 레코드를
 # 전부 놓친다. 그룹 안 값이면 전부 OR로 같이 찾는다.
@@ -456,6 +471,16 @@ def _build_filter(
         resolved_types = {data_type_value}
     else:
         resolved_types = None
+
+    # 역할 필드(요청자·제공자·담당자·결재자)가 채워져 있는데, 사용자가 메뉴를 직접 고정한
+    # 게 아니면서(allowed_data_types is None) 그 역할의 유효 범위와 resolved_types가 전혀
+    # 안 겹치면, 신뢰도 낮은 데이터유형 추측 쪽을 버린다(위 _ROLE_FIELD_DATA_TYPES 설명 참고).
+    if allowed_data_types is None and resolved_types is not None:
+        for field, valid_types in _ROLE_FIELD_DATA_TYPES.items():
+            if field in values and not (resolved_types & valid_types):
+                resolved_types = None
+                data_type_value = None
+                break
 
     # 메뉴1(기관정보/신청이력)에만 존재하는 필드는, 최종 확정된 데이터유형 범위가 메뉴1을
     # 하나도 포함하지 않으면 제거한다("3차" 같은 표현이 통계종류에도 중복으로 채워져 존재하지
