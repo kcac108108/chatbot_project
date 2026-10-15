@@ -1115,6 +1115,26 @@ INTERNAL_INFO_PROBE_REFUSAL = (
 )
 EMPTY_QUESTION_ANSWER = "질문을 입력해 주세요."
 
+# "한국환경공단이랑 한국철강협회 중에 어디가 이력이 더 많아?"류 복수 기관 비교 질문 —
+# 이 챗봇은 기관명 필터가 단일 값이라(2026-10-15 즉흥 테스트로 발견) 비교 의도를 처리할
+# 방법이 없음. 재현해보니 두 가지 실패 모드가 섞여 나옴: (1) 두 기관명을 콤마로 합친
+# 문자열이 필터에 그대로 들어가 정확매칭이 항상 실패해 "찾지 못함" (2) 둘 중 하나만
+# 뽑혀서 그 기관 하나의 전체이력만 보여주고 비교 의도 자체는 조용히 무시됨 — 둘 다
+# 사용자가 원하는 답(실제 비교 결과)을 주지 못하면서도 겉보기엔 정상 응답처럼 보여
+# 혼란스러움. 실제 비교 기능을 새로 구현하는 대신(사용자 확인, AskUserQuestion) 명확히
+# 거절하는 쪽을 선택 — "기관을 하나씩 질문해 달라"고 정직하게 안내.
+MULTI_ORG_COMPARISON_REFUSAL = (
+    "이 챗봇은 여러 기관을 한 번에 비교하는 기능은 지원하지 않습니다. "
+    "기관을 하나씩 질문해 주세요(예: \"OO기관 이력 알려줘\")."
+)
+_MULTI_ORG_COMPARISON_RE = re.compile(
+    r"(이랑|랑|와|과|하고|,).{0,40}(중에|중에서|가운데).{0,20}(더\s*(많|적|큰|작|높|낮)|어디가|누가|뭐가)"
+)
+
+
+def _looks_like_multi_org_comparison(question: str) -> bool:
+    return bool(_MULTI_ORG_COMPARISON_RE.search(question))
+
 # 삭제요청 판단 — 어제 버전은 "삭제류 동사 + DB/데이터베이스 언급"을 AND로 봤는데, 이
 # 시스템 자체가 통계 데이터·DB 관련 업무를 다루다 보니 "데이터베이스 변경사항을 협의한
 # 내용이 이력에 있으면 알려줘"처럼 DB를 언급하는 **정상 검색 질문**까지 오탐할 위험이
@@ -1427,6 +1447,9 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     if _looks_like_mutation_request(question):
         session_store.append_turn(session_id, question, MUTATION_REFUSAL)
         return ChatResponse(session_id=session_id, answer=MUTATION_REFUSAL, sources=[])
+    if _looks_like_multi_org_comparison(question):
+        session_store.append_turn(session_id, question, MULTI_ORG_COMPARISON_REFUSAL)
+        return ChatResponse(session_id=session_id, answer=MULTI_ORG_COMPARISON_REFUSAL, sources=[])
 
     analysis = _analyze_query(question, history)
     allowed_data_types = _MENU_SCOPE_DATA_TYPES.get(menu_scope)
