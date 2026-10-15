@@ -371,6 +371,18 @@ def _build_details(grounded: GroundedAnswer, results: list[dict], keyword: str |
 
 
 _NULLISH = {"null", "none", "n/a", "미상", ""}
+# LLM이 값 없음을 "null" 같은 정해진 문자열이 아니라 "수출입 관련 기관명은 명시되지
+# 않음"처럼 자연어 설명문으로 채워버리는 경우가 있다(2026-10-15 즉흥 테스트로 발견 —
+# "거기 말고 다른 데" 후속질문에서 재현). 위 정확매칭 집합으로는 못 거르므로, "명시/언급/
+# 확인되지 않음·불명확·알 수 없음" 같은 패턴이 포함돼 있으면 같이 null 취급한다.
+_NULLISH_PATTERN_RE = re.compile(r"(명시되지\s*않|언급되지\s*않|확인되지\s*않|불명확|알\s*수\s*없)")
+
+
+def _is_nullish(value) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = value.strip().lower()
+    return normalized in _NULLISH or bool(_NULLISH_PATTERN_RE.search(value))
 _PREVIEW_LEN = 150
 # 첨부파일 출처는 "세부항목" 표가 없어서 narrative(요약)와 미리보기가 사실상 유일한 설명
 # 통로다. narrative가 원문의 핵심(배경·기간 등)을 놓치는 경우가 실제로 반복 확인됐는데,
@@ -434,7 +446,7 @@ def _build_filter(
             # 청크 payload의 필드명이 아니라 본문 부분 문자열 검색용 — _search()에서 별도 처리
             continue
         # 구조화 출력이 값 없음을 실제 null 대신 문자열 "null" 등으로 채우는 경우 방어
-        if isinstance(value, str) and value.strip().lower() in _NULLISH:
+        if _is_nullish(value):
             continue
         values[field] = value
 
@@ -612,7 +624,7 @@ def _clean_query_analysis(analysis: QueryAnalysis) -> QueryAnalysis:
     질문이 검색으로 새는 문제가 있었다). 여기서 한 번에 정리해서, 이후 모든 사용처가 실제
     None만 보게 한다."""
     cleaned = {
-        field: (None if isinstance(value, str) and value.strip().lower() in _NULLISH else value)
+        field: (None if _is_nullish(value) else value)
         for field, value in analysis.filters.model_dump().items()
     }
     analysis.filters = FilterExtraction(**cleaned)
