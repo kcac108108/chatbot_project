@@ -1,9 +1,28 @@
+import re
+
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
 
 from app.core.config import QDRANT_COLLECTION, QDRANT_HOST, QDRANT_PORT
 
 EMBEDDING_DIM = 3072  # text-embedding-3-large 기본 차원
+
+
+def keyword_matches(keyword: str, *texts: str) -> bool:
+    """키워드가 텍스트 안에 (띄어쓰기 차이는 무시하고) 실제로 포함되는지 확인한다.
+    키워드 자신의 공백 위치에만 선택적 공백(\\s*)을 허용하고 나머지는 원문 그대로
+    검색한다 — 예전엔 haystack 전체의 공백을 전부 지우고 비교했는데, 그러면 전혀
+    무관한 단어들이 우연히 이어 붙어 키워드를 만들어내는 거짓 매칭이 생긴다
+    (2026-10-16 실측 확인: "MICHAEL KORS"+"SLUT" 브랜드 나열이 공백 제거 시
+    "...KORSSLUT..."가 되어 'SSL'을 우연히 포함, 완전히 무관한 문서가 "SSL 관련
+    자료"로 지어내짐 — 짧은 키워드일수록 이 우연한 교차 매칭 위험이 큼). 키워드
+    내부에 공백이 없으면(예: "SSL") 이 함수는 사실상 평범한 리터럴 부분 문자열
+    검색과 같아져 원문의 단어 경계를 그대로 존중한다."""
+    parts = keyword.split()
+    if not parts:
+        return False
+    pattern = re.compile(r"\s*".join(re.escape(p) for p in parts))
+    return any(pattern.search(t) for t in texts if t)
 
 _client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
 
@@ -103,7 +122,6 @@ def scan_text_contains(keyword: str, limit: int) -> list[dict]:
     나열이라 특정 단어가 문자 그대로는 없는데 요약에서는 그 개념으로 풀어써서(예: 원문엔
     인증서 파일 목록만 있고 "SSL 인증서"라는 표현 자체는 요약에만 등장) 원문만 보면 놓치는
     사례가 재현됨(2026-09-21)."""
-    normalized_keyword = "".join(keyword.split())
     matches: list[dict] = []
     offset = None
     while True:
@@ -117,8 +135,7 @@ def scan_text_contains(keyword: str, limit: int) -> list[dict]:
         for p in points:
             text = p.payload.get("text", "")
             summary = p.payload.get("요약", "") or ""
-            haystack = "".join(text.split()) + "".join(summary.split())
-            if normalized_keyword in haystack:
+            if keyword_matches(keyword, text, summary):
                 matches.append(p.payload)
                 if len(matches) >= limit:
                     return matches

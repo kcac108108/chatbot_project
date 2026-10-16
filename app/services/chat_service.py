@@ -10,6 +10,7 @@ from app.core.vectordb import (
     find_by_type_and_field,
     find_by_type_and_fields,
     find_by_type_and_source,
+    keyword_matches,
     scan_field_contains,
     scan_text_contains,
 )
@@ -264,7 +265,6 @@ def _find_related_attachments(
     # 문제가 있었다(2026-09-23 사용자 지적: "저렇게 많으면 SSL 관련된 내용만 보여줄 수
     # 없어?"). 키워드가 있으면 그 단어가 실제로 포함된 첨부만 추려서 보여준다 — 매칭이
     # 하나도 없으면(요약·본문 표기가 애매해 놓친 경우 대비) 안전하게 전체 목록으로 폴백.
-    normalized_keyword = "".join(keyword.split()) if keyword else None
     seen_files: set[str] = set()
     related: list[RelatedAttachment] = []
     matched: list[RelatedAttachment] = []
@@ -288,11 +288,9 @@ def _find_related_attachments(
             preview = chunk.get("요약") or _preview(chunk.get("text"), attachment_type) or ""
             item = RelatedAttachment(첨부파일명=filename, 미리보기=preview)
         related.append(item)
-        if normalized_keyword:
-            haystack = "".join((chunk.get("text") or "").split()) + "".join((chunk.get("요약") or "").split())
-            if normalized_keyword in haystack:
-                matched.append(item)
-    if normalized_keyword and matched:
+        if keyword and keyword_matches(keyword, chunk.get("text") or "", chunk.get("요약") or ""):
+            matched.append(item)
+    if keyword and matched:
         return matched
     return related
 
@@ -1602,10 +1600,9 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 대신 매칭 안 된 [자료 1][자료 2]를 근거로 들어 없는 내용을 지어냄). 안내 문구로 유도하는
     # 대신, 매칭 안 된 자료를 LLM이 애초에 볼 수 없게 만들어 잘못 인용할 여지 자체를 없앤다.
     if analysis.filters.키워드:
-        _kw_normalized = "".join(analysis.filters.키워드.split())
         _matched_results = [
             r for r in results
-            if _kw_normalized in "".join(r["text"].split()) + "".join((r.get("요약") or "").split())
+            if keyword_matches(analysis.filters.키워드, r["text"], r.get("요약") or "")
         ]
         if _matched_results:
             results = _matched_results
@@ -1676,10 +1673,9 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     keyword_note = ""
     if analysis.filters.키워드:
         keyword = analysis.filters.키워드
-        normalized_keyword = "".join(keyword.split())
         matched = [
             i + 1 for i, payload in enumerate(results[: len(context_blocks)])
-            if normalized_keyword in "".join(payload["text"].split()) + "".join((payload.get("요약") or "").split())
+            if keyword_matches(keyword, payload["text"], payload.get("요약") or "")
         ]
         if matched:
             keyword_note = (
