@@ -1545,13 +1545,19 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
 
     # 기관명이 명시된 "전체 이력" 질문은, 메뉴 스코프가 신청이력을 배제하지 않는 한
     # 집계 거절보다 우선해서 정확한 전체 이력을 코드로 직접 가져와 보여준다.
-    if _looks_like_full_org_history_question(analysis.standalone_question, analysis.filters) and (
-        allowed_data_types is None or "신청이력" in allowed_data_types
-    ):
-        answer_text, sources, org_payloads = _full_org_history_answer(analysis.filters.기관명)
-        session_store.append_turn(session_id, question, answer_text)
-        session_store.set_last_sources(session_id, org_payloads)
-        return ChatResponse(session_id=session_id, answer=answer_text, sources=sources)
+    if _looks_like_full_org_history_question(analysis.standalone_question, analysis.filters):
+        if allowed_data_types is None or "신청이력" in allowed_data_types:
+            answer_text, sources, org_payloads = _full_org_history_answer(analysis.filters.기관명)
+            session_store.append_turn(session_id, question, answer_text)
+            session_store.set_last_sources(session_id, org_payloads)
+            return ChatResponse(session_id=session_id, answer=answer_text, sources=sources)
+        # 스코프가 신청이력을 배제하는 경우(예: 심의위원회 스코프 고정) 전체이력 자체는
+        # 줄 수 없지만(스코프 위반), 기관명이라는 명확한 조건이 있는 질문을 "전체"라는
+        # 단어 하나 때문에 집계 거절로 떨어뜨리면 안 된다(2026-10-16 발견 — 심의위원회
+        # 스코프에서 "OO 전체 이력 알려줘"가 매번 집계 거절 문구로 잘못 응답됨, 레이스
+        # 컨디션으로 의심했으나 매번 100% 재현되는 설계상의 틈이었음). is_aggregation_question을
+        # 코드로 강제 해제해 정상적인 스코프 내 검색(기관명 필터)으로 흘러가게 한다.
+        analysis.is_aggregation_question = False
 
     resolved_field = _resolve_list_field(analysis.standalone_question, analysis.filters)
     # is_aggregation_question을 LLM이 이미 true로 확신했으면, 코드 휴리스틱(놓친 케이스를
