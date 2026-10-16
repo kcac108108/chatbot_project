@@ -647,6 +647,19 @@ _TEXT_TRACE_FILTER_FIELDS = (
     "연도", "통계종류", "수출입구분", "요청자", "제공자", "담당자", "결재자", "심의결과",
 )
 
+# "국가 항목 관련 첨부파일 있어?"처럼 키워드로 완전히 새로운 주제를 검색하는 질문인데도,
+# 직전까지 다른 기관(예: 한국철강협회) 얘기를 하고 있었으면 LLM이 그 기관명을 암묵적으로
+# 계속 이어붙이는 경우가 있다(2026-10-16 실측 확인 — "한국철강협회 안건→결과→최근 건"
+# 3턴 뒤 "국가 항목 관련 첨부파일 있어?"를 물으면 standalone_question이 "한국철강협회에서
+# 요청한..."으로 멋대로 재작성돼 검색 결과가 전부 그 기관으로만 좁혀짐, 다른 기관 자료는
+# 전혀 안 보임). 다만 "수수료는 얼마야?"/"담당자는 누구야?" 같은 **정상** 후속질문도
+# 기관명을 원문 언급 없이 암묵적으로 이어받는 게 핵심 기능이라(2026-10-15 많은 수정이
+# 이 동작에 의존), 기관명 자체를 위 _TEXT_TRACE_FILTER_FIELDS처럼 일괄 검증하면 그 기능이
+# 깨진다. 실측 결과 이 두 경우는 키워드 추출 여부로 갈린다 — 정상 후속질문은 키워드가
+# 안 뽑히고, 새 주제 키워드 검색일 때만 기관명이 같이 뽑힌다. 따라서 **키워드가 있을
+# 때만** 기관명을 원문 추적 검증한다(좁은 조건이라 위 핵심 기능엔 영향 없음).
+_CONTINUATION_REFERENCE_WORDS = ("그", "거기", "그것", "해당", "방금", "이전")
+
 
 def _strip_untraceable_filters(analysis: QueryAnalysis, question: str, history: list[dict]) -> QueryAnalysis:
     user_texts = [question] + [m["content"] for m in history if m.get("role") == "user"]
@@ -659,6 +672,14 @@ def _strip_untraceable_filters(analysis: QueryAnalysis, question: str, history: 
         normalized_value = "".join(str(value).split())
         if normalized_value and normalized_value not in normalized_user_text:
             updates[field] = None
+    org_name = analysis.filters.기관명
+    if (
+        org_name
+        and analysis.filters.키워드
+        and org_name not in question
+        and not any(w in question for w in _CONTINUATION_REFERENCE_WORDS)
+    ):
+        updates["기관명"] = None
     if updates:
         analysis.filters = analysis.filters.model_copy(update=updates)
     return analysis
