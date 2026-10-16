@@ -375,6 +375,17 @@
     .widget-wrap { padding: 0; }
     .widget { border-radius: 0; }
     .msg-row { max-width: 92%; }
+    /* "이력 보기" 표의 칼럼 비율(신청일 13%/사업명 63%/원본ID 24%)은 데스크톱
+       폭 기준이라, 모바일 좁은 폭에서는 신청일·원본ID처럼 공백 없는 고정형
+       문자열(2025-12-31, D20260100179487)이 하이픈 사이로 줄바꿈돼 숫자가
+       토막 나 보인다(2026-10-16, 모바일 뷰포트 실사용 테스트로 발견 — 처음엔
+       white-space:nowrap으로 시도했으나 table-layout:fixed 때문에 내용이
+       옆 칼럼으로 넘쳐 겹치는 더 나쁜 결과가 나와 폐기). 칼럼 비율 자체를
+       좁은 화면에 맞게 재조정 — JS가 매긴 인라인 width(가장 높은 specificity)를
+       덮어써야 해서 !important 필요. */
+    .extracted-table.history-table col:nth-child(1) { width: 22% !important; }
+    .extracted-table.history-table col:nth-child(2) { width: 42% !important; }
+    .extracted-table.history-table col:nth-child(3) { width: 36% !important; }
   }
 </style>
 </head>
