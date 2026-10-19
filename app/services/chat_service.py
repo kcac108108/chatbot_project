@@ -1334,6 +1334,19 @@ _RECENT_INGESTION_RE = re.compile(
 )
 _YEAR_MENTION_RE = re.compile(r"\d{4}\s*년")
 
+# "요즘 심의위원회에서 가장 최근에 처리된 안건이 뭐야?"처럼 "가장/제일 최근·최신·오래된"은
+# 날짜 기준 최댓값/최솟값을 묻는 집계 질문인데, is_aggregation_question이 이를 포착하지
+# 못해 top-6/20 검색 결과 중 하나를 LLM이 그냥 골라 "가장 최근"이라고 확신에 차서 답하는
+# 버그가 즉흥 테스트로 재현됨(2026-10-19) — 검색 자체는 진짜 최신 레코드(2026년)를 포함해
+# 6건을 다 찾았는데, 답변 생성 LLM이 그중 2025년 것을 "가장 최근"으로 잘못 고름(실측
+# 확인). top-K 안에서조차 완전히 믿을 수 없고, top-K 밖에 더 최신이 있을 수도 있어 근본적
+# 으로 "집계"와 같은 성격 — 기존 집계 거절과 동일하게 처리한다. 단, 기관명이 있으면
+# "한국환경공단 중 가장 최근 이력"처럼 이미 찾은 좁은 목록에서 하나를 고르는 의미이므로
+# (_SINGLE_ITEM_SELECTOR_WORDS가 이미 처리) 건드리지 않는다.
+_SUPERLATIVE_DATE_RE = re.compile(
+    r"(가장|제일)\s*(최근|최신|오래된|오래|나중|늦은|이른|먼저)"
+)
+
 # "등록된/등록되"를 "신청된/신청되"로 치환 — 답변 생성 LLM에게 보여줄 질문 텍스트 전용
 # (ask()의 [질문] 구성부 참고). 이 시스템에 "등록일" 필드가 없어 생기는 용어 혼동을
 # 피하기 위함.
@@ -1664,6 +1677,12 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     if _looks_like_recent_ingestion_question(question) or _looks_like_recent_ingestion_question(
         analysis.standalone_question
     ):
+        analysis.is_aggregation_question = True
+
+    # "가장 최근" 류 날짜 기준 최댓값/최솟값 질문도 집계와 같은 성격이다(위
+    # _SUPERLATIVE_DATE_RE 정의부 참고) — 기관명이 없을 때만 적용(기관명이 있으면
+    # _SINGLE_ITEM_SELECTOR_WORDS가 이미 좁은 목록에서 하나를 고르는 의미로 처리함).
+    if not analysis.filters.기관명 and _SUPERLATIVE_DATE_RE.search(question):
         analysis.is_aggregation_question = True
 
     # "안녕" 같은 인사말은 검색 의도가 전혀 없는데도 벡터 검색이 무관한 상위 몇 건을 그대로
