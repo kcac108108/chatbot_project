@@ -1201,10 +1201,22 @@ _MULTI_ORG_COMPARISON_RE = re.compile(
     r"각각|둘\s*다|모두\s*(알려|보여)|따로\s*(알려|보여))"
     r"|보다.{0,15}(더\s*)?(많|적|크|작|높|낮)"
 )
+# 위 패턴만으로는 "한국환경공단 2020년이랑 2021년 이력 둘 다 보여줘"(기관은 하나, 연도
+# 두 개를 비교)처럼 연결어+비교표현이 기관이 아닌 다른 대상(연도 등)을 잇는 경우까지
+# 오탐한다(2026-10-19 CDP 즉흥테스트로 발견) — 실제 "기관" 이름이 최소 2번 등장할 때만
+# 거절하도록 보강. 흔한 기관명 접미사를 세되, "청"/"원"처럼 "신청"/"요청인" 등 일반
+# 단어에도 흔히 섞이는 짧은 접미사는 거짓양성 위험이 커서 일부러 뺐다(완벽하진 않지만,
+# 이력관리시스템 실데이터 기관명 대부분은 공사/공단/협회/진흥원 등으로 끝남).
+_ORG_SUFFIX_RE = re.compile(
+    r"(공사|공단|협회|진흥원|연구원|위원회|재단|조합|공제회|그룹|코퍼레이션|"
+    r"평가원|관리원|안전원|정보원|센터|연구소|주식회사|㈜|\(주\)|기관)"
+)
 
 
 def _looks_like_multi_org_comparison(question: str) -> bool:
-    return bool(_MULTI_ORG_COMPARISON_RE.search(question))
+    if not _MULTI_ORG_COMPARISON_RE.search(question):
+        return False
+    return len(_ORG_SUFFIX_RE.findall(question)) >= 2
 
 # 삭제요청 판단 — 어제 버전은 "삭제류 동사 + DB/데이터베이스 언급"을 AND로 봤는데, 이
 # 시스템 자체가 통계 데이터·DB 관련 업무를 다루다 보니 "데이터베이스 변경사항을 협의한
