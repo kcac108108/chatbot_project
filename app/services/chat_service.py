@@ -1301,6 +1301,11 @@ _RECENT_INGESTION_RE = re.compile(
 )
 _YEAR_MENTION_RE = re.compile(r"\d{4}\s*년")
 
+# "등록된/등록되"를 "신청된/신청되"로 치환 — 답변 생성 LLM에게 보여줄 질문 텍스트 전용
+# (ask()의 [질문] 구성부 참고). 이 시스템에 "등록일" 필드가 없어 생기는 용어 혼동을
+# 피하기 위함.
+_REGISTRATION_WORD_RE = re.compile(r"등록(된|되)")
+
 # "수수료 1억원 넘는 거 있어?"처럼 금액·수량 임계값 조건도 연도 범위와 같은 계열 문제다
 # (2026-10-15 즉흥 테스트로 발견 — filters 구조화 필드로 담을 수 없는 조건이라 LLM이
 # 비워버리고, "조건 없음"으로 오판해 전체이력 83건 답변이 그대로 반복됨). "이상/이하/초과/
@@ -1781,11 +1786,23 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 한다 — 검색은 이미 이걸로 하는데 답변 생성에는 원본의 애매한 표현을 그대로 넘겨서,
     # 자료에 정답이 있어도 "이게 질문에 대한 진짜 답인지" LLM이 확신 못 하고 가끔 no_result로
     # 잘못 처리하는 문제가 재현됨("또 다른건 하나 알려줘" 류 후속 질문에서 특히 두드러짐)
+    #
+    # "등록된/등록되"도 같은 계열 문제다(2026-10-19 즉흥 테스트로 발견) — "2024-01-01
+    # 이후에 등록된 한국환경공단 이력 있어?"가 자료에 정확히 일치하는 레코드(신청일
+    # 20241227)가 있는데도 no_result로 답함, "등록" 빼면("~이후 이력") 바로 정상 동작.
+    # 이 시스템엔 "등록일" 필드 자체가 없고 [자료]엔 "신청"만 적혀있는데, LLM이 둘을 다른
+    # 개념으로 보고 확인을 거부하는 것으로 추정 — 프롬프트 지시로 1차 시도했으나 6/6 효과
+    # 없어서(이 계열 문제의 전형적 패턴) 질문 텍스트 자체를 치환하는 코드 레벨 방식으로
+    # 전환, 4/4 해결 확인. standalone_question 원본(세션 저장 등에 쓰임)은 건드리지 않고
+    # 답변 생성 프롬프트에 보여줄 사본에만 적용한다.
+    _answer_question_text = _REGISTRATION_WORD_RE.sub(
+        lambda m: "신청" + m.group(1), analysis.standalone_question
+    )
     messages.append(
         {
             "role": "user",
             "content": (
-                f"[자료]\n{context_text}\n\n[질문]\n{analysis.standalone_question}{keyword_note}{truncation_note}"
+                f"[자료]\n{context_text}\n\n[질문]\n{_answer_question_text}{keyword_note}{truncation_note}"
             ),
         }
     )
