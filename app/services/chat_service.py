@@ -1558,7 +1558,16 @@ def _looks_like_full_org_history_question(text: str, filters: FilterExtraction) 
         return False
     if any(w in text for w in _FULL_HISTORY_ASK_WORDS):
         return True
-    if any(w in text for w in _SINGLE_ITEM_SELECTOR_WORDS) or _SUPERLATIVE_SELECTOR_RE.search(text):
+    # "가장 긴 요청내용이 뭐야"/"제일 짧게 처리된 건"처럼 _SINGLE_ITEM_SELECTOR_WORDS/
+    # _SUPERLATIVE_SELECTOR_RE(거/것/건으로 끝나는 좁은 패턴)로도 못 잡는 "제일/가장"
+    # 변형이 계속 재현돼(2026-10-19), 기관명이 있는 맥락에서는 "제일"/"가장" 포함 자체를
+    # 단건선택 신호로 넓게 본다(이 함수는 이미 filters.기관명이 있을 때만 호출됨).
+    if (
+        any(w in text for w in _SINGLE_ITEM_SELECTOR_WORDS)
+        or _SUPERLATIVE_SELECTOR_RE.search(text)
+        or "제일" in text
+        or "가장" in text
+    ):
         return False
     # "2020년부터 2022년 사이에 신청한 거 있어?"처럼 연도 범위 조건은 filters.연도가
     # 단일 문자열이라 담을 수 없어 LLM이 그냥 비워버리는 경우가 있다(2026-10-15 즉흥
@@ -1692,22 +1701,34 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     ):
         analysis.is_aggregation_question = True
 
+    # "기관명뿐 아니라 요청자/담당자 등 다른 narrowing 필드로 좁혀진 질문도 '좁은 목록
+    # 에서 하나 고르기' 맥락일 수 있다(예: "박상용 계장이 요청한 자료 중 제일 최근 거")
+    # — 기관명만 체크하던 최초 구현이 이런 경우를 놓치는 게 즉흥 테스트로 재현됨
+    # (2026-10-19). _TEXT_TRACE_FILTER_FIELDS(+기관명)로 좁힌 조건이 하나라도 있으면
+    # "narrowing됨"으로 본다.
+    _has_narrowing_for_superlative = analysis.filters.기관명 or any(
+        getattr(analysis.filters, f, None) for f in _TEXT_TRACE_FILTER_FIELDS
+    )
+
     # "가장 최근" 류 날짜 기준 최댓값/최솟값 질문도 집계와 같은 성격이다(위
-    # _SUPERLATIVE_DATE_RE 정의부 참고) — 기관명이 없을 때만 적용(기관명이 있으면
-    # _SINGLE_ITEM_SELECTOR_WORDS가 이미 좁은 목록에서 하나를 고르는 의미로 처리함).
-    if not analysis.filters.기관명 and _SUPERLATIVE_DATE_RE.search(question):
+    # _SUPERLATIVE_DATE_RE 정의부 참고) — narrowing 조건이 전혀 없을 때만 적용(있으면
+    # 아래 반대 방향 가드가 "좁은 목록에서 하나 고르기"로 처리함).
+    if not _has_narrowing_for_superlative and _SUPERLATIVE_DATE_RE.search(question):
         analysis.is_aggregation_question = True
 
-    # 반대 방향 보강: "한국환경공단 이력 중에 제일 최근 요청구분은 뭐야"처럼 기관명이 있는
-    # 질문에서도 질문분석 LLM이 "제일/가장"을 보고 종종(동일 질문 8회 중 1회꼴) 집계로
-    # 잘못 판단하는 비결정성이 재현됨(2026-10-19) — is_aggregation_question이 이미
-    # True면 _looks_like_full_org_history_question/단건선택 로직 자체가 적용될 기회도
-    # 없이 바로 거절돼버린다. 기관명이 있고 단건선택어/최상급 패턴이 있으면 "좁은 목록
-    # 에서 하나 고르기"가 맞으므로 집계 판단을 강제로 되돌린다.
-    if analysis.filters.기관명 and (
-        any(w in analysis.standalone_question for w in _SINGLE_ITEM_SELECTOR_WORDS)
-        or _SUPERLATIVE_SELECTOR_RE.search(analysis.standalone_question)
-    ):
+    # 반대 방향 보강: "한국환경공단 이력 중에 제일 최근 요청구분은 뭐야"처럼 narrowing
+    # 조건이 있는 질문에서도 질문분석 LLM이 "제일/가장"을 보고 종종(동일 질문 8회 중
+    # 1회꼴) 집계로 잘못 판단하는 비결정성이 재현됨(2026-10-19) — is_aggregation_question
+    # 이 이미 True면 _looks_like_full_org_history_question/단건선택 로직 자체가 적용될
+    # 기회도 없이 바로 거절돼버린다. narrowing 조건이 있고 "제일/가장"이 있으면 "좁은
+    # 목록에서 하나 고르기"가 맞으므로 집계 판단을 강제로 되돌린다.
+    # ⚠️ 처음엔 _SINGLE_ITEM_SELECTOR_WORDS/_SUPERLATIVE_SELECTOR_RE(거/것/건으로 끝나는
+    # 패턴)만 체크했는데, "가장 긴 요청내용이 뭐야"(거/것/건으로 안 끝남)나 "제일 짧게
+    # 처리된 건"(수식어가 길어 정규식 범위 1~6자를 넘김)에서 매치 실패가 재현됨 — narrowing
+    # 조건이 있다는 전제 하에는 "제일"/"가장"이 그냥 있기만 해도 단건선택 의도로 본다
+    # (기관명 없는 진짜 전체 집계와 혼동할 위험은 위 _has_narrowing_for_superlative 체크로
+    # 이미 배제됨).
+    if _has_narrowing_for_superlative and ("제일" in analysis.standalone_question or "가장" in analysis.standalone_question):
         analysis.is_aggregation_question = False
 
     # "안녕" 같은 인사말은 검색 의도가 전혀 없는데도 벡터 검색이 무관한 상위 몇 건을 그대로
