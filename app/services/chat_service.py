@@ -1057,6 +1057,18 @@ def _search(
         for payload in scan_results:
             if allowed_data_types is not None and payload["데이터유형"] not in allowed_data_types:
                 continue
+            # 기관명이 필터로 걸려있는데(예: "한국환경공단 신청이력 중 수수료 0원인거") "수수료"
+            # 처럼 흔한 키워드는 완전히 무관한 다른 기관(국민건강보험공단 등)의 레코드도 전수
+            # 스캔에 대거 걸려서, 기관명 조건이 사실상 무시되고 섞여 나오는 교차오염이 즉흥
+            # 테스트로 재현됨(2026-10-19) — 스캔 결과가 명백히 다른 기관 소속이면 제외한다.
+            # 첨부 청크처럼 기관명 필드 자체가 없는 경우(None)는 구분이 불가능하니 그대로
+            # 통과시킨다(완벽하진 않지만, 본문 레벨의 명백한 교차오염은 확실히 막는다).
+            if (
+                analysis.filters.기관명
+                and payload.get("기관명")
+                and payload.get("기관명") != analysis.filters.기관명
+            ):
+                continue
             key = _pool_key(payload)
             scan_confirmed_keys.add(key)
             scan_confirmed_files.add(_file_identity(payload))
