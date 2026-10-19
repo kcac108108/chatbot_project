@@ -1698,6 +1698,18 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     if not analysis.filters.기관명 and _SUPERLATIVE_DATE_RE.search(question):
         analysis.is_aggregation_question = True
 
+    # 반대 방향 보강: "한국환경공단 이력 중에 제일 최근 요청구분은 뭐야"처럼 기관명이 있는
+    # 질문에서도 질문분석 LLM이 "제일/가장"을 보고 종종(동일 질문 8회 중 1회꼴) 집계로
+    # 잘못 판단하는 비결정성이 재현됨(2026-10-19) — is_aggregation_question이 이미
+    # True면 _looks_like_full_org_history_question/단건선택 로직 자체가 적용될 기회도
+    # 없이 바로 거절돼버린다. 기관명이 있고 단건선택어/최상급 패턴이 있으면 "좁은 목록
+    # 에서 하나 고르기"가 맞으므로 집계 판단을 강제로 되돌린다.
+    if analysis.filters.기관명 and (
+        any(w in analysis.standalone_question for w in _SINGLE_ITEM_SELECTOR_WORDS)
+        or _SUPERLATIVE_SELECTOR_RE.search(analysis.standalone_question)
+    ):
+        analysis.is_aggregation_question = False
+
     # "안녕" 같은 인사말은 검색 의도가 전혀 없는데도 벡터 검색이 무관한 상위 몇 건을 그대로
     # 반환해버려서, 답변 LLM이 그걸 근거인 것처럼 제시하는 문제가 있었다(2026-09-23 발견).
     # filters에 뭐라도 실제로 추출됐으면(기관명·키워드 등) 검색 의도가 있다는 뜻이니, LLM이
