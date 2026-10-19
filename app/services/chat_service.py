@@ -398,6 +398,24 @@ def _preview(text: str | None, data_type: str | None = None) -> str | None:
 
 
 _PERSON_ROLE_FIELDS = {"요청자", "제공자", "담당자", "결재자"}
+
+# "박상용 계장 말고 다른 사람이 요청한 외부요청은 없어?" 같은 제외(negation) 후속질문이,
+# 정작 답변 상세엔 제외하라고 한 그 사람의 레코드를 그대로 보여주면서 "다른 사람이 요청한
+# 자료가 1건 있다"고 자기모순적으로 답하는 버그가 즉흥 테스트로 재현됨(2026-10-19) — 필터
+# 추출이 "제외"라는 의미를 표현할 방법이 없어(요청자 필드는 포함할 값만 담음) 그냥 None으로
+# 비워지고, 벡터 검색+세션 carried_over가 그 사람의 기존 레코드를 그대로 다시 찾아와 LLM이
+# "다른 사람"이라고 잘못 서술함. "A 말고/빼고/제외하고" 패턴으로 제외 대상 이름을 감지해
+# 검색 결과에서 그 사람이 해당 역할 필드에 있는 레코드를 코드로 직접 걸러낸다 — "제외 검색"
+# 기능 전체를 새로 만드는 대신, 이미 뽑힌 결과에서 명백히 틀린 레코드만 빼는 좁은 범위의 수정.
+_EXCLUSION_NAME_RE = re.compile(
+    r"([가-힣]{2,4}(?:\s*(?:계장|팀장|과장|대리|주임|사원|선임|책임|부장|차장|실장|국장|원장|소장))?)"
+    r"\s*(?:말고|빼고|제외하고)"
+)
+
+
+def _excluded_role_value(text: str) -> str | None:
+    m = _EXCLUSION_NAME_RE.search(text or "")
+    return m.group(1).strip() if m else None
 # 메뉴1(기관정보/신청이력)에만 존재하는 필드. 다른 데이터유형일 때 LLM이 "3차" 같은 표현을
 # 차수뿐 아니라 여기에도 중복으로 지어내 채우는 문제가 프롬프트 설명 추가로도 반복 재현됨 —
 # 코드가 강제로 걸러낸다
@@ -1644,6 +1662,15 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         return ChatResponse(session_id=session_id, answer=AGGREGATION_REFUSAL, sources=[])
 
     results, possibly_truncated = _search(analysis, carried_over, allowed_data_types)
+
+    excluded_name = _excluded_role_value(question) or _excluded_role_value(analysis.standalone_question)
+    if excluded_name:
+        _excluded_filtered = [
+            r for r in results
+            if not any(excluded_name in (r.get(f) or "") for f in _PERSON_ROLE_FIELDS)
+        ]
+        if len(_excluded_filtered) < len(results):
+            results = _excluded_filtered
 
     # 키워드 질문인데 매칭된 자료가 있으면, 매칭 안 된 자료는 컨텍스트에서 아예 제거한다.
     # 예전엔 "[자료 N]은 이미 키워드 포함이 확인됐다"고 LLM에게 안내만 하고 나머지는 그대로
