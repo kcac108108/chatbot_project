@@ -1645,6 +1645,19 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     if not analysis.filters.키워드 and "댓글" in question:
         analysis.filters = analysis.filters.model_copy(update={"키워드": "댓글"})
 
+    # 심의결과 값("제공불가" 등)이 기관명으로 잘못 들어가는 경우는 _build_filter에서
+    # 방어했지만(_KNOWN_COMMITTEE_RESULTS), LLM이 그 값을 기관명·심의결과 어느 구조화
+    # 필드에도 아예 안 채우는 경우도 상당히 자주 재현됨(2026-10-19, 8회 중 절반가량) —
+    # 그러면 narrowing filter가 전혀 없어 top-6 벡터 결과만으로 판단하게 돼 불안정해진다.
+    # 질문에 심의결과 값이 문자 그대로 있는데 구조화 필드 어디에도 안 뽑혔으면 코드가
+    # 직접 채운다(기관명에 잘못 들어간 경우는 이미 model_copy 이전 단계에서 처리되므로
+    # 여기선 "심의결과도 기관명도 둘 다 비어있는" 경우만 해당).
+    if not analysis.filters.심의결과 and not analysis.filters.기관명:
+        for _result_value in _KNOWN_COMMITTEE_RESULTS:
+            if _result_value in question:
+                analysis.filters = analysis.filters.model_copy(update={"심의결과": _result_value})
+                break
+
     # 프롬프트 지시만으로 두 차례 시도했으나 매번 다른 회귀를 일으켜서(주석 참고) 코드로
     # 직접 강제. standalone_question(대명사 해석된 재작성 질문)과 원문 둘 다 확인 — 후속
     # 질문에서 "거기" 같은 대명사가 풀리면서 패턴이 드러나는 경우까지 잡기 위함.
