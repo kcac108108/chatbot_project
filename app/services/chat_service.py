@@ -466,6 +466,19 @@ def _resolve_statistics_type_group(value: str) -> list[str]:
     return [value]
 
 
+# 실제 DB에 존재하는 통계종류 값 전체(직접 스캔 확인, 2026-10-19). "한국환경공단 신청이력
+# 중에 2024년 수수료 관련 알려줘"에서 LLM이 "수수료 관련"처럼 전혀 존재하지 않는 값을
+# 통계종류 필드에 지어내 채워 넣는 바람에, 그 값과 정확히 일치하는 레코드가 DB에 없어
+# 필터가 0건 → 완화 단계를 거쳐 결국 기관명·연도까지 전부 풀린 최종 폴백(벡터 유사도만)
+# 으로 떨어지면서 무관한 연도가 대거 섞이는 버그가 즉흥 테스트로 재현됨 — 알려진 값
+# 집합에 없는 통계종류는 애초에 신뢰하지 않고 제거한다(기관명·연도 등 신뢰할 수 있는
+# 필터는 그대로 유지한 채 재검색되므로 완화 단계를 하나 아낄 수 있음).
+_KNOWN_STATISTICS_TYPES = {
+    "-", ".", "세부 및 일반가공", "세부가공", "일반 및 세부가공", "일반가공",
+    "일반가공, 세부가공", "일반통계", "지역별 통계", "통관기초", "통관기초자료", "통관기초통계",
+}
+
+
 def _build_filter(
     extracted: FilterExtraction, allowed_data_types: set[str] | None = None
 ) -> qmodels.Filter | None:
@@ -490,6 +503,13 @@ def _build_filter(
         misplaced = values.pop("기관명")
         if "심의결과" not in values:
             values["심의결과"] = misplaced
+
+    # "수수료 관련"처럼 DB에 실제로 존재하지 않는 값이 통계종류 필드에 지어내지는 경우를
+    # 방어한다(2026-10-19 발견, _KNOWN_STATISTICS_TYPES 정의부 참고) — 신뢰 못 할 값은
+    # 제거만 하고(옮길 곳이 마땅치 않음), 기관명·연도 등 나머지 신뢰할 수 있는 필터는
+    # 그대로 유지한 채 검색한다.
+    if values.get("통계종류") and values["통계종류"] not in _KNOWN_STATISTICS_TYPES:
+        values.pop("통계종류", None)
 
     data_type_value = values.pop("데이터유형", None)
 
