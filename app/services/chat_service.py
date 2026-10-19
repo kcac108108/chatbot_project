@@ -1061,12 +1061,16 @@ def _search(
             # 처럼 흔한 키워드는 완전히 무관한 다른 기관(국민건강보험공단 등)의 레코드도 전수
             # 스캔에 대거 걸려서, 기관명 조건이 사실상 무시되고 섞여 나오는 교차오염이 즉흥
             # 테스트로 재현됨(2026-10-19) — 스캔 결과가 명백히 다른 기관 소속이면 제외한다.
-            # 첨부 청크처럼 기관명 필드 자체가 없는 경우(None)는 구분이 불가능하니 그대로
+            # 첨부 청크처럼 해당 필드 자체가 없는 경우(None)는 구분이 불가능하니 그대로
             # 통과시킨다(완벽하진 않지만, 본문 레벨의 명백한 교차오염은 확실히 막는다).
-            if (
-                analysis.filters.기관명
-                and payload.get("기관명")
-                and payload.get("기관명") != analysis.filters.기관명
+            # 같은 버그를 연도 필터로도 재현 확인("2024년에 보안 관련 신청된 자료" →
+            # 2016년 레코드도 섞임) — 역할필드(요청자 등)는 콤마 다중값이라 단순 값비교가
+            # 틀릴 수 있어 제외하고, 단일값 필드만 체크한다.
+            if any(
+                getattr(analysis.filters, f, None)
+                and payload.get(f)
+                and str(payload.get(f)) != str(getattr(analysis.filters, f))
+                for f in ("기관명", "연도", "통계종류", "수출입구분", "심의결과", "차수")
             ):
                 continue
             key = _pool_key(payload)
