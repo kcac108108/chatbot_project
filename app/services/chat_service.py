@@ -1584,6 +1584,16 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     analysis = _analyze_query(question, history)
     allowed_data_types = _MENU_SCOPE_DATA_TYPES.get(menu_scope)
 
+    # "내부자료에서 댓글 달린 글 알려줘"/"~있는거 알려줘"처럼 "~달린/있는" 서술형 수식이
+    # 붙으면 필터 추출이 "댓글"을 키워드로 안 뽑는 경우가 재현됨(2026-10-19 즉흥 테스트
+    # 발견) — "댓글 관련 내부자료 알려줘"처럼 명사형으로 물으면 바로 추출되는 걸 보면
+    # 추출 자체는 가능한데 이 서술형 패턴에서만 불안정함. FilterExtraction 필드 설명에
+    # 예시를 추가해 프롬프트로 고쳐보려 했으나 6/6 효과 없어(이 계열 문제의 전형적 패턴)
+    # 되돌리고, "댓글"이 질문에 문자 그대로 있는데 키워드가 안 뽑혔으면 코드가 직접
+    # 채운다 — 내부자료 전용 도메인 단어라 다른 맥락과 오탐할 위험이 낮다.
+    if not analysis.filters.키워드 and "댓글" in question:
+        analysis.filters = analysis.filters.model_copy(update={"키워드": "댓글"})
+
     # 프롬프트 지시만으로 두 차례 시도했으나 매번 다른 회귀를 일으켜서(주석 참고) 코드로
     # 직접 강제. standalone_question(대명사 해석된 재작성 질문)과 원문 둘 다 확인 — 후속
     # 질문에서 "거기" 같은 대명사가 풀리면서 패턴이 드러나는 경우까지 잡기 위함.
