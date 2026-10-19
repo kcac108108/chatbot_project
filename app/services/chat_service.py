@@ -437,6 +437,19 @@ _ROLE_FIELD_DATA_TYPES = {
     "결재자": {"내부자료"},
 }
 
+# "심의위원회 제공불가 안건 중에 2008년도 아닌거 알려줘"에서 필터 추출이 "제공불가"
+# (심의결과 값)를 엉뚱하게 기관명 필드에 채워넣는 버그가 즉흥 테스트로 재현됨(2026-10-19)
+# — 기관명="제공불가"로 필터를 걸면 그런 기관이 없어 0건, 결국 필터가 전부 풀려 심의결과와
+# 무관한(결정유보/일부제공 등 섞인) 상위 벡터 결과만 남고, 답변 생성 LLM이 그중 일부만
+# 골라 마치 완전한 답처럼 제시(실제 13건인데 2건만 답함). 실제 DB의 심의결과 값 전부를
+# 집합으로 등록해, 기관명이 이 중 하나와 정확히 같으면 "역할을 착각한 것"으로 보고
+# 제거한다(심의결과 필드로 옮기지는 않는다 — "~아닌"처럼 제외 조건은 정확매칭 필터로
+# 표현이 안 돼서, 심의결과에 넣어봤자 또 0건이 되거나 반대로 좁혀버릴 위험이 있음).
+_KNOWN_COMMITTEE_RESULTS = {
+    "감면대상및감면율조정", "결정유보", "요청안대로제공", "원안대로승인", "원안대로제공",
+    "원안수용", "일부제공", "일부통계제공", "제공불가", "항목조정후제공",
+}
+
 # 통계종류는 사람이 손으로 입력한 자유 텍스트라 같은 개념인데 표기가 갈라져 있다(실측 확인,
 # 2026-09-21) — 정확매칭만 쓰면 사용자가 하나를 물어도 나머지 동의어로 저장된 레코드를
 # 전부 놓친다. 그룹 안 값이면 전부 OR로 같이 찾는다.
@@ -466,6 +479,18 @@ def _build_filter(
             continue
         values[field] = value
 
+    # "제공불가"/"원안수용" 같은 심의결과 값이 기관명 필드에 잘못 채워지는 경우를 방어
+    # (2026-10-19 발견, _KNOWN_COMMITTEE_RESULTS 정의부 참고) — 그런 기관은 존재하지
+    # 않으니 그대로 두면 필터가 항상 0건으로 깨지고, 완화 단계를 거쳐 결국 무관한 결과만
+    # 남는다. 처음엔 그냥 지우기만 했는데, 그러면 기관명 필터 자체가 없어져 벡터 검색이
+    # scope 전체(심의위원회+심의위원회첨부)에서 돌면서 "제공불가"라는 표현이 흔한 첨부
+    # 문서 쪽으로 쏠려버리는 역효과 발견 — 심의결과 필드가 비어있으면 그쪽으로 옮겨서
+    # 정확매칭 필터로 살린다(이미 심의결과가 채워져 있으면 충돌 방지를 위해 그냥 버림).
+    if values.get("기관명") in _KNOWN_COMMITTEE_RESULTS:
+        misplaced = values.pop("기관명")
+        if "심의결과" not in values:
+            values["심의결과"] = misplaced
+
     data_type_value = values.pop("데이터유형", None)
 
     # 키워드가 추출된 질문("SSL 인증서 관련 자료 알려줘"처럼 특정 메뉴를 염두에 둔 게 아니라
@@ -487,14 +512,22 @@ def _build_filter(
     # 없이는 "심의위원회 첨부파일만"처럼 submenu를 좁히는 질문이 항상 구조적으로 전체
     # 5개 첨부타입으로 폴백되는 버그가 있었다(2026-10-14 발견). 추출된 기본 타입을 첨부
     # 변형으로도 먼저 변환해 범위 소속을 확인한다.
+    # ⚠️ data_type_value 정확매칭을 mapped_type보다 먼저 확인해야 한다 — 원래는 mapped_type을
+    # 먼저 체크했는데, "심의위원회" 스코프(allowed_data_types={'심의위원회','심의위원회첨부'})
+    # 에서 LLM이 데이터유형='심의위원회'(본문)로 정확히 추출해도, 이 값의 첨부 변형
+    # '심의위원회첨부'가 먼저 allowed_data_types에 걸려버려 본문이 아니라 첨부로 잘못
+    # 좁혀지는 버그가 있었다(2026-10-19, "심의위원회 제공불가 안건" 질문 디버깅 중 발견 —
+    # 심의결과 필드가 비어서 첨부 청크가 전부 메타데이터 없이 반환되는 걸 보고 추적함).
+    # data_type_value 자체가 scope에 이미 정확히 속하면 그게 가장 구체적이니 최우선으로 쓴다.
     if allowed_data_types is not None:
-        mapped_type = _ATTACHMENT_TYPE_OF.get(data_type_value, data_type_value)
-        if mapped_type in allowed_data_types:
-            resolved_types = {mapped_type}
-        elif data_type_value in allowed_data_types:
+        if data_type_value in allowed_data_types:
             resolved_types = {data_type_value}
         else:
-            resolved_types = allowed_data_types
+            mapped_type = _ATTACHMENT_TYPE_OF.get(data_type_value, data_type_value)
+            if mapped_type in allowed_data_types:
+                resolved_types = {mapped_type}
+            else:
+                resolved_types = allowed_data_types
     elif data_type_value:
         resolved_types = {data_type_value}
     else:
