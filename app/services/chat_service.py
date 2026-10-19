@@ -1528,7 +1528,25 @@ def _full_org_history_answer(org_name: str) -> tuple[str, list[SourceItem], list
     항상 기관정보를 sources에 채우고, 신청이력 목록은 그 뒤에 텍스트로 붙인다."""
     org_payloads = find_by_type_and_field("기관정보", "기관명", org_name)
     if not org_payloads:
-        return f"'{org_name}' 기관 정보를 찾지 못했습니다.", [], []
+        # 사용자가 줄임말로 기관명을 물으면(예: "무역협회" → 실제 정식명칭은 "한국무역협회")
+        # 질문분석 LLM이 항상 정식 명칭으로 정규화해주지는 않는다(2026-10-19 CDP 즉흥테스트
+        # 발견 — "환경공단"→"한국환경공단"은 자동 정규화됐는데 "무역협회"→"한국무역협회"는
+        # 안 돼서 'XYZ 기관 정보를 찾지 못했습니다'로 실패, 들쭉날쭉함 확인). 정확매칭이
+        # 실패하면 부분 문자열 매칭으로 한 번 더 시도 — 결과가 전부 같은 정식 명칭이면
+        # 그 이름을, 아니면(동명이인처럼 애매하면) 원래 질문 그대로를 답변 문구에 쓴다.
+        fuzzy = scan_field_contains("기관명", org_name, limit=20, data_type="기관정보")
+        seen_ids: set[str] = set()
+        org_payloads = []
+        for p in fuzzy:
+            if p["원본ID"] not in seen_ids:
+                seen_ids.add(p["원본ID"])
+                org_payloads.append(p)
+        if org_payloads:
+            matched_names = {p.get("기관명") for p in org_payloads}
+            if len(matched_names) == 1:
+                org_name = matched_names.pop()
+        if not org_payloads:
+            return f"'{org_name}' 기관 정보를 찾지 못했습니다.", [], []
 
     sources = [_build_source_item(p) for p in org_payloads]
 
