@@ -1705,10 +1705,18 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 그 기관과 전혀 무관하게 "내부자료 전체 담당자 10명"을 답해버리는 버그가 재현됨
     # (2026-10-15, 브라우저로 자연스러운 대화 흐름을 테스트하다가 발견). `_list_field_answer`는
     # 애초에 기관명으로 좁혀서 조회하는 기능 자체가 없어 구조적으로 무관한 답만 낼 수 있다.
+    # 기관명뿐 아니라 통계종류/수출입구분/연도/역할필드/심의결과/차수 같은 다른 narrowing
+    # 조건이 있어도 목록조회로 빠지면 안 된다 — "수입 통계 신청한 기관들 알려줘"가 "수입"
+    # 조건을 완전히 무시하고 조건 없는 전체 업체명 32개를 마치 답인 것처럼 보여주는 버그가
+    # 즉흥 테스트로 재현됨(2026-10-19). 기관명만 체크하던 가드를 모든 narrowing 필드로 확장.
+    _has_other_narrowing_filter = any(
+        getattr(analysis.filters, f, None) for f in (*_TEXT_TRACE_FILTER_FIELDS, "차수")
+    )
     is_list_question = (
         not analysis.is_aggregation_question
         and not analysis.filters.키워드
         and not analysis.filters.기관명
+        and not _has_other_narrowing_filter
         and (analysis.is_full_list_question or _looks_like_list_question(analysis.standalone_question, analysis.filters))
     )
     if is_list_question:
