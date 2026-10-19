@@ -1800,13 +1800,24 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # "등록된/등록되"도 같은 계열 문제다(2026-10-19 즉흥 테스트로 발견) — "2024-01-01
     # 이후에 등록된 한국환경공단 이력 있어?"가 자료에 정확히 일치하는 레코드(신청일
     # 20241227)가 있는데도 no_result로 답함, "등록" 빼면("~이후 이력") 바로 정상 동작.
-    # 이 시스템엔 "등록일" 필드 자체가 없고 [자료]엔 "신청"만 적혀있는데, LLM이 둘을 다른
-    # 개념으로 보고 확인을 거부하는 것으로 추정 — 프롬프트 지시로 1차 시도했으나 6/6 효과
-    # 없어서(이 계열 문제의 전형적 패턴) 질문 텍스트 자체를 치환하는 코드 레벨 방식으로
-    # 전환, 4/4 해결 확인. standalone_question 원본(세션 저장 등에 쓰임)은 건드리지 않고
-    # 답변 생성 프롬프트에 보여줄 사본에만 적용한다.
-    _answer_question_text = _REGISTRATION_WORD_RE.sub(
-        lambda m: "신청" + m.group(1), analysis.standalone_question
+    # 신청이력/기관정보 등엔 "등록일" 필드 자체가 없고 [자료]엔 "신청"만 적혀있는데, LLM이
+    # 둘을 다른 개념으로 보고 확인을 거부하는 것으로 추정 — 프롬프트 지시로 1차 시도했으나
+    # 6/6 효과 없어서(이 계열 문제의 전형적 패턴) 질문 텍스트 자체를 치환하는 코드 레벨
+    # 방식으로 전환, 4/4 해결 확인. standalone_question 원본(세션 저장 등에 쓰임)은 건드리지
+    # 않고 답변 생성 프롬프트에 보여줄 사본에만 적용한다.
+    #
+    # ⚠️ 내부자료는 예외다 — 청크 원문에 실제로 "(담당: OO, 결재: OO, 등록: 2024-01-19)"
+    # 처럼 "등록"이 진짜 필드로 존재해서(게시판형 글의 등록일), 여기서도 "신청된"으로
+    # 바꿔버리면 "~이후에 신청된 내부자료가..."처럼 틀린 용어로 답하는 역효과가 생김
+    # (2026-10-19 발견, 같은 세션 후속 테스트) — 검색 결과에 내부자료/내부자료첨부가
+    # 섞여있으면 이 치환을 건너뛴다.
+    _skip_registration_sub = any(
+        r.get("데이터유형") in ("내부자료", "내부자료첨부") for r in results
+    )
+    _answer_question_text = (
+        analysis.standalone_question
+        if _skip_registration_sub
+        else _REGISTRATION_WORD_RE.sub(lambda m: "신청" + m.group(1), analysis.standalone_question)
     )
     messages.append(
         {
