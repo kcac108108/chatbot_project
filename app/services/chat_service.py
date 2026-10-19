@@ -1528,6 +1528,15 @@ _SINGLE_ITEM_SELECTOR_WORDS = (
     # (2026-10-19) — "오래된/먼저/이전"류 단건선택어 추가.
     "제일 오래된", "가장 오래된", "가장 먼저", "제일 먼저", "가장 이전", "맨 처음", "최초 건",
 )
+# 위 고정 단어 목록은 "수수료 제일 비싼 거 알려줘"처럼 "가장/제일 + 임의의 형용사 + 거/것/건"
+# 패턴의 또 다른 변형에서 똑같이 재현됨(2026-10-19, "오래된" 수정 직후 바로 이어서 발견) —
+# "비싼"/"저렴한"/"긴"/"짧은" 등 모든 형용사를 하나씩 추가하는 건 끝이 없으므로, 이 형태
+# 자체를 일반화된 정규식으로 잡는다. 오탐(진짜 집계 질문을 단건선택으로 잘못 봄)의 위험보다
+# 미탐(전체이력 통짜 답 반복)의 위험이 훨씬 크므로, 넓게 잡는 쪽으로 설계.
+# \b(단어 경계)를 쓰면 standalone_question 재작성이 "~것은 무엇인가요?"처럼 "것/건/거"
+# 바로 뒤에 조사를 붙이는 경우(한글 음절은 전부 단어 문자라 경계가 안 생김) 매치가 실패해서
+# 원래 버그가 재발하는 걸 실측으로 확인(2026-10-19) — \b 없이 포함 여부만 본다.
+_SUPERLATIVE_SELECTOR_RE = re.compile(r"(제일|가장)\s*.{1,6}?(거|것|건)")
 
 # 기관명+"이력"만 있고 다른 좁히는 조건(연도·심의결과 등)이 전혀 없는 질문은, "전체"라는
 # 단어가 없어도 완전성을 보장할 수 없는 일반 검색 경로(top-K 상한 + 답변생성 LLM이 매번
@@ -1549,7 +1558,7 @@ def _looks_like_full_org_history_question(text: str, filters: FilterExtraction) 
         return False
     if any(w in text for w in _FULL_HISTORY_ASK_WORDS):
         return True
-    if any(w in text for w in _SINGLE_ITEM_SELECTOR_WORDS):
+    if any(w in text for w in _SINGLE_ITEM_SELECTOR_WORDS) or _SUPERLATIVE_SELECTOR_RE.search(text):
         return False
     # "2020년부터 2022년 사이에 신청한 거 있어?"처럼 연도 범위 조건은 filters.연도가
     # 단일 문자열이라 담을 수 없어 LLM이 그냥 비워버리는 경우가 있다(2026-10-15 즉흥
