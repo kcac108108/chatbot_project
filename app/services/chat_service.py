@@ -840,6 +840,25 @@ def _strip_untraceable_filters(analysis: QueryAnalysis, question: str, history: 
         normalized_value = "".join(str(value).split())
         if normalized_value and normalized_value not in normalized_user_text:
             updates[field] = None
+
+    # 신청일이후/이전도 같은 "챗봇 답변 속 세부사실을 조건으로 착각" 패턴에 취약함이
+    # 실측 확인됨(2026-10-20 — "한국환경공단 이력 알려줘"처럼 이번 질문엔 날짜 언급이
+    # 전혀 없는데, 직전 턴들에서 다룬 "2024년 1월 1일 이후"를 여전히 유효한 조건으로
+    # 착각해 지어내 채움 → 전체이력 우회를 못 타고 무관한 top-7 검색으로 빠짐).
+    # ⚠️ 1차 시도(과거 user_texts 전체에서 그 날짜를 찾아 대조) 실패 — 연도·통계종류 등
+    # 다른 필드는 "한 번이라도 언급됐으면 변치 않는 사실"이라 과거 전체 대조가 맞지만,
+    # 날짜 "조건"(~이후/~이전)은 그 질문 하나에서만 유효한 질의 조건이지 사실이 아니다.
+    # 과거에 그 날짜를 여러 번 물어본 적 있다는 이유로 이번 질문에도 계속 적용하면
+    # 안 되므로(바로 이 재현 사례가 과거에 3번이나 그 날짜를 언급한 경우였음), 검증
+    # 범위를 과거 전체가 아니라 **이번 질문 원문 하나**로 좁힌다.
+    _after_dates, _before_dates = set(), set()
+    for year, month, day, direction in _ABS_DATE_DIRECTION_RE.findall(question):
+        iso = f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+        (_after_dates if direction in ("이후", "부터") else _before_dates).add(iso)
+    if analysis.filters.신청일이후 and analysis.filters.신청일이후 not in _after_dates:
+        updates["신청일이후"] = None
+    if analysis.filters.신청일이전 and analysis.filters.신청일이전 not in _before_dates:
+        updates["신청일이전"] = None
     org_name = analysis.filters.기관명
     if (
         org_name
