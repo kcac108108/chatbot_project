@@ -426,11 +426,18 @@ def _excluded_role_value(text: str) -> str | None:
 # 있으므로, LLM에게 "비교"를 맡기는 대신 이 값을 코드가 직접 문자열 비교해서 걸러낸다
 # (ISO 날짜 형식은 자릿수가 고정이라 문자열 비교가 곧 날짜 비교와 동일 — datetime 파싱 불필요).
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# 메뉴별로 "그 건이 접수/등록된 시점"을 뜻하는 라벨이 다르다(신청이력="신청일",
+# 외부요청="요청일", 내부자료="등록일") — 서로 다른 메뉴에 배타적으로만 존재해 충돌 위험이
+# 없다. "제공일" 등 다른 시점을 뜻하는 날짜는 의도적으로 제외(2026-10-20, 외부요청에
+# "~이후 요청된거 있어?"를 코드 필터링 없이 LLM 판단에만 맡겼더니 5/5 안정적으로 같은
+# 레코드 하나를 결정론적으로 빠뜨리는 걸 확인해 범위를 넓힘 — 심의위원회는 세부항목에
+# 날짜 자체가 없어 연도 필터만으로 대응, 이 목록에 추가해도 효과 없음).
+_APPLICATION_DATE_LABELS = ("신청일", "요청일", "등록일")
 
 
 def _extract_application_date(payload: dict) -> str | None:
     for item in payload.get("세부항목") or []:
-        if item.get("label") == "신청일":
+        if item.get("label") in _APPLICATION_DATE_LABELS:
             value = item.get("value")
             if value and _DATE_RE.match(value):
                 return value
@@ -438,9 +445,10 @@ def _extract_application_date(payload: dict) -> str | None:
 
 
 def _matches_date_threshold(payload: dict, after: str | None, before: str | None) -> bool:
-    """신청일이 after 이상·before 이하 범위를 만족하는지 확인한다. 신청일 필드 자체가 없는
-    레코드(첨부 청크 등)는 판단할 근거가 없으므로 안전하게 통과시킨다 — 날짜 조건을 걸었다고
-    무관한 데이터유형 레코드까지 전부 걸러버리면 과도하게 좁아진다."""
+    """신청일/요청일/등록일이 after 이상·before 이하 범위를 만족하는지 확인한다. 해당 날짜
+    필드 자체가 없는 레코드(심의위원회·첨부 청크 등)는 판단할 근거가 없으므로 안전하게
+    통과시킨다 — 날짜 조건을 걸었다고 무관한 데이터유형 레코드까지 전부 걸러버리면
+    과도하게 좁아진다."""
     app_date = _extract_application_date(payload)
     if app_date is None:
         return True
@@ -749,6 +757,46 @@ def _clean_query_analysis(analysis: QueryAnalysis) -> QueryAnalysis:
     return analysis
 
 
+# 2026-10-20 추가 — "YYYY년 M월 D일 이전/이후" 같은 절대 날짜+방향 표현의 필터 추출이
+# 생각보다 불안정함을 측정으로 확인(같은 질문 15회 중 6회가 "이전"인데 "신청일이후"에
+# 채우는 식으로 방향을 반대로 혼동, 날짜 자체는 항상 정확). 날짜·방향 둘 다 질문 원문에
+# 명시 문자 그대로 있으니 정규식으로 안정적으로 파싱 가능한 영역이라, 코드가 직접
+# 추출해 LLM 결과를 덮어쓴다(날짜 "비교"는 이미 코드가 담당하는데 "파싱"까지 코드가
+# 넘겨받는 것 — 10-20 앞부분의 신청일이후/이전 구조적 해결과 같은 전략).
+_ABS_DATE_DIRECTION_RE = re.compile(r"(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일\s*(이후|부터|이전|까지|사이)")
+
+
+def _apply_date_direction_guard(analysis: QueryAnalysis, question: str) -> QueryAnalysis:
+    matches = _ABS_DATE_DIRECTION_RE.findall(question)
+    if not matches:
+        return analysis
+    after_date = None
+    before_date = None
+    for year, month, day, direction in matches:
+        iso_date = f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+        if direction in ("이후", "부터"):
+            after_date = iso_date
+        else:
+            before_date = iso_date
+    updates = {}
+    if after_date is not None and analysis.filters.신청일이후 != after_date:
+        updates["신청일이후"] = after_date
+    if before_date is not None and analysis.filters.신청일이전 != before_date:
+        updates["신청일이전"] = before_date
+    # 질문이 한쪽 방향만 명시했는데(범위 질문처럼 양쪽 다 있는 게 아니라) LLM이 반대 필드에도
+    # 값을 채웠으면, 그건 방향을 혼동해 잘못 채운 것이다 — 그대로 두면 두 조건이 동시에 걸려
+    # 교집합이 비정상적으로 좁아진다(예: "9월 1일 이전"인데 이후=9/1도 같이 남으면 사실상
+    # "9월 1일 당일"로 좁아져 정답을 거의 다 놓침).
+    if len(matches) == 1:
+        if after_date is not None and analysis.filters.신청일이전 is not None:
+            updates["신청일이전"] = None
+        if before_date is not None and analysis.filters.신청일이후 is not None:
+            updates["신청일이후"] = None
+    if updates:
+        analysis.filters = analysis.filters.model_copy(update=updates)
+    return analysis
+
+
 # 대화 이력에 챗봇이 이전에 언급한 세부사실(연도·통계종류·수출입구분·요청자·제공자·
 # 심의결과·담당자·결재자·차수 등)이 있으면, 이번 질문이 그 값으로 좁혀달라고 한 게 아닌데도
 # LLM이 "이미 아는 사실"로 착각해 필터에 채워버리는 경우가 있다(2026-10-15 "결과가 어떻게
@@ -826,6 +874,7 @@ def _analyze_query(question: str, history: list[dict]) -> QueryAnalysis:
     messages.extend(history)
     messages.append({"role": "user", "content": question})
     analysis = _clean_query_analysis(chat_parse(messages, QueryAnalysis))
+    analysis = _apply_date_direction_guard(analysis, question)
     return _strip_untraceable_filters(analysis, question, history)
 
 
@@ -2044,10 +2093,10 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
             _app_date = _extract_application_date(payload)
             if _app_date:
                 text = (
-                    f"[이 자료의 신청일은 {_app_date}로, 질문의 날짜 조건을 이미 만족하는 것으로 "
-                    "코드가 직접 확인했다. 본문 속 기안일자·결재일자·시행일자 등 다른 날짜와 "
-                    "혼동해서 스스로 재판단하지 말고, 이 확인을 그대로 신뢰해 no_result=false로 "
-                    "답하라.] " + text
+                    f"[이 자료의 신청일/요청일/등록일은 {_app_date}로, 질문의 날짜 조건을 이미 "
+                    "만족하는 것으로 코드가 직접 확인했다. 본문 속 기안일자·결재일자·시행일자 등 "
+                    "다른 날짜와 혼동해서 스스로 재판단하지 말고, 이 확인을 그대로 신뢰해 "
+                    "no_result=false로 답하라.] " + text
                 )
         if context_blocks and context_chars + len(text) > _CONTEXT_CHAR_BUDGET:
             context_truncated = True
