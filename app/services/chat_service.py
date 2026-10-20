@@ -512,6 +512,20 @@ def _build_filter(
     if values.get("통계종류") and values["통계종류"] not in _KNOWN_STATISTICS_TYPES:
         values.pop("통계종류", None)
 
+    # 대화 히스토리가 있으면 "위원회 안건" 같은 표현에서 "위원회"처럼 질문 속 일반명사를
+    # 기관명으로 잘못 지어내는 경우를 방어한다(2026-10-20 발견) — DB에 실제로 존재하지
+    # 않는 기관명으로 AND 필터를 걸면 0건→단계적 완화→결국 필터가 전부 풀려 무관한
+    # 레코드가 섞이는 연쇄로 이어진다.
+    # ⚠️ 처음엔 ask()에서 analysis.filters.기관명 자체를 전역으로 지웠는데, 그러면
+    # _looks_like_full_org_history_question/_full_org_history_answer가 이미 갖고 있던
+    # fuzzy 폴백(scan_field_contains, "무역협회"→"한국무역협회" 같은 줄임말·오타 교정)이
+    # 적용될 기회까지 같이 사라지는 회귀가 재현됨(같은 날 "한국철강협의"처럼 진짜 기관명의
+    # 오타/절단에서 "전체 이력" 질문이 안전한 집계 거절로 잘못 빠짐). 그래서 이 존재
+    # 확인은 실제로 AND 필터에 들어가 0건 캐스케이드를 일으키는 여기(_build_filter)
+    # 안에서만 적용하고, analysis.filters 자체는 건드리지 않는다.
+    if values.get("기관명") and not field_value_exists("기관명", values["기관명"]):
+        values.pop("기관명", None)
+
     data_type_value = values.pop("데이터유형", None)
 
     # 키워드가 추출된 질문("SSL 인증서 관련 자료 알려줘"처럼 특정 메뉴를 염두에 둔 게 아니라
@@ -1706,15 +1720,6 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
 
     analysis = _analyze_query(question, history)
     allowed_data_types = _MENU_SCOPE_DATA_TYPES.get(menu_scope)
-
-    # 대화 히스토리가 있으면 "위원회 안건" 같은 표현에서 "위원회"처럼 질문 속 일반명사를
-    # 기관명으로 잘못 지어내는 경우가 재현됨(2026-10-20 발견 — 히스토리 없이 단독 질문하면
-    # 6/6 안 생기는데, 3턴짜리 대화 맥락이 있으면 6/6 재현). 존재하지 않는 기관명으로
-    # 필터를 걸면 0건→단계적 완화→결국 필터가 전부 풀려 무관한 레코드가 뒤섞이는 연쇄로
-    # 이어진다(2026-08-06에 고친 "데이터유형 과잉단정"과 같은 계열의 더 근본적인 버전).
-    # DB에 그 기관명이 실제로 존재하는지(데이터유형 무관) 빠르게 확인해 없으면 버린다.
-    if analysis.filters.기관명 and not field_value_exists("기관명", analysis.filters.기관명):
-        analysis.filters = analysis.filters.model_copy(update={"기관명": None})
 
     # "내부자료에서 댓글 달린 글 알려줘"/"~있는거 알려줘"처럼 "~달린/있는" 서술형 수식이
     # 붙으면 필터 추출이 "댓글"을 키워드로 안 뽑는 경우가 재현됨(2026-10-19 즉흥 테스트
