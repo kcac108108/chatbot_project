@@ -785,7 +785,16 @@ KEYWORD_SCAN_LIMIT = 30
 # 그 대상에 딸린 이력이 CHAT_TOP_K(기본 6)보다 많을 수 있다("관세청이 요청한 자료" 8건 중
 # 6건만 반환되는 문제로 실데이터에서 재현됨). 이런 필터는 벡터 유사도 근사가 아니라 정확
 # 매칭이니, 상위 몇 건이 아니라 필터에 맞는 걸 사실상 전부 가져와야 한다.
-_NARROWING_FILTER_FIELDS = {"기관명", "요청자", "제공자", "담당자", "결재자"}
+# ⚠️ 원래는 "특정 대상 하나를 지목"하는 5개 필드만 포함했는데, "통관기초통계 관련해서
+# 2021년에 신청한 기관들 알려줘"처럼 연도+통계종류/수출입구분 "조합"으로 목록을 묻는
+# 질문도 똑같이 top-6 제한에 걸려 완전성이 깨지는 게 재현됨(2026-10-20 — 19건 중 top-6만
+# 반환, 나머지 13건 누락). 연도/통계종류/수출입구분/심의결과/차수도 포함하도록 확장 —
+# 상한을 20으로 올리는 것뿐이라 기존에 top-6으로 찾던 것들을 못 찾게 만들 위험은 없다
+# (순위 상위 6개는 top-20 안에 그대로 포함됨, 완전성만 개선되는 방향).
+_NARROWING_FILTER_FIELDS = {
+    "기관명", "요청자", "제공자", "담당자", "결재자",
+    "연도", "통계종류", "수출입구분", "심의결과", "차수",
+}
 FILTERED_SEARCH_LIMIT = 20
 
 
@@ -1755,6 +1764,17 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         for _stat_value in sorted(_KNOWN_STATISTICS_TYPES, key=len, reverse=True):
             if len(_stat_value) >= 2 and _stat_value in question:
                 analysis.filters = analysis.filters.model_copy(update={"통계종류": _stat_value})
+                break
+
+    # 수출입구분도 같은 "~관련해서" 패턴에서 똑같이 비는 게 재현됨(2026-10-20,
+    # "수출입 관련해서 2020년에 신청한 기관들 알려줘" — 18건·15개 기관 중 top-6만 벡터
+    # 유사도로 반환, 나머지는 narrowing 없이 통째로 누락). 값 종류가 "수입"/"수출"/
+    # "수출입" 셋뿐이라 통계종류보다 단순 — 길이 긴 "수출입"을 먼저 확인해야
+    # "수출입"이라는 질문을 "수출"로 더 좁게 오매칭하지 않는다.
+    if not analysis.filters.수출입구분:
+        for _ei_value in ("수출입", "수출", "수입"):
+            if _ei_value in question:
+                analysis.filters = analysis.filters.model_copy(update={"수출입구분": _ei_value})
                 break
 
     # 프롬프트 지시만으로 두 차례 시도했으나 매번 다른 회귀를 일으켜서(주석 참고) 코드로
