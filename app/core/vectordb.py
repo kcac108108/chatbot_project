@@ -90,6 +90,24 @@ def find_by_type_and_field(data_type: str, field: str, value: str, limit: int = 
     return [p.payload for p in points]
 
 
+def field_value_exists(field: str, value: str) -> bool:
+    """데이터유형과 무관하게 컬렉션 전체에서 특정 필드=값인 레코드가 하나라도
+    있는지만 빠르게 확인한다(limit=1, 인덱싱된 정확매칭이라 가볍다). LLM이 질문
+    문맥에서 "위원회" 같은 일반명사를 기관명으로 지어내는 경우(2026-10-20 재현 —
+    존재하지 않는 기관명이 필터에 들어가면 0건→단계적 완화→결국 필터가 전부
+    풀려 무관한 레코드가 섞이는 연쇄)를 걸러내는 용도."""
+    points, _ = _client.scroll(
+        collection_name=QDRANT_COLLECTION,
+        limit=1,
+        with_payload=False,
+        with_vectors=False,
+        scroll_filter=qmodels.Filter(
+            must=[qmodels.FieldCondition(key=field, match=qmodels.MatchValue(value=value))]
+        ),
+    )
+    return len(points) > 0
+
+
 def find_by_type_and_fields(data_type: str, fields: dict[str, str], limit: int = 200) -> list[dict]:
     """(데이터유형, 필드1=값1 AND 필드2=값2 ...)으로 정확히 매칭되는 payload를 전부
     가져온다. 첨부 청크엔 데이터유형/원본ID/첨부파일명/요약/text 외의 메타데이터 필드가

@@ -7,6 +7,7 @@ from app.core.config import CHAT_TOP_K
 from app.core.db import fetch_all
 from app.core.openai_client import chat_parse, embed_texts
 from app.core.vectordb import (
+    field_value_exists,
     find_by_type_and_field,
     find_by_type_and_fields,
     find_by_type_and_source,
@@ -1705,6 +1706,15 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
 
     analysis = _analyze_query(question, history)
     allowed_data_types = _MENU_SCOPE_DATA_TYPES.get(menu_scope)
+
+    # 대화 히스토리가 있으면 "위원회 안건" 같은 표현에서 "위원회"처럼 질문 속 일반명사를
+    # 기관명으로 잘못 지어내는 경우가 재현됨(2026-10-20 발견 — 히스토리 없이 단독 질문하면
+    # 6/6 안 생기는데, 3턴짜리 대화 맥락이 있으면 6/6 재현). 존재하지 않는 기관명으로
+    # 필터를 걸면 0건→단계적 완화→결국 필터가 전부 풀려 무관한 레코드가 뒤섞이는 연쇄로
+    # 이어진다(2026-08-06에 고친 "데이터유형 과잉단정"과 같은 계열의 더 근본적인 버전).
+    # DB에 그 기관명이 실제로 존재하는지(데이터유형 무관) 빠르게 확인해 없으면 버린다.
+    if analysis.filters.기관명 and not field_value_exists("기관명", analysis.filters.기관명):
+        analysis.filters = analysis.filters.model_copy(update={"기관명": None})
 
     # "내부자료에서 댓글 달린 글 알려줘"/"~있는거 알려줘"처럼 "~달린/있는" 서술형 수식이
     # 붙으면 필터 추출이 "댓글"을 키워드로 안 뽑는 경우가 재현됨(2026-10-19 즉흥 테스트
