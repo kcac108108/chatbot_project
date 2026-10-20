@@ -435,21 +435,44 @@ _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _APPLICATION_DATE_LABELS = ("신청일", "요청일", "등록일")
 
 
-def _extract_application_date(payload: dict) -> str | None:
+def _extract_application_date(payload: dict, cache: dict | None = None) -> str | None:
     for item in payload.get("세부항목") or []:
         if item.get("label") in _APPLICATION_DATE_LABELS:
             value = item.get("value")
             if value and _DATE_RE.match(value):
                 return value
+    # 첨부 청크(세부항목 없음)는 자기 날짜가 없으므로 부모 레코드의 신청일/요청일/등록일을
+    # 대신 확인한다 — _attachment_metadata_header와 동일한 패턴(2026-10-20 발견: "첨부파일"
+    # 스코프+날짜조건 조합이 구조적으로 거의 항상 "찾지 못함"이 나오는 걸 확인 — 17건 전부
+    # 날짜 미확인으로 분류돼, "날짜 확인된 자료가 있으면 그것만 근거로" 안내가 아무 자료도
+    # 못 가리켜 LLM이 no_result로 감). cache는 호출자(`ask()`)가 _attachment_metadata_header와
+    # 공유하는 (base_type, source_id)→parent 캐시를 넘겨 중복 조회를 피한다.
+    if cache is not None:
+        base_type = _BASE_TYPE_OF.get(payload.get("데이터유형"))
+        if base_type:
+            source_id = payload.get("원본ID")
+            cache_key = (base_type, source_id)
+            if cache_key not in cache:
+                parents = find_by_type_and_source(base_type, source_id, limit=1)
+                cache[cache_key] = parents[0] if parents else None
+            parent = cache[cache_key]
+            if parent:
+                for item in parent.get("세부항목") or []:
+                    if item.get("label") in _APPLICATION_DATE_LABELS:
+                        value = item.get("value")
+                        if value and _DATE_RE.match(value):
+                            return value
     return None
 
 
-def _matches_date_threshold(payload: dict, after: str | None, before: str | None) -> bool:
+def _matches_date_threshold(
+    payload: dict, after: str | None, before: str | None, cache: dict | None = None
+) -> bool:
     """신청일/요청일/등록일이 after 이상·before 이하 범위를 만족하는지 확인한다. 해당 날짜
-    필드 자체가 없는 레코드(심의위원회·첨부 청크 등)는 판단할 근거가 없으므로 안전하게
-    통과시킨다 — 날짜 조건을 걸었다고 무관한 데이터유형 레코드까지 전부 걸러버리면
-    과도하게 좁아진다."""
-    app_date = _extract_application_date(payload)
+    필드 자체가 없는 레코드(심의위원회 등, 부모 조회로도 못 찾은 경우)는 판단할 근거가
+    없으므로 안전하게 통과시킨다 — 날짜 조건을 걸었다고 무관한 데이터유형 레코드까지 전부
+    걸러버리면 과도하게 좁아진다."""
+    app_date = _extract_application_date(payload, cache)
     if app_date is None:
         return True
     if after and app_date < after:
@@ -529,6 +552,18 @@ def _build_filter(
     for field, value in extracted.model_dump(exclude_none=True).items():
         if field == "키워드":
             # 청크 payload의 필드명이 아니라 본문 부분 문자열 검색용 — _search()에서 별도 처리
+            continue
+        if field in ("신청일이후", "신청일이전"):
+            # Qdrant payload에 이런 필드 자체가 없다 — 세부항목 리스트 안의 날짜를 코드가
+            # 직접 비교하는 애플리케이션 레벨 후처리 전용 필드다(`_matches_date_threshold`,
+            # `ask()`에서 적용). 그런데도 여기 values에 섞여 들어가면 Qdrant 필터에
+            # FieldCondition(key="신청일이후", ...)로 그대로 추가돼 **항상 0건**이 된다
+            # (2026-10-20 발견 — 비첨부 경로는 0건→단계적 필터 완화를 거쳐 결국 "전체 필터
+            # 제거" 최종 폴백까지 간 뒤 코드 후처리로 우연히 정답을 찾아 증상이 안 보였을
+            # 뿐이고, 첨부 경로는 이 값이 섞인 채로 부모 레코드 조회(아래 "첨부 청크는
+            # 메타데이터가 없다" 블록)까지 들어가 조건에 맞는 부모가 "전혀 없다"고 잘못
+            # 판단해 __no_such_parent__ 안전폴백으로 바로 0건 확정 — "한국환경공단 관련
+            # 첨부파일 중 2024년 이후 등록된거"가 실제로 있는데도 17건 전부 못 찾음).
             continue
         # 구조화 출력이 값 없음을 실제 null 대신 문자열 "null" 등으로 채우는 경우 방어
         if _is_nullish(value):
@@ -655,6 +690,15 @@ def _build_filter(
         role_only = {f: v for f, v in parent_only_values.items() if f in _PERSON_ROLE_FIELDS}
         non_role = {f: v for f, v in parent_only_values.items() if f not in _PERSON_ROLE_FIELDS}
 
+        # 날짜 임계값 조건(신청일이후/신청일이전)도 여기서 부모 레코드에 직접 적용한다.
+        # 그냥 원본ID를 다 모아두고 나중에 벡터검색 뒤에 코드로 날짜 필터링하면, 큰 기관
+        # (예: 신청이력 83건)의 모든 첨부 원본ID(수십~수백 개)가 MatchAny 후보가 되어
+        # 벡터 유사도 top-K(20)가 그 중 극소수만 가져오는데 하필 최신 날짜 레코드가
+        # 순위에서 밀려 빠지는 문제가 실측 확인됨(2026-10-20 — top-100까지 넓혀도 겨우
+        # 1/3만 걸림). 날짜 조건을 만족하는 부모만 먼저 골라 원본ID 후보 자체를 작게
+        # 줄이면(83개→2~3개), 뒤이은 벡터검색 top-K가 그 적은 후보를 전부 커버할 수 있다.
+        _date_after, _date_before = extracted.신청일이후, extracted.신청일이전
+
         source_ids = set()
         if role_only:
             for role_field, role_value in role_only.items():
@@ -663,11 +707,20 @@ def _build_filter(
                         continue
                     if any(payload.get(f) != v for f, v in non_role.items()):
                         continue
+                    if (_date_after or _date_before) and not _matches_date_threshold(
+                        payload, _date_after, _date_before
+                    ):
+                        continue
                     source_ids.add(payload["원본ID"])
         else:
             for base_type in base_types:
                 matches = find_by_type_and_fields(base_type, non_role)
-                source_ids.update(p["원본ID"] for p in matches)
+                for p in matches:
+                    if (_date_after or _date_before) and not _matches_date_threshold(
+                        p, _date_after, _date_before
+                    ):
+                        continue
+                    source_ids.add(p["원본ID"])
 
         if source_ids:
             conditions.append(
@@ -792,6 +845,16 @@ def _apply_date_direction_guard(analysis: QueryAnalysis, question: str) -> Query
             updates["신청일이전"] = None
         if before_date is not None and analysis.filters.신청일이후 is not None:
             updates["신청일이후"] = None
+        # "2024년 1월 1일 이후"처럼 열린 범위(이후/이전) 표현은 그 연도 하나로 한정하는
+        # 의미가 아니라 그 시점부터/까지 전체를 가리키는데, LLM이 날짜 표현 속 연도를
+        # 별도 `연도` 필드에도 중복 추출해 "정확히 그 해만"으로 잘못 좁히는 경우가 실측
+        # 확인됨(2026-10-20 — "2024년 1월 1일 이후"에 연도=2024가 같이 채워져, 날짜조건은
+        # 만족하는 2025년 레코드 2건이 연도 AND 조건에 걸려 추가로 빠짐). 단일 방향(사이가
+        # 아닌 이후/이전)이고 그 연도가 filters.연도와 정확히 일치할 때만 제거 — "~부터
+        # ~사이"(범위, 서로 다른 해를 가리킬 수 있음)는 건드리지 않는다.
+        matched_year = matches[0][0]
+        if analysis.filters.연도 == matched_year:
+            updates["연도"] = None
     if updates:
         analysis.filters = analysis.filters.model_copy(update=updates)
     return analysis
@@ -2076,19 +2139,29 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         if len(_excluded_filtered) < len(results):
             results = _excluded_filtered
 
+    # 날짜 필터링이 첨부 청크의 부모 레코드를 조회할 때 쓰는 캐시 — 아래 _attachment_
+    # metadata_header도 같은 (base_type, source_id)→parent 캐시 구조라 그대로 공유해
+    # 중복 조회를 피한다(선언을 여기로 앞당김, 원래는 context_blocks 생성부에서만 선언됨).
+    _metadata_header_cache: dict = {}
+
     if analysis.filters.신청일이후 or analysis.filters.신청일이전:
         results = [
             r for r in results
-            if _matches_date_threshold(r, analysis.filters.신청일이후, analysis.filters.신청일이전)
+            if _matches_date_threshold(
+                r, analysis.filters.신청일이후, analysis.filters.신청일이전, _metadata_header_cache
+            )
         ]
-        # 위 필터는 신청일/요청일/등록일 필드 자체가 없는 레코드(첨부 청크 등)를 "검증 불가"로
-        # 보수적으로 통과시킨다. 그런데 날짜가 실제로 확인된 레코드와 미확인 레코드가 섞여
-        # 남으면, 안내 문구(아래)를 추가해도 LLM이 혼동해 전부 no_result로 거절하는 문제가
-        # 실측 확인됨(내부자료 날짜질문 재현 — 확인 1건+미확인 4건 섞이자 8/8 전부 거절,
-        # 안내만으론 불충분해 바로 아래 구조적 조치로 전환). 날짜가 확인된 레코드가 하나라도
-        # 있으면 미확인 레코드는 노이즈이니 걸러낸다 — 확인된 게 전혀 없으면(그 메뉴엔 날짜
-        # 개념 자체가 없는 심의위원회 등) 걸러낼 기준이 없으므로 그대로 둔다.
-        _date_verified = [r for r in results if _extract_application_date(r) is not None]
+        # 위 필터는 신청일/요청일/등록일 필드 자체가 없는 레코드(첨부 청크 등 — 단 부모
+        # 레코드 조회로 찾아지면 그걸로 확인됨)를 "검증 불가"로 보수적으로 통과시킨다.
+        # 그런데 날짜가 실제로 확인된 레코드와 미확인 레코드가 섞여 남으면, 안내 문구(아래)를
+        # 추가해도 LLM이 혼동해 전부 no_result로 거절하는 문제가 실측 확인됨(내부자료
+        # 날짜질문 재현 — 확인 1건+미확인 4건 섞이자 8/8 전부 거절, 안내만으론 불충분해
+        # 바로 아래 구조적 조치로 전환). 날짜가 확인된 레코드가 하나라도 있으면 미확인
+        # 레코드는 노이즈이니 걸러낸다 — 확인된 게 전혀 없으면(그 메뉴엔 날짜 개념 자체가
+        # 없는 심의위원회 등) 걸러낼 기준이 없으므로 그대로 둔다.
+        _date_verified = [
+            r for r in results if _extract_application_date(r, _metadata_header_cache) is not None
+        ]
         if _date_verified:
             results = _date_verified
 
@@ -2129,7 +2202,8 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 으로 전환**하도록 2단계로 수정 — 평소엔 기존에 검증된 동작 그대로, 예산 압박이 실제로
     # 있을 때만 완전성을 위해 요약으로 압축한다(요약 없는 레코드는 그래도 원문 그대로 사용).
     _CONTEXT_CHAR_BUDGET = 40000
-    _metadata_header_cache: dict = {}
+    # _metadata_header_cache는 위 날짜 필터링 단계에서 이미 선언됨(부모 레코드 조회를
+    # 공유하기 위해 앞당김) — 여기서 다시 선언하지 않고 그대로 이어서 쓴다.
     _full_texts = [
         _attachment_metadata_header(p, _metadata_header_cache) + p["text"] for p in results
     ]
@@ -2155,7 +2229,7 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         else:
             text = _full_texts[i]
         if _date_threshold_set:
-            _app_date = _extract_application_date(payload)
+            _app_date = _extract_application_date(payload, _metadata_header_cache)
             if _app_date:
                 text = (
                     f"[이 자료의 신청일/요청일/등록일은 {_app_date}로, 질문의 날짜 조건을 이미 "
