@@ -2157,7 +2157,16 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 정확하므로) — 기관명이 있으면 narrowing 없이 전체 이력을 가져와(이미 "전체 이력"
     # 기능에서 검증된 find_by_type_and_field 패턴) 세부항목의 수수료 값을 코드가 직접
     # 비교한다. 사용자 확인 후(2026-10-20) 날짜와 같은 전략으로 구조적으로 해결하기로 결정.
-    _fee_org = excluded_org or analysis.filters.기관명
+    # ⚠️ `excluded_org`는 "제외할 기관"일 뿐 "검색 대상 기관"이 아닌데, `excluded_org or
+    # analysis.filters.기관명`로 폴백시키면 "A 말고 다른 기관 중에 수수료 제일 비싼 거"
+    # 같은 질문에서 하필 제외하라고 한 그 기관(A)을 find_by_type_and_field의 대상으로 써서,
+    # 사용자가 명시적으로 빼달라고 한 기관의 레코드를 "정답"으로 확신에 차서 답하는 자기모순이
+    # 재현됨(2026-10-20 — "한국환경공단 말고 다른 기관 중에..."가 그대로 한국환경공단을
+    # 답함). excluded_org는 절대 여기서 양성 검색 대상으로 쓰면 안 된다 — 제외 질문일 땐
+    # analysis.filters.기관명이 이미 None이라 이 블록 자체가 비활성화되고, 제외 후 남은
+    # results(top-K)에서 LLM이 비교하는 기존 동작으로 폴백한다(완전성은 보장 못 해도 최소한
+    # 틀린 기관을 정답으로 내세우진 않음 — "여러 기관에 걸친 최댓값"은 원래도 해결 범위 밖).
+    _fee_org = analysis.filters.기관명
     _fee_extreme_payload = None
     _fee_extreme_value = None
     _fee_total_checked = 0
@@ -2287,7 +2296,10 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         # 2007-03-14가 진짜인데 top-K에 없어 2009-02-04를 틀리게 답함, 수수료 최상급과
         # 똑같은 top-K 맹점). 기관명이 있으면 수수료와 동일하게 top-K를 거치지 않고 전체
         # 이력을 직접 가져와(find_by_type_and_field) 그 안에서 극값을 계산한다.
-        _recency_org = excluded_org or analysis.filters.기관명
+        # ⚠️ 수수료와 동일한 이유로 excluded_org를 양성 검색 대상으로 쓰면 안 된다(바로 위
+        # _fee_org 주석 참고) — "A 말고 다른 기관 중에 가장 빠른 신청일" 같은 질문에서
+        # 제외 대상 A를 find_by_type_and_field의 대상으로 잘못 쓰면 똑같은 자기모순이 난다.
+        _recency_org = analysis.filters.기관명
         _recency_pool = results
         if _recency_org:
             _full_recency_history = find_by_type_and_field("신청이력", "기관명", _recency_org, limit=200)
