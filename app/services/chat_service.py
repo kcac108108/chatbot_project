@@ -408,15 +408,30 @@ _PERSON_ROLE_FIELDS = {"요청자", "제공자", "담당자", "결재자"}
 # "다른 사람"이라고 잘못 서술함. "A 말고/빼고/제외하고" 패턴으로 제외 대상 이름을 감지해
 # 검색 결과에서 그 사람이 해당 역할 필드에 있는 레코드를 코드로 직접 걸러낸다 — "제외 검색"
 # 기능 전체를 새로 만드는 대신, 이미 뽑힌 결과에서 명백히 틀린 레코드만 빼는 좁은 범위의 수정.
+_TITLE_SUFFIX = r"(?:\s*(?:계장|팀장|과장|대리|주임|사원|선임|책임|부장|차장|실장|국장|원장|소장))?"
 _EXCLUSION_NAME_RE = re.compile(
-    r"([가-힣]{2,4}(?:\s*(?:계장|팀장|과장|대리|주임|사원|선임|책임|부장|차장|실장|국장|원장|소장))?)"
+    # 이름 캡처를 lazy(`{2,4}?`)로 해서, "전봉석이랑"처럼 이름 바로 뒤에 연결어가 붙는
+    # 경우 탐욕적 매칭이 조사까지 삼켜 "전봉석이"로 잘못 캡처되는 걸 방지한다(2026-10-20
+    # 발견 — 탐욕적이면 2~4글자 범위에서 가능한 한 많이 먹으려 해 "전봉석이"(4글자)까지
+    # 가져가고 "랑"만 연결자로 남아 두 번째 이름 캡처가 깨짐).
+    rf"([가-힣]{{2,4}}?{_TITLE_SUFFIX})"
+    # "전봉석이랑 차영경 말고"처럼 제외 대상이 2명일 때, 연결어("이랑/랑/와/과/,")로 이어진
+    # 두 번째 이름도 선택적으로 캡처한다 — 첫 이름만 잡히면 두 번째 사람의 레코드가 그대로
+    # 컨텍스트에 남아, "둘 다 빼달라"는 질문과 안 맞아 LLM이 혼란스러워하며 전부 no_result로
+    # 답해버림(실측 재현). 1명만 제외해도 매칭은 안전하게 동작해야 하므로 선택적 그룹.
+    rf"(?:\s*(?:이랑|랑|와|과|,)\s*([가-힣]{{2,4}}?{_TITLE_SUFFIX}))?"
     r"\s*(?:말고|빼고|제외하고|외에|외\s)"
 )
 
 
-def _excluded_role_value(text: str) -> str | None:
+def _excluded_role_values(text: str) -> list[str]:
     m = _EXCLUSION_NAME_RE.search(text or "")
-    return m.group(1).strip() if m else None
+    if not m:
+        return []
+    names = [m.group(1).strip()]
+    if m.group(2):
+        names.append(m.group(2).strip())
+    return names
 
 
 # 2026-10-20 추가 — "2024-01-01 이후에 등록된 이력 있어?" 류 날짜 임계값 질문에서, 검색은
@@ -2135,11 +2150,13 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     if excluded_org:
         results = [r for r in results if r.get("기관명") != excluded_org]
 
-    excluded_name = _excluded_role_value(question) or _excluded_role_value(analysis.standalone_question)
-    if excluded_name:
+    excluded_names = _excluded_role_values(question) or _excluded_role_values(analysis.standalone_question)
+    if excluded_names:
         _excluded_filtered = [
             r for r in results
-            if not any(excluded_name in (r.get(f) or "") for f in _PERSON_ROLE_FIELDS)
+            if not any(
+                name in (r.get(f) or "") for name in excluded_names for f in _PERSON_ROLE_FIELDS
+            )
         ]
         if len(_excluded_filtered) < len(results):
             results = _excluded_filtered
@@ -2256,6 +2273,20 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
                     "대한 no_result 판단을 내리지 마라 — 다른 자료 중 날짜가 확인된 것이 있으면 "
                     "그것을 근거로 답하라.] " + text
                 )
+        if excluded_names:
+            # "전봉석이랑 차영경 말고 다른 사람이 담당한 자료 있어?" 같은 제외 질문에서,
+            # 코드가 이미 요청자/제공자/담당자/결재자 필드로 제외 대상이 아님을 확인한
+            # 레코드만 여기 도달했는데도, 답변 생성 LLM이 본문에 그 사실이 명시적으로
+            # 안 적혀있다며 확신을 못 갖고 no_result로 거절하는 문제가 실측 확인됨(2026-10-20
+            # — 코드 필터링은 4/4 정확한데 ask() 전체 결과는 5/5 전부 no_result). 날짜
+            # 임계값과 동일한 패턴 — 검색이 이미 보장한 사실을 구체적으로 명시해 재판단을
+            # 막는다.
+            text = (
+                f"[이 자료는 {'/'.join(excluded_names)} 중 누구의 것도 아닌 것으로 코드가 "
+                "직접 확인했다(요청자·제공자·담당자·결재자 필드 전부 확인). 이 제외 조건을 "
+                "이미 만족하는 것으로 신뢰하고, 본문에 그 사실이 적혀있는지 스스로 재확인하려 "
+                "하지 마라.] " + text
+            )
         if context_blocks and context_chars + len(text) > _CONTEXT_CHAR_BUDGET:
             context_truncated = True
             break
