@@ -243,8 +243,18 @@ def build_menu3_chunks(rows: list[dict]) -> list[dict]:
 def build_menu4_chunks(rows: list[dict]) -> list[dict]:
     chunks: list[dict] = []
     for row in rows:
+        # AGENDA_NUMBER가 NULL이면 f-string이 그대로 "None" 문자열을 삽입해버리는 버그가
+        # 있었다(2026-10-20 발견 — 전체 58건 중 11건에서 재현, "위원회 안건 None —"처럼
+        # 뜬금없는 "None"이 본문에 그대로 노출됨). 사실관계 왜곡은 아니지만 순수한 표기
+        # 품질 문제라 정리 — 값이 있을 때만 그 뒤에 붙인다. (참고: 처음엔 이게 같은 날
+        # 발견한 "한국은행 1차/3차 위원회" 답변 불안정의 원인일 수 있다고 의심해 먼저
+        # 고쳤으나, 수정 후에도 재현율이 그대로(15/15 실패)라 무관함을 확인 — 진짜 원인은
+        # 별도로 찾은 답변생성 history anchoring 문제였다. 이 수정 자체는 독립적으로
+        # 정당한 데이터 품질 개선이라 그대로 유지.)
+        agenda_number = row.get("AGENDA_NUMBER")
+        agenda_suffix = f" {agenda_number}" if agenda_number not in (None, "") else ""
         lines = [
-            f"[심의안건 {row['DISCUSSION_ID']}] {row['YEAR']}년 {row['SEQ']}차 위원회 안건 {row['AGENDA_NUMBER']} — "
+            f"[심의안건 {row['DISCUSSION_ID']}] {row['YEAR']}년 {row['SEQ']}차 위원회 안건{agenda_suffix} — "
             f"{cleanse(row['CRP_NAME'])}({cleanse(row['CRP_DEPT_NAME']) or '부서 미상'})",
             _line("제목", row["TITLE"]),
             _line("요청내용", row["REQ_MENT"]),
