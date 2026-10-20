@@ -1812,7 +1812,20 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 조건이 있다는 전제 하에는 "제일"/"가장"이 그냥 있기만 해도 단건선택 의도로 본다
     # (기관명 없는 진짜 전체 집계와 혼동할 위험은 위 _has_narrowing_for_superlative 체크로
     # 이미 배제됨).
-    if _has_narrowing_for_superlative and ("제일" in analysis.standalone_question or "가장" in analysis.standalone_question):
+    # ⚠️ 위 가정("narrowing 있으면 무조건 단건선택")이 깨지는 경우를 2026-10-20 발견—
+    # "2021년에 통관기초통계로 수입 신청한 기관 중에 제일 많이 신청한 곳은 어디야?"는
+    # 연도·통계종류·수출입구분(전부 CATEGORY를 좁히는 필드, 특정 개체 하나를 지목하는
+    # 게 아님)으로 narrowing이 있는데도, "제일 많이"는 그 카테고리 안의 여러 기관에 걸쳐
+    # **건수를 세어 비교**하는 진짜 집계 질문이다 — "제일 최근 거"(이미 좁혀진 한 개체의
+    # 레코드 중 하나 고르기)와는 근본적으로 다름. "많이/적게"(빈도·개수 비교)가 들어간
+    # 문장은 narrowing 여부와 무관하게 역방향 가드를 적용하지 않는다(LLM이 이미 올바르게
+    # is_aggregation_question=True로 판단한 걸 코드가 잘못 뒤집지 않도록).
+    _is_count_based_superlative = bool(re.search(r"(제일|가장)\s*(많이|적게)", analysis.standalone_question))
+    if (
+        _has_narrowing_for_superlative
+        and not _is_count_based_superlative
+        and ("제일" in analysis.standalone_question or "가장" in analysis.standalone_question)
+    ):
         analysis.is_aggregation_question = False
 
     # "안녕" 같은 인사말은 검색 의도가 전혀 없는데도 벡터 검색이 무관한 상위 몇 건을 그대로
