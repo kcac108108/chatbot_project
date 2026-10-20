@@ -1163,14 +1163,26 @@ def _search(
             seen.add(key)
             vector_payloads.append(r.payload)
 
+    # 이번 턴에 기관명 필터가 명확히 있으면 carried_over(직전 턴 안전장치)를 아예 건너뛴다.
+    # 브라우저를 새로고침하지 않고 완전히 다른 주제로 화제를 바꾸면(실사용에서 흔함) 직전
+    # 턴의 무관한 출처가 이번 턴에 그대로 섞여 나오는 교차오염이 실측 확인됨(2026-10-20 —
+    # "내부자료 댓글" 질문 직후 "한국환경공단 신청이력" 질문에, 직전 턴의 내부자료 10건이
+    # carried_over로 끼어들어 날짜필터까지 우연히 통과하며 완전히 무관한 메뉴의 레코드가
+    # "확인된 자료"로 제시됨). 내부자료처럼 기관명 필드 자체가 없는 레코드는 기관명 불일치
+    # 검사로 못 걸러지므로(None이라 "다르다"고 판단 못 함), 아예 기관명이 명시된 질문에서는
+    # carried_over를 쓰지 않기로 한다 — 이런 질문은 _search()의 narrowing filter(top-20)와
+    # find_by_type_and_field(기관정보 전체표시)가 이미 그 기관 자료를 충분히 정확하게 가져와
+    # carried_over 안전장치가 애초에 불필요하다(기존 "그것만 알려줘"류 모호한 후속질문을
+    # 위한 안전장치는 기관명이 없을 때만 의미가 있음).
     carried_payloads = []
-    for p in carried_over:
-        if allowed_data_types is not None and p["데이터유형"] not in allowed_data_types:
-            continue
-        key = _pool_key(p)
-        if key not in seen:
-            seen.add(key)
-            carried_payloads.append(p)
+    if not analysis.filters.기관명:
+        for p in carried_over:
+            if allowed_data_types is not None and p["데이터유형"] not in allowed_data_types:
+                continue
+            key = _pool_key(p)
+            if key not in seen:
+                seen.add(key)
+                carried_payloads.append(p)
 
     # 키워드가 추출됐으면, 벡터 유사도 순위와 무관하게 본문에 그 단어가 실제로 들어간 건을
     # 전수 스캔해서 빠짐없이 합친다 (벡터 검색은 상위 몇 개만 가져와 놓치는 경우가 있음).
