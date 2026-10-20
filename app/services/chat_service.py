@@ -1744,6 +1744,19 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
                 analysis.filters = analysis.filters.model_copy(update={"심의결과": _result_value})
                 break
 
+    # 통계종류도 같은 계열 — "통관기초통계 관련해서 2021년에 신청한 기관들 알려줘"처럼
+    # "~관련해서" 수식이 붙으면 질문에 값이 문자 그대로 있는데도 통계종류 필드가 비는
+    # 경우가 재현됨(2026-10-20 발견). narrowing filter 없이 연도만으로 검색하면 top-20
+    # 벡터 결과가 무관한 기관으로 쏠려 진짜 매칭(예: 울산과학기술원 4건)이 아예 안 보이고
+    # 무관한 기관이 섞이는 완전성 문제로 이어짐. 길이가 긴 값부터 확인해 부분 포함
+    # 오매칭을 피한다("통관기초"가 "통관기초통계"의 부분문자열이라 짧은 것부터 보면
+    # 더 구체적인 값을 놓칠 수 있음).
+    if not analysis.filters.통계종류:
+        for _stat_value in sorted(_KNOWN_STATISTICS_TYPES, key=len, reverse=True):
+            if len(_stat_value) >= 2 and _stat_value in question:
+                analysis.filters = analysis.filters.model_copy(update={"통계종류": _stat_value})
+                break
+
     # 프롬프트 지시만으로 두 차례 시도했으나 매번 다른 회귀를 일으켜서(주석 참고) 코드로
     # 직접 강제. standalone_question(대명사 해석된 재작성 질문)과 원문 둘 다 확인 — 후속
     # 질문에서 "거기" 같은 대명사가 풀리면서 패턴이 드러나는 경우까지 잡기 위함.
