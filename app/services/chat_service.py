@@ -2026,6 +2026,16 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
             r for r in results
             if _matches_date_threshold(r, analysis.filters.신청일이후, analysis.filters.신청일이전)
         ]
+        # 위 필터는 신청일/요청일/등록일 필드 자체가 없는 레코드(첨부 청크 등)를 "검증 불가"로
+        # 보수적으로 통과시킨다. 그런데 날짜가 실제로 확인된 레코드와 미확인 레코드가 섞여
+        # 남으면, 안내 문구(아래)를 추가해도 LLM이 혼동해 전부 no_result로 거절하는 문제가
+        # 실측 확인됨(내부자료 날짜질문 재현 — 확인 1건+미확인 4건 섞이자 8/8 전부 거절,
+        # 안내만으론 불충분해 바로 아래 구조적 조치로 전환). 날짜가 확인된 레코드가 하나라도
+        # 있으면 미확인 레코드는 노이즈이니 걸러낸다 — 확인된 게 전혀 없으면(그 메뉴엔 날짜
+        # 개념 자체가 없는 심의위원회 등) 걸러낼 기준이 없으므로 그대로 둔다.
+        _date_verified = [r for r in results if _extract_application_date(r) is not None]
+        if _date_verified:
+            results = _date_verified
 
     # 키워드 질문인데 매칭된 자료가 있으면, 매칭 안 된 자료는 컨텍스트에서 아예 제거한다.
     # 예전엔 "[자료 N]은 이미 키워드 포함이 확인됐다"고 LLM에게 안내만 하고 나머지는 그대로
@@ -2097,6 +2107,20 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
                     "만족하는 것으로 코드가 직접 확인했다. 본문 속 기안일자·결재일자·시행일자 등 "
                     "다른 날짜와 혼동해서 스스로 재판단하지 말고, 이 확인을 그대로 신뢰해 "
                     "no_result=false로 답하라.] " + text
+                )
+            else:
+                # 2026-10-20 추가 — 첨부 청크처럼 신청일/요청일/등록일 자체가 없는 레코드는
+                # 날짜조건을 "검증 불가"라 보수적으로 통과시킨 것뿐인데(_matches_date_threshold
+                # 참고), 위 "이미 확인됨" 안내가 없는 이런 레코드가 노이즈로 여럿 섞이면 LLM이
+                # "날짜가 확인된 진짜 정답 1건"까지 포함해 전부 no_result로 거절해버리는 문제가
+                # 실측 확인됨(내부자료 날짜질문 재현 — 미확인 4건+확인 1건이 섞이자 5건 전부
+                # 거절, 미확인 레코드를 빼고 확인 1건만 남기면 정상 응답). 이 레코드는 날짜
+                # 조건의 근거로 쓰지 말라고 명시해 혼동을 막는다.
+                text = (
+                    "[이 자료는 신청일/요청일/등록일 정보가 없어 질문의 날짜 조건을 검증할 수 "
+                    "없다. 날짜 조건을 만족/불만족한다고 단정하지 말고, 이 자료만으로 날짜 조건에 "
+                    "대한 no_result 판단을 내리지 마라 — 다른 자료 중 날짜가 확인된 것이 있으면 "
+                    "그것을 근거로 답하라.] " + text
                 )
         if context_blocks and context_chars + len(text) > _CONTEXT_CHAR_BUDGET:
             context_truncated = True
