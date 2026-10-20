@@ -2242,6 +2242,35 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 동일한 패턴 — 막연한 안내만으론 부족해서 실패했던 적이 있으니 구체적 값을 못박는다).
     _date_threshold_set = bool(analysis.filters.신청일이후 or analysis.filters.신청일이전)
 
+    # "제일 최근거는 뭐야"/"가장 오래된 건 언제야" 같은 날짜 최상급 질문도 날짜 비교를
+    # LLM에게 맡기면 틀리는 걸 실측 확인(2026-10-20 — 3건 중 실제 최근은 2025-12-31인데
+    # 5/5 전부 2024-12-27을 "가장 최근"이라고 틀리게 답함). `_SINGLE_ITEM_SELECTOR_WORDS`가
+    # 이 질문을 narrowing 경로로는 잘 보내주지만, 그 안에서 "어느 게 진짜 최근인지" 비교하는
+    # 건 여전히 LLM 몫이었다 — 신청일이후/이전과 동일한 전략으로, 날짜가 확인된 레코드 중
+    # 실제 최댓값/최솟값을 코드가 직접 계산해 명시한다.
+    _recency_max = bool(re.search(r"(가장|제일)\s*(최근|최신)", analysis.standalone_question))
+    _recency_min = bool(
+        re.search(r"(가장|제일)\s*(오래된|먼저|이전)|맨\s*처음|최초", analysis.standalone_question)
+    )
+    _recency_extreme_date = None
+    _recency_add_negative_note = False
+    if _recency_max or _recency_min:
+        # 날짜 임계값 조건이 같이 있어도("2024년 이후 중에 제일 최근거") 그 조건은 "포함
+        # 여부"만 알려줄 뿐 "그 중 가장 최근이 어느 것인지"는 별개 질문이므로 함께 적용한다.
+        _dates = [
+            _extract_application_date(r, _metadata_header_cache) for r in results
+        ]
+        _dates = [d for d in _dates if d]
+        if _dates:
+            _recency_extreme_date = max(_dates) if _recency_max else min(_dates)
+            # 긍정 안내("이게 극값이다")만으로 충분한지, 비매칭 레코드에도 부정 안내("이건
+            # 아니다")를 같이 붙여야 하는지는 날짜 있는 레코드 수에 따라 상반된 결과가 실측
+            # 확인됨(2026-10-20) — narrowing으로 좁혀진 소수(4건)에서는 부정 안내가 없으면
+            # LLM이 안내 없는 다른 후보를 스스로 재비교해 틀린 걸 고름(긍정 안내 하나로는
+            # 불충분), 반면 좁혀지지 않은 다수(21건)에서는 부정 안내 20개가 노이즈가 되어
+            # 오히려 no_result로 거절함. 적은 건수일 때만 부정 안내를 같이 붙이는 절충.
+            _recency_add_negative_note = len(_dates) <= 10
+
     context_blocks = []
     context_chars = 0
     context_truncated = False
@@ -2272,6 +2301,21 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
                     "없다. 날짜 조건을 만족/불만족한다고 단정하지 말고, 이 자료만으로 날짜 조건에 "
                     "대한 no_result 판단을 내리지 마라 — 다른 자료 중 날짜가 확인된 것이 있으면 "
                     "그것을 근거로 답하라.] " + text
+                )
+        if _recency_extreme_date:
+            _this_date = _extract_application_date(payload, _metadata_header_cache)
+            _kind = "가장 최근" if _recency_max else "가장 오래된"
+            if _this_date == _recency_extreme_date:
+                text = (
+                    f"[이 자료의 신청일/요청일/등록일은 {_this_date}로, 검색된 자료 중 "
+                    f"{_kind} 날짜인 것으로 코드가 직접 비교해 확인했다. 본문 속 다른 날짜와 "
+                    "혼동해서 스스로 재비교하지 말고, 이 자료를 답으로 삼아라.] " + text
+                )
+            elif _this_date and _recency_add_negative_note:
+                text = (
+                    f"[이 자료의 신청일/요청일/등록일은 {_this_date}로, 검색된 자료 중 "
+                    f"{_kind} 날짜가 아닌 것으로 코드가 직접 비교해 확인했다 — {_kind} 날짜를 "
+                    "묻는 질문의 답으로 이 자료를 고르지 마라.] " + text
                 )
         if excluded_names:
             # "전봉석이랑 차영경 말고 다른 사람이 담당한 자료 있어?" 같은 제외 질문에서,
