@@ -2150,6 +2150,64 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     if excluded_org:
         results = [r for r in results if r.get("기관명") != excluded_org]
 
+    # "수수료 제일 비싼/저렴한 거" 같은 금액 최상급 질문도 날짜 최상급과 동일한 문제를
+    # 겪는 게 실측 확인됨(2026-10-20 — 한국환경공단 83건 중 narrowing top-20만 보고 LLM이
+    # 비교해, 실제 최댓값 329,270원이 아닌 다른 레코드를 "가장 비싼 것"이라고 확신에 차서
+    # 틀리게 답함). 날짜와 달리 top-K를 넓히는 걸로는 해결 안 됨(83건 전체를 다 봐야
+    # 정확하므로) — 기관명이 있으면 narrowing 없이 전체 이력을 가져와(이미 "전체 이력"
+    # 기능에서 검증된 find_by_type_and_field 패턴) 세부항목의 수수료 값을 코드가 직접
+    # 비교한다. 사용자 확인 후(2026-10-20) 날짜와 같은 전략으로 구조적으로 해결하기로 결정.
+    _fee_org = excluded_org or analysis.filters.기관명
+    _fee_extreme_payload = None
+    _fee_extreme_value = None
+    _fee_total_checked = 0
+    if _fee_org and "수수료" in analysis.standalone_question and re.search(
+        r"(제일|가장)", analysis.standalone_question
+    ):
+        _fee_kind = None
+        if re.search(r"비싼|높은|많은", analysis.standalone_question):
+            _fee_kind = "max"
+        elif re.search(r"저렴한|싼|낮은|적은", analysis.standalone_question):
+            _fee_kind = "min"
+        if _fee_kind:
+            _all_history = find_by_type_and_field("신청이력", "기관명", _fee_org, limit=200)
+            _fee_candidates = []
+            for p in _all_history:
+                for item in p.get("세부항목") or []:
+                    if item.get("label") == "수수료":
+                        # ⚠️ 대부분의 실데이터 수수료 값이 "270,000,000(부가세포함)"처럼
+                        # 괄호 설명이 붙어있어서, 단순 int(value.replace(",","")) 시도는
+                        # ValueError로 break해 이런 레코드를 전부 건너뛴다(2026-10-20 실측
+                        # — 83건 중 순수 숫자만 있는 극소수만 후보로 잡혀 진짜 최댓값
+                        # 300,000,000 대신 329,270을 "최댓값"으로 잘못 계산함, 그 틀린 값을
+                        # 기준으로 비교하니 LLM도 매번 다른 레코드를 답하는 것처럼 보였을
+                        # 뿐 — 사실은 ground truth 계산 자체가 틀렸던 것). 맨 앞의 숫자+콤마
+                        # 구간만 정규식으로 뽑아 뒤의 설명은 무시한다.
+                        _m = re.match(r"\d[\d,]*", str(item["value"]).strip())
+                        if not _m:
+                            break
+                        _val = int(_m.group(0).replace(",", ""))
+                        _fee_candidates.append((_val, p))
+                        break
+            _fee_total_checked = len(_fee_candidates)
+            if _fee_candidates:
+                _fee_extreme_value, _fee_extreme_payload = (
+                    max(_fee_candidates, key=lambda x: x[0])
+                    if _fee_kind == "max"
+                    else min(_fee_candidates, key=lambda x: x[0])
+                )
+                _fee_key = (_fee_extreme_payload.get("데이터유형"), _fee_extreme_payload.get("원본ID"))
+                # ⚠️ "존재하면 건너뛰기"로는 부족했다(2026-10-20 실측) — 이 레코드가 narrowing
+                # 검색 결과에 이미 섞여 있으면(이번 사례처럼 21건 중 20번째 자리) 그대로 둬서,
+                # 답변 생성 LLM이 뒤쪽에 묻힌 안내를 놓치고 앞쪽의 무관한 레코드를 고르는
+                # 문제가 재현됨(날짜 최상급 수정 때는 극값 레코드가 벡터 유사도로도 이미
+                # 상위권이라 우연히 문제가 안 드러났을 뿐). 이미 있든 없든 항상 맨 앞으로
+                # 옮겨 [자료 1]이 되도록 보장한다.
+                results = [_fee_extreme_payload] + [
+                    r for r in results
+                    if (r.get("데이터유형"), r.get("원본ID")) != _fee_key
+                ]
+
     excluded_names = _excluded_role_values(question) or _excluded_role_values(analysis.standalone_question)
     if excluded_names:
         _excluded_filtered = [
@@ -2317,6 +2375,17 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
                     f"{_kind} 날짜가 아닌 것으로 코드가 직접 비교해 확인했다 — {_kind} 날짜를 "
                     "묻는 질문의 답으로 이 자료를 고르지 마라.] " + text
                 )
+        if (
+            _fee_extreme_payload is not None
+            and payload.get("데이터유형") == _fee_extreme_payload.get("데이터유형")
+            and payload.get("원본ID") == _fee_extreme_payload.get("원본ID")
+        ):
+            text = (
+                f"[이 자료의 수수료는 {_fee_extreme_value:,}원으로, 이 기관의 수수료가 확인된 "
+                f"신청이력 {_fee_total_checked}건 전체를 코드가 직접 비교해 확인한 "
+                "최댓값/최솟값이다. 본문 속 다른 수수료 값과 혼동해서 스스로 재비교하지 말고, "
+                "이 자료를 답으로 삼아라.] " + text
+            )
         if excluded_names:
             # "전봉석이랑 차영경 말고 다른 사람이 담당한 자료 있어?" 같은 제외 질문에서,
             # 코드가 이미 요청자/제공자/담당자/결재자 필드로 제외 대상이 아님을 확인한
