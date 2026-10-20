@@ -2259,6 +2259,78 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         if _matched_results:
             results = _matched_results
 
+    # "제일 최근거는 뭐야"/"가장 오래된 건 언제야" 같은 날짜 최상급 질문도 날짜 비교를
+    # LLM에게 맡기면 틀리는 걸 실측 확인(2026-10-20 — 3건 중 실제 최근은 2025-12-31인데
+    # 5/5 전부 2024-12-27을 "가장 최근"이라고 틀리게 답함). `_SINGLE_ITEM_SELECTOR_WORDS`가
+    # 이 질문을 narrowing 경로로는 잘 보내주지만, 그 안에서 "어느 게 진짜 최근인지" 비교하는
+    # 건 여전히 LLM 몫이었다 — 신청일이후/이전과 동일한 전략으로, 날짜가 확인된 레코드 중
+    # 실제 최댓값/최솟값을 코드가 직접 계산해 명시한다.
+    # ⚠️ 이 블록은 반드시 `_full_texts`(아래)를 만들기 전에 `results`를 확정지어야 한다 —
+    # 처음엔 `_full_texts` 뒤에 이 블록을 둬서 `results`를 prepend한 뒤에 `_full_texts[i]`를
+    # 인덱싱하다가 길이 불일치로 IndexError가 났다(2026-10-20, 수수료 수정 때의 교훈을
+    # 놓쳤던 실수 — 그 수정은 이미 `_full_texts` 이전 위치에 있어서 문제가 없었다).
+    _recency_max = bool(re.search(r"(가장|제일)\s*(최근|최신)", analysis.standalone_question))
+    _recency_min = bool(
+        re.search(
+            r"(가장|제일)\s*(오래된|먼저|이전|빠른)|맨\s*처음|최초", analysis.standalone_question
+        )
+    )
+    _recency_extreme_date = None
+    _recency_extreme_payload = None
+    _recency_add_negative_note = False
+    if _recency_max or _recency_min:
+        # ⚠️ 처음엔 `results`(이미 narrowing된 top-20)에서만 극값을 찾았는데, "가장 빠른
+        # 신청일은?"처럼 다른 narrowing 조건이 전혀 없는 단독 질문은 `_looks_like_full_org_
+        # history_question`이 "가장/제일" 텍스트 때문에 전체이력 우회를 타지 않아(단건선택
+        # 의도로 간주) 그냥 top-K 검색으로 넘어가고, 그 top-K 안에 진짜 극값이 우연히
+        # 포함돼야만 맞는 답이 나오는 구조였다(2026-10-20 실측 — "가장 빠른 신청일"이
+        # 2007-03-14가 진짜인데 top-K에 없어 2009-02-04를 틀리게 답함, 수수료 최상급과
+        # 똑같은 top-K 맹점). 기관명이 있으면 수수료와 동일하게 top-K를 거치지 않고 전체
+        # 이력을 직접 가져와(find_by_type_and_field) 그 안에서 극값을 계산한다.
+        _recency_org = excluded_org or analysis.filters.기관명
+        _recency_pool = results
+        if _recency_org:
+            _full_recency_history = find_by_type_and_field("신청이력", "기관명", _recency_org, limit=200)
+            if _full_recency_history:
+                # 날짜 임계값 조건이 같이 있으면("2024년 이후 중에 제일 최근거") 전체이력
+                # 안에서도 그 조건을 먼저 적용해야, 조건을 벗어난 레코드가 극값으로 잘못
+                # 뽑히지 않는다(코드 필터링은 위 `_matches_date_threshold` 블록이 이미
+                # `results`엔 적용했지만, 여기선 별도 풀이라 다시 적용해야 함).
+                if analysis.filters.신청일이후 or analysis.filters.신청일이전:
+                    _full_recency_history = [
+                        r for r in _full_recency_history
+                        if _matches_date_threshold(
+                            r, analysis.filters.신청일이후, analysis.filters.신청일이전,
+                            _metadata_header_cache,
+                        )
+                    ]
+                if _full_recency_history:
+                    _recency_pool = _full_recency_history
+        _date_pairs = [
+            (d, r) for r in _recency_pool
+            if (d := _extract_application_date(r, _metadata_header_cache))
+        ]
+        if _date_pairs:
+            _recency_extreme_date, _recency_extreme_payload = (
+                max(_date_pairs, key=lambda x: x[0])
+                if _recency_max
+                else min(_date_pairs, key=lambda x: x[0])
+            )
+            # 긍정 안내("이게 극값이다")만으로 충분한지, 비매칭 레코드에도 부정 안내("이건
+            # 아니다")를 같이 붙여야 하는지는 날짜 있는 레코드 수에 따라 상반된 결과가 실측
+            # 확인됨(2026-10-20) — narrowing으로 좁혀진 소수(4건)에서는 부정 안내가 없으면
+            # LLM이 안내 없는 다른 후보를 스스로 재비교해 틀린 걸 고름(긍정 안내 하나로는
+            # 불충분), 반면 좁혀지지 않은 다수(21건)에서는 부정 안내 20개가 노이즈가 되어
+            # 오히려 no_result로 거절함. 적은 건수일 때만 부정 안내를 같이 붙이는 절충.
+            _recency_add_negative_note = len(_date_pairs) <= 10
+            # 극값 레코드가 narrowing 검색 결과(results)에 이미 섞여 있어도 뒤쪽 순위에
+            # 묻혀 LLM이 놓치는 문제가 수수료 최상급에서 실측 확인됨(2026-10-20) — 이미
+            # 있든 없든 항상 맨 앞으로 옮겨 [자료 1]이 되도록 보장한다.
+            _rkey = (_recency_extreme_payload.get("데이터유형"), _recency_extreme_payload.get("원본ID"))
+            results = [_recency_extreme_payload] + [
+                r for r in results if (r.get("데이터유형"), r.get("원본ID")) != _rkey
+            ]
+
     # 키워드 전수 스캔(최대 30건)이 첨부 청크(수천~1만 자 이상)와 겹치면 [자료] 전체 텍스트가
     # 수만~10만 자를 넘어가 답변 생성 프롬프트가 지나치게 커진다(2026-09-28, "중소기업 수수료
     # 면제 관련 지침" 질문에서 31건 합쳐 92,808자 → 63,422 프롬프트 토큰까지 커져 완성 토큰
@@ -2299,35 +2371,6 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # "이미 확인됐다"고 구체적인 날짜를 명시해 재판단을 막는다(2026-08-10 keyword_note와
     # 동일한 패턴 — 막연한 안내만으론 부족해서 실패했던 적이 있으니 구체적 값을 못박는다).
     _date_threshold_set = bool(analysis.filters.신청일이후 or analysis.filters.신청일이전)
-
-    # "제일 최근거는 뭐야"/"가장 오래된 건 언제야" 같은 날짜 최상급 질문도 날짜 비교를
-    # LLM에게 맡기면 틀리는 걸 실측 확인(2026-10-20 — 3건 중 실제 최근은 2025-12-31인데
-    # 5/5 전부 2024-12-27을 "가장 최근"이라고 틀리게 답함). `_SINGLE_ITEM_SELECTOR_WORDS`가
-    # 이 질문을 narrowing 경로로는 잘 보내주지만, 그 안에서 "어느 게 진짜 최근인지" 비교하는
-    # 건 여전히 LLM 몫이었다 — 신청일이후/이전과 동일한 전략으로, 날짜가 확인된 레코드 중
-    # 실제 최댓값/최솟값을 코드가 직접 계산해 명시한다.
-    _recency_max = bool(re.search(r"(가장|제일)\s*(최근|최신)", analysis.standalone_question))
-    _recency_min = bool(
-        re.search(r"(가장|제일)\s*(오래된|먼저|이전)|맨\s*처음|최초", analysis.standalone_question)
-    )
-    _recency_extreme_date = None
-    _recency_add_negative_note = False
-    if _recency_max or _recency_min:
-        # 날짜 임계값 조건이 같이 있어도("2024년 이후 중에 제일 최근거") 그 조건은 "포함
-        # 여부"만 알려줄 뿐 "그 중 가장 최근이 어느 것인지"는 별개 질문이므로 함께 적용한다.
-        _dates = [
-            _extract_application_date(r, _metadata_header_cache) for r in results
-        ]
-        _dates = [d for d in _dates if d]
-        if _dates:
-            _recency_extreme_date = max(_dates) if _recency_max else min(_dates)
-            # 긍정 안내("이게 극값이다")만으로 충분한지, 비매칭 레코드에도 부정 안내("이건
-            # 아니다")를 같이 붙여야 하는지는 날짜 있는 레코드 수에 따라 상반된 결과가 실측
-            # 확인됨(2026-10-20) — narrowing으로 좁혀진 소수(4건)에서는 부정 안내가 없으면
-            # LLM이 안내 없는 다른 후보를 스스로 재비교해 틀린 걸 고름(긍정 안내 하나로는
-            # 불충분), 반면 좁혀지지 않은 다수(21건)에서는 부정 안내 20개가 노이즈가 되어
-            # 오히려 no_result로 거절함. 적은 건수일 때만 부정 안내를 같이 붙이는 절충.
-            _recency_add_negative_note = len(_dates) <= 10
 
     context_blocks = []
     context_chars = 0
