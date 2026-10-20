@@ -410,7 +410,7 @@ _PERSON_ROLE_FIELDS = {"요청자", "제공자", "담당자", "결재자"}
 # 기능 전체를 새로 만드는 대신, 이미 뽑힌 결과에서 명백히 틀린 레코드만 빼는 좁은 범위의 수정.
 _EXCLUSION_NAME_RE = re.compile(
     r"([가-힣]{2,4}(?:\s*(?:계장|팀장|과장|대리|주임|사원|선임|책임|부장|차장|실장|국장|원장|소장))?)"
-    r"\s*(?:말고|빼고|제외하고)"
+    r"\s*(?:말고|빼고|제외하고|외에|외\s)"
 )
 
 
@@ -1742,6 +1742,13 @@ def _looks_like_full_org_history_question(text: str, filters: FilterExtraction) 
         or _NEGATIVE_CONDITION_RE.search(text)
     ):
         return False
+    # "거기 말고 다른 기관 이력도 있어?"처럼 직전 기관을 명시적으로 제외하는 질문도 "이력"
+    # 단어 때문에 걸려서, filters.기관명(LLM이 "거기"를 직전 기관명으로 해석해 채운 값)을
+    # 그대로 다시 보여주는 자기모순("거기 말고"라고 물었는데 거기 이력을 또 반복)이 즉흥
+    # 테스트로 재현됨(2026-10-20). _EXCLUSION_NAME_RE(역할필드 제외와 동일 패턴)로 감지해
+    # 이 우회를 타지 않고 일반 검색 경로로 넘긴다(그 경로에서 실제 제외 처리).
+    if _EXCLUSION_NAME_RE.search(text):
+        return False
     has_other_filter = any(getattr(filters, f) for f in _FULL_HISTORY_OTHER_FILTER_FIELDS)
     return not has_other_filter
 
@@ -2010,7 +2017,24 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         session_store.append_turn(session_id, question, AGGREGATION_REFUSAL)
         return ChatResponse(session_id=session_id, answer=AGGREGATION_REFUSAL, sources=[])
 
+    # 기관명도 역할필드(요청자 등)와 같은 구조적 한계를 겪는다 — filters.기관명은 "포함할
+    # 값"만 담을 수 있어 "A 말고 다른 기관"의 제외 의도를 표현 못 하고, LLM은 "거기"를
+    # 세션 맥락으로 해석해 그 제외 대상 기관명을 filters.기관명에 그대로 채워버린다(2026-10-20
+    # 즉흥 테스트로 재현). 검색을 그 기관명으로 좁히면 제외하려는 대상만 나오는 정반대
+    # 결과가 되므로, 검색 전에 필터에서 기관명을 빼고 검색 후 결과에서 그 기관명을 제거한다.
+    org_excluded = bool(
+        analysis.filters.기관명
+        and (_EXCLUSION_NAME_RE.search(question) or _EXCLUSION_NAME_RE.search(analysis.standalone_question))
+    )
+    excluded_org = None
+    if org_excluded:
+        excluded_org = analysis.filters.기관명
+        analysis.filters = analysis.filters.model_copy(update={"기관명": None})
+
     results, possibly_truncated = _search(analysis, carried_over, allowed_data_types)
+
+    if excluded_org:
+        results = [r for r in results if r.get("기관명") != excluded_org]
 
     excluded_name = _excluded_role_value(question) or _excluded_role_value(analysis.standalone_question)
     if excluded_name:
