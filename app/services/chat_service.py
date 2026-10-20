@@ -480,6 +480,53 @@ def _extract_application_date(payload: dict, cache: dict | None = None) -> str |
     return None
 
 
+# 최상급("가장 최근/오래된") 질문을 코드가 직접 비교해 해결하는 전략(아래 `ask()`의 recency
+# 블록)이 처음엔 신청이력/외부요청/내부자료(ISO 날짜 필드 있음)만 지원했는데, 심의위원회는
+# 세부항목에 날짜 자체가 없어 "가장 최근 심의위원회 안건은?"류 질문에서 여전히 top-K
+# 안에서 LLM이 고르는 옛 방식으로 빠져 틀린 안건을 골랐다(2026-10-20 실측 — 2025년 안건이
+# 있는데 2024년 안건을 "가장 최근"이라고 답함). 심의위원회는 ISO 날짜 대신 연도+차수(둘 다
+# payload 최상위 필드)로 시간 순서를 비교할 수 있어, "YYYY-NNN" 합성 키로 변환해 기존 ISO
+# 날짜 문자열과 동일하게 max()/min()/비교에 그대로 쓸 수 있게 만든다.
+_RECENCY_SUPPORTED_TYPES = ("신청이력", "외부요청", "내부자료", "심의위원회")
+
+
+def _infer_recency_base_type(pool: list[dict]) -> str | None:
+    """results 안의 데이터유형 분포로 이번 최상급 질문이 어느 메뉴를 묻는지 추정한다
+    (첨부 청크는 _BASE_TYPE_OF로 부모 메뉴로 환산). 가장 많이 등장한 메뉴를 쓴다 —
+    find_by_type_and_field가 단일 데이터유형으로만 조회하므로 하나를 골라야 한다."""
+    counts: dict[str, int] = {}
+    for p in pool:
+        base = _BASE_TYPE_OF.get(p.get("데이터유형"), p.get("데이터유형"))
+        if base in _RECENCY_SUPPORTED_TYPES:
+            counts[base] = counts.get(base, 0) + 1
+    if not counts:
+        return None
+    return max(counts, key=lambda k: counts[k])
+
+
+def _extract_recency_key(payload: dict, base_type: str, cache: dict | None = None) -> str | None:
+    if base_type == "심의위원회":
+        year, round_no = payload.get("연도"), payload.get("차수")
+        if year is None or round_no is None:
+            return None
+        try:
+            return f"{int(year):04d}-{int(round_no):03d}"
+        except (TypeError, ValueError):
+            return None
+    return _extract_application_date(payload, cache)
+
+
+def _recency_field_label(base_type: str) -> str:
+    return "연도/차수" if base_type == "심의위원회" else "신청일/요청일/등록일"
+
+
+def _recency_display_value(key: str, base_type: str) -> str:
+    if base_type == "심의위원회":
+        year, round_no = key.split("-")
+        return f"{int(year)}년 {int(round_no)}차"
+    return key
+
+
 def _matches_date_threshold(
     payload: dict, after: str | None, before: str | None, cache: dict | None = None
 ) -> bool:
@@ -2287,6 +2334,7 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     _recency_extreme_date = None
     _recency_extreme_payload = None
     _recency_add_negative_note = False
+    _recency_base_type = None
     if _recency_max or _recency_min:
         # ⚠️ 처음엔 `results`(이미 narrowing된 top-20)에서만 극값을 찾았는데, "가장 빠른
         # 신청일은?"처럼 다른 narrowing 조건이 전혀 없는 단독 질문은 `_looks_like_full_org_
@@ -2299,16 +2347,27 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         # ⚠️ 수수료와 동일한 이유로 excluded_org를 양성 검색 대상으로 쓰면 안 된다(바로 위
         # _fee_org 주석 참고) — "A 말고 다른 기관 중에 가장 빠른 신청일" 같은 질문에서
         # 제외 대상 A를 find_by_type_and_field의 대상으로 잘못 쓰면 똑같은 자기모순이 난다.
+        # ⚠️ 처음엔 신청이력으로만 고정해 전체이력을 가져왔는데, "가장 최근 심의위원회
+        # 안건은?"처럼 신청이력 없는 메뉴의 최상급 질문은 여전히 top-K 폴백에 걸려 틀린
+        # 답을 했다(2026-10-20 실측 — 2025년 안건이 있는데 2024년 안건을 "가장 최근"으로
+        # 답함). 이번 질문이 어느 메뉴를 묻는지 results의 데이터유형 분포로 추정해 그
+        # 메뉴로 전체이력을 가져온다.
         _recency_org = analysis.filters.기관명
+        _recency_base_type = _infer_recency_base_type(results) or "신청이력"
         _recency_pool = results
         if _recency_org:
-            _full_recency_history = find_by_type_and_field("신청이력", "기관명", _recency_org, limit=200)
+            _full_recency_history = find_by_type_and_field(
+                _recency_base_type, "기관명", _recency_org, limit=200
+            )
             if _full_recency_history:
                 # 날짜 임계값 조건이 같이 있으면("2024년 이후 중에 제일 최근거") 전체이력
                 # 안에서도 그 조건을 먼저 적용해야, 조건을 벗어난 레코드가 극값으로 잘못
                 # 뽑히지 않는다(코드 필터링은 위 `_matches_date_threshold` 블록이 이미
-                # `results`엔 적용했지만, 여기선 별도 풀이라 다시 적용해야 함).
-                if analysis.filters.신청일이후 or analysis.filters.신청일이전:
+                # `results`엔 적용했지만, 여기선 별도 풀이라 다시 적용해야 함). 심의위원회는
+                # ISO 날짜 임계값 개념이 없으므로 건너뛴다.
+                if _recency_base_type != "심의위원회" and (
+                    analysis.filters.신청일이후 or analysis.filters.신청일이전
+                ):
                     _full_recency_history = [
                         r for r in _full_recency_history
                         if _matches_date_threshold(
@@ -2320,7 +2379,7 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
                     _recency_pool = _full_recency_history
         _date_pairs = [
             (d, r) for r in _recency_pool
-            if (d := _extract_application_date(r, _metadata_header_cache))
+            if (d := _extract_recency_key(r, _recency_base_type, _metadata_header_cache))
         ]
         if _date_pairs:
             _recency_extreme_date, _recency_extreme_payload = (
@@ -2416,18 +2475,21 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
                     "그것을 근거로 답하라.] " + text
                 )
         if _recency_extreme_date:
-            _this_date = _extract_application_date(payload, _metadata_header_cache)
+            _this_date = _extract_recency_key(payload, _recency_base_type, _metadata_header_cache)
             _kind = "가장 최근" if _recency_max else "가장 오래된"
+            _field_label = _recency_field_label(_recency_base_type)
             if _this_date == _recency_extreme_date:
                 text = (
-                    f"[이 자료의 신청일/요청일/등록일은 {_this_date}로, 검색된 자료 중 "
-                    f"{_kind} 날짜인 것으로 코드가 직접 비교해 확인했다. 본문 속 다른 날짜와 "
+                    f"[이 자료의 {_field_label}은(는) "
+                    f"{_recency_display_value(_this_date, _recency_base_type)}로, 검색된 자료 중 "
+                    f"{_kind} 것인 것으로 코드가 직접 비교해 확인했다. 본문 속 다른 날짜/차수와 "
                     "혼동해서 스스로 재비교하지 말고, 이 자료를 답으로 삼아라.] " + text
                 )
             elif _this_date and _recency_add_negative_note:
                 text = (
-                    f"[이 자료의 신청일/요청일/등록일은 {_this_date}로, 검색된 자료 중 "
-                    f"{_kind} 날짜가 아닌 것으로 코드가 직접 비교해 확인했다 — {_kind} 날짜를 "
+                    f"[이 자료의 {_field_label}은(는) "
+                    f"{_recency_display_value(_this_date, _recency_base_type)}로, 검색된 자료 중 "
+                    f"{_kind} 것이 아닌 것으로 코드가 직접 비교해 확인했다 — {_kind} 것을 "
                     "묻는 질문의 답으로 이 자료를 고르지 마라.] " + text
                 )
         if (
