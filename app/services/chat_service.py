@@ -417,6 +417,40 @@ _EXCLUSION_NAME_RE = re.compile(
 def _excluded_role_value(text: str) -> str | None:
     m = _EXCLUSION_NAME_RE.search(text or "")
     return m.group(1).strip() if m else None
+
+
+# 2026-10-20 추가 — "2024-01-01 이후에 등록된 이력 있어?" 류 날짜 임계값 질문에서, 검색은
+# 항상 정답 레코드를 정확히 찾아내는데도 답변 생성 LLM이 "이 날짜가 기준 이후인가"를
+# 판단하는 단계에서 불안정함이 반복 측정으로 확인됨(10회 중 2회만 성공, 특히 기준일에
+# 가까운 날짜일수록 심함). "신청일" 값은 세부항목에 YYYY-MM-DD로 이미 깔끔하게 구조화돼
+# 있으므로, LLM에게 "비교"를 맡기는 대신 이 값을 코드가 직접 문자열 비교해서 걸러낸다
+# (ISO 날짜 형식은 자릿수가 고정이라 문자열 비교가 곧 날짜 비교와 동일 — datetime 파싱 불필요).
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _extract_application_date(payload: dict) -> str | None:
+    for item in payload.get("세부항목") or []:
+        if item.get("label") == "신청일":
+            value = item.get("value")
+            if value and _DATE_RE.match(value):
+                return value
+    return None
+
+
+def _matches_date_threshold(payload: dict, after: str | None, before: str | None) -> bool:
+    """신청일이 after 이상·before 이하 범위를 만족하는지 확인한다. 신청일 필드 자체가 없는
+    레코드(첨부 청크 등)는 판단할 근거가 없으므로 안전하게 통과시킨다 — 날짜 조건을 걸었다고
+    무관한 데이터유형 레코드까지 전부 걸러버리면 과도하게 좁아진다."""
+    app_date = _extract_application_date(payload)
+    if app_date is None:
+        return True
+    if after and app_date < after:
+        return False
+    if before and app_date > before:
+        return False
+    return True
+
+
 # 메뉴1(기관정보/신청이력)에만 존재하는 필드. 다른 데이터유형일 때 LLM이 "3차" 같은 표현을
 # 차수뿐 아니라 여기에도 중복으로 지어내 채우는 문제가 프롬프트 설명 추가로도 반복 재현됨 —
 # 코드가 강제로 걸러낸다
@@ -1621,6 +1655,7 @@ _SUPERLATIVE_SELECTOR_RE = re.compile(r"(제일|가장)\s*.{1,6}?(거|것|건)")
 # 있으면(예: "OO 기관 2020년 이력") 그 조건에 맞는 일반 검색을 그대로 써야 하므로 제외한다.
 _FULL_HISTORY_OTHER_FILTER_FIELDS = (
     "연도", "통계종류", "수출입구분", "요청자", "제공자", "담당자", "결재자", "심의결과", "차수", "키워드",
+    "신청일이후", "신청일이전",
 )
 
 
@@ -1937,6 +1972,12 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         if len(_excluded_filtered) < len(results):
             results = _excluded_filtered
 
+    if analysis.filters.신청일이후 or analysis.filters.신청일이전:
+        results = [
+            r for r in results
+            if _matches_date_threshold(r, analysis.filters.신청일이후, analysis.filters.신청일이전)
+        ]
+
     # 키워드 질문인데 매칭된 자료가 있으면, 매칭 안 된 자료는 컨텍스트에서 아예 제거한다.
     # 예전엔 "[자료 N]은 이미 키워드 포함이 확인됐다"고 LLM에게 안내만 하고 나머지는 그대로
     # 보여줬는데, LLM이 그 안내를 무시하고 매칭 안 된 다른 번호를 엉뚱하게 인용하는 사례가
@@ -1980,6 +2021,17 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     ]
     _use_summary = sum(len(t) for t in _full_texts) > _CONTEXT_CHAR_BUDGET
 
+    # 날짜 임계값 조건(신청일이후/신청일이전)이 있으면, 여기 도달한 results는 이미 코드가
+    # "신청일" 값으로 직접 비교해 조건을 만족하는 것만 남긴 상태다(위 _matches_date_threshold
+    # 필터링 참고, 신청일 필드 자체가 없는 레코드는 보수적으로 통과시켰을 뿐 실제 검증은
+    # 안 됐으므로 아래 노트는 날짜가 실제로 확인된 레코드에만 붙인다). 그런데 [자료] 본문엔
+    # 기안일자·결재일자·시행일자 등 신청일 아닌 다른 날짜도 섞여 있어서, 답변 생성 LLM이
+    # 본문 속 엉뚱한 날짜를 보고 "조건을 만족 안 한다"고 스스로 재판단해 no_result로 답하는
+    # 문제가 실측 확인됨(코드 필터 통과 후에도 8건 전부 no_result로 거절됨, 2026-10-20).
+    # "이미 확인됐다"고 구체적인 날짜를 명시해 재판단을 막는다(2026-08-10 keyword_note와
+    # 동일한 패턴 — 막연한 안내만으론 부족해서 실패했던 적이 있으니 구체적 값을 못박는다).
+    _date_threshold_set = bool(analysis.filters.신청일이후 or analysis.filters.신청일이전)
+
     context_blocks = []
     context_chars = 0
     context_truncated = False
@@ -1988,6 +2040,15 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
             text = _attachment_metadata_header(payload, _metadata_header_cache) + payload["요약"]
         else:
             text = _full_texts[i]
+        if _date_threshold_set:
+            _app_date = _extract_application_date(payload)
+            if _app_date:
+                text = (
+                    f"[이 자료의 신청일은 {_app_date}로, 질문의 날짜 조건을 이미 만족하는 것으로 "
+                    "코드가 직접 확인했다. 본문 속 기안일자·결재일자·시행일자 등 다른 날짜와 "
+                    "혼동해서 스스로 재판단하지 말고, 이 확인을 그대로 신뢰해 no_result=false로 "
+                    "답하라.] " + text
+                )
         if context_blocks and context_chars + len(text) > _CONTEXT_CHAR_BUDGET:
             context_truncated = True
             break
