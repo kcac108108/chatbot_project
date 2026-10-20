@@ -766,8 +766,24 @@ def _strip_untraceable_filters(analysis: QueryAnalysis, question: str, history: 
         and not any(w in question for w in _CONTINUATION_REFERENCE_WORDS)
     ):
         updates["기관명"] = None
+        # 구조화 필터(기관명)만 지우는 걸로는 부족하다(2026-10-20 발견, 긴 멀티턴 뒤에
+        # 재현 — 짧은 3턴 테스트로는 안 걸리다가 6턴으로 늘리니 8/8 재현됨). `standalone_
+        # question` 자체(예: "한국철강협회의 국가 항목 관련 첨부파일이 있나요?")에 이미
+        # 같은 기관명이 녹아들어가 있는데, `_search()`의 벡터 임베딩은 이 standalone_
+        # question을 그대로 쓰므로 구조화 필터가 깨끗해도 벡터 유사도 자체가 그 기관
+        # 쪽으로 계속 쏠린다(2026-10-16에 "구조화 필터는 지웠는데도 결과가 그 기관으로만
+        # 쏠림"으로 재현됐던 것과 정확히 같은 메커니즘). 위에서 기관명을 지우기로 판단한
+        # 바로 그 조건(키워드 있음+현재 턴에 기관명 언급 없음+연속지시어 없음)은 "이번
+        # 질문은 그 자체로 완결된 새 주제"라는 뜻이므로, standalone_question도 안전하게
+        # 원문 question으로 되돌릴 수 있다 — 대명사 해석이 필요없는 상황이기 때문.
+        if org_name in analysis.standalone_question:
+            updates["standalone_question"] = question
     if updates:
-        analysis.filters = analysis.filters.model_copy(update=updates)
+        analysis.filters = analysis.filters.model_copy(
+            update={k: v for k, v in updates.items() if k != "standalone_question"}
+        )
+        if "standalone_question" in updates:
+            analysis.standalone_question = updates["standalone_question"]
     return analysis
 
 
