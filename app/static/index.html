@@ -40,7 +40,7 @@
     height: 100vh;
     background: var(--sidebar-bg);
     display: grid;
-    grid-template-columns: 300px 1fr;
+    grid-template-columns: 340px 1fr;
     grid-template-rows: 100vh;
     position: relative;
     overflow: hidden;
@@ -142,9 +142,16 @@
   .widget-head b { font-size: 13.5px; color: #fff; }
   .widget-head .badge { font-size: 10px; color: #7c8794; margin-left: 6px; border: 1px solid rgba(124,135,148,.4); border-radius: 4px; padding: 1px 6px; }
 
+  /* 위젯이 넓은 화면에서 전체 너비를 다 쓰면, 유저(우측 정렬)·봇(좌측 정렬) 말풍선이
+     양쪽 끝에 붙어 가운데가 휭하게 비어 보인다는 실사용 피드백(2026-10-21) — 채팅
+     내용 자체를 중앙의 적당한 폭 안으로 모아 좌우 여백을 균형 있게 둔다. */
   #chat {
     flex: 1; min-height: 0; overflow-y: auto;
     padding: 20px 18px; display: flex; flex-direction: column; gap: 16px;
+  }
+  #chat-inner {
+    display: flex; flex-direction: column; gap: 16px;
+    width: 100%; max-width: 900px; margin: 0 auto;
   }
   #chat::-webkit-scrollbar { width: 7px; }
   #chat::-webkit-scrollbar-thumb { background: rgba(255,255,255,.12); border-radius: 999px; }
@@ -432,7 +439,7 @@
           <div class="widget-logo"></div>
           <b>이력관리시스템 챗봇</b><span class="badge">PoC</span>
         </div>
-        <div id="chat"></div>
+        <div id="chat"><div id="chat-inner"></div></div>
         <div id="input-bar">
           <div class="input-inner">
             <textarea id="question" rows="1" placeholder="질문을 입력하세요 (예: OO기관 관련 이력 알려줘) — Shift+Enter로 줄바꿈" autocomplete="off"></textarea>
@@ -453,6 +460,7 @@ let recentQuestions = [];
 
 const shellEl = document.getElementById("shell");
 const chatEl = document.getElementById("chat");
+const chatInnerEl = document.getElementById("chat-inner");
 const questionEl = document.getElementById("question");
 const sendEl = document.getElementById("send");
 const menuListEl = document.getElementById("menu-list");
@@ -1014,7 +1022,7 @@ function addMessage(role, text, sources, isError, retryQuestion, details) {
   }
 
   row.appendChild(col);
-  chatEl.appendChild(row);
+  chatInnerEl.appendChild(row);
   chatEl.scrollTop = chatEl.scrollHeight;
   return row;
 }
@@ -1033,7 +1041,7 @@ function addTyping() {
   el.innerHTML = "<span></span><span></span><span></span>";
   row.appendChild(el);
 
-  chatEl.appendChild(row);
+  chatInnerEl.appendChild(row);
   chatEl.scrollTop = chatEl.scrollHeight;
 }
 
