@@ -315,14 +315,44 @@ class _AttachmentDetail(BaseModel):
 _DETAIL_INPUT_LIMIT = 12000
 
 _DETAIL_PROMPT = (
-    "다음은 첨부파일에서 추출한 원문 내용이다. 사용자가 미리 보여준 간략한 요약보다 "
-    "더 자세한 상세 설명을 요청했다. 원문에서 확인 가능한 내용을 최대한 풍부하게 담아 서술하라.\n"
-    "- 구체적 수치(건수·금액·날짜 등), 배경/근거, 적용 기간·조건은 전부 포함\n"
-    "- 요약에선 생략됐을 수 있는 담당자·결재자·문서번호 등 행정 정보도 원문에 있으면 포함\n"
+    "다음은 어떤 신청/요청 건에 딸린 첨부파일에서 추출한 원문 내용이다. 사용자가 미리 "
+    "보여준 간략한 요약보다 더 자세한 상세 설명을 요청했다.\n"
+    "- [이 건의 기본 정보]로 제공된 기관명·사업명·신청목적/제공목적 등은 이미 DB에 "
+    "정확히 기록된 공식 정보다 — 이게 가장 중요한 맥락이므로, 상세 설명 맨 앞에서 "
+    "이 자료가 어느 기관의 어떤 목적과 관련된 것인지부터 명확히 밝혀라\n"
+    "- 그 다음 첨부파일 원문에서 확인 가능한 구체적 수치(건수·금액·날짜 등), 배경/근거, "
+    "적용 기간·조건을 최대한 풍부하게 담아 서술하라\n"
+    "- 담당자·결재자·문서번호 같은 행정 정보는 핵심이 아니므로 굳이 언급하지 마라\n"
     "- 항목 나열이 아니라 자연스러운 문장으로 서술(문단 나눠도 됨)\n"
-    "- 원문에 없는 내용을 지어내지 마라\n"
+    "- [이 건의 기본 정보]에 없는 내용은 반드시 원문에서만 가져오고, 원문에도 없는 "
+    "내용을 지어내지 마라\n"
     "- 8~15문장 정도로, 요약보다 명확히 더 상세하게 작성"
 )
+
+
+def _attachment_parent_context(data_type: str, source_id: str) -> str:
+    """첨부파일 원문만으로는 "이게 어느 기관의 무슨 목적과 관련된 자료인지" 같은 가장
+    핵심적인 맥락이 아예 빠질 수 있다(원문 PDF/계약서 자체엔 그런 문구가 없을 수 있고,
+    기관명·신청목적 등은 DB 정형 컬럼에만 있는 정보라서) — 2026-10-21 사용자 지적:
+    "상세를 눌러도 기관·신청목적처럼 가장 중요한 내용이 하나도 없다". 부모 레코드의
+    세부항목(이미 DB에서 정확히 뽑아놓은 라벨:값 목록)을 그대로 프롬프트 맥락으로
+    제공해, LLM이 원문 밖에서 지어내지 않고도 이 핵심 정보를 서술에 포함할 수 있게 한다."""
+    base_type = _BASE_TYPE_OF.get(data_type)
+    if not base_type:
+        return ""
+    parents = find_by_type_and_source(base_type, source_id, limit=1)
+    if not parents:
+        return ""
+    parent = parents[0]
+    lines = []
+    if parent.get("기관명"):
+        lines.append(f"기관명: {parent['기관명']}")
+    for field in parent.get("세부항목") or []:
+        if field.get("value"):
+            lines.append(f"{field['label']}: {field['value']}")
+    if not lines:
+        return ""
+    return "[이 건의 기본 정보]\n" + "\n".join(lines) + "\n\n"
 
 
 def generate_attachment_detail(data_type: str, source_id: str, filename: str) -> str | None:
@@ -353,10 +383,11 @@ def generate_attachment_detail(data_type: str, source_id: str, filename: str) ->
     if not text.strip():
         return None
     truncated_text = text if len(text) <= _DETAIL_INPUT_LIMIT else text[:_DETAIL_INPUT_LIMIT]
+    parent_context = _attachment_parent_context(data_type, source_id)
     result = chat_parse(
         messages=[
             {"role": "system", "content": _DETAIL_PROMPT},
-            {"role": "user", "content": f"[파일명: {filename}]\n{truncated_text}"},
+            {"role": "user", "content": f"{parent_context}[파일명: {filename}]\n{truncated_text}"},
         ],
         response_format=_AttachmentDetail,
     )

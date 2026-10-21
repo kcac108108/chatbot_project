@@ -13,7 +13,7 @@ from qdrant_client.http import models as qmodels
 from app.core.config import ATTACHMENT_BASE_DIR
 from app.core.db import fetch_all
 from app.core.openai_client import chat_parse, embed_texts
-from app.core.vectordb import ensure_collection, upsert_points
+from app.core.vectordb import ensure_collection, find_by_type_and_source, upsert_points
 from app.services.attachment_extract import extract_any
 
 # DOCUCD -> (부모 테이블, 부모ID 컬럼, 이 첨부가 속하는 첨부전용 데이터유형)
@@ -137,10 +137,51 @@ _SUMMARIZE_INPUT_LIMIT = 12000
 
 _SUMMARIZE_PROMPT_BASE = (
     "다음은 첨부파일에서 추출한 원문 내용이다. 챗봇 화면에 보여줄 간략한 요약으로 정리하라.\n"
+    "- [이 건의 기본 정보]가 함께 주어지면, 그 기관이 왜/무엇 때문에 이 자료를 "
+    "요청·제공했는지(신청목적·제공목적 등)부터 요약 맨 앞에서 먼저 짚어라 — 이게 가장 "
+    "중요한 맥락이다\n"
     "- 반드시 포함: 구체적 수치(건수·금액 등), 배경/근거(지침·법령 개정 등 왜 이 내용이 생겼는지), 적용 기간·조건\n"
+    "- 담당자·결재자·문서번호 같은 행정 정보는 핵심이 아니므로 굳이 언급하지 마라\n"
     "- 항목 나열이 아니라 자연스러운 문장으로 서술\n"
-    "- 원문에 없는 내용을 지어내지 마라\n"
+    "- [이 건의 기본 정보]에 없는 내용은 반드시 원문에서만 가져오고, 원문에도 없는 "
+    "내용을 지어내지 마라\n"
 )
+
+# 데이터유형(첨부) -> 부모 레코드의 데이터유형. chat_service.py의 _BASE_TYPE_OF와
+# 같은 매핑이지만, 순환 import를 피하려고(attachment_ingest가 chat_service를
+# 끌어오게 됨) 이 모듈에 독립적으로 둔다.
+_ATTACHMENT_BASE_TYPE_OF = {
+    "기관정보첨부": "기관정보",
+    "신청이력첨부": "신청이력",
+    "외부요청첨부": "외부요청",
+    "내부자료첨부": "내부자료",
+    "심의위원회첨부": "심의위원회",
+}
+
+
+def _attachment_parent_context(data_type: str, parent_id: str) -> str:
+    """첨부파일 원문만으로는 "이 자료가 왜/무엇 때문에 요청됐는지" 같은 가장 중요한
+    맥락이 아예 안 담길 수 있다(원문 PDF/계약서 자체엔 그런 문구가 없고, 신청목적·
+    제공목적 등은 DB 정형 컬럼에만 있는 정보라서) — 2026-10-21 사용자 지적: "요약에
+    저 업체가 뭐 때문에 요청했는지가 하나도 없다". 부모 레코드의 세부항목(DB에서 이미
+    정확히 뽑아놓은 라벨:값 목록)을 그대로 프롬프트 맥락으로 제공해, LLM이 원문 밖에서
+    지어내지 않고도 이 핵심 정보를 요약에 포함할 수 있게 한다."""
+    base_type = _ATTACHMENT_BASE_TYPE_OF.get(data_type)
+    if not base_type:
+        return ""
+    parents = find_by_type_and_source(base_type, parent_id, limit=1)
+    if not parents:
+        return ""
+    parent = parents[0]
+    lines = []
+    if parent.get("기관명"):
+        lines.append(f"기관명: {parent['기관명']}")
+    for field in parent.get("세부항목") or []:
+        if field.get("value"):
+            lines.append(f"{field['label']}: {field['value']}")
+    if not lines:
+        return ""
+    return "[이 건의 기본 정보]\n" + "\n".join(lines) + "\n\n"
 
 # 원문 길이가 길수록 담아야 할 정보(사건·수치·조건)도 많아지므로, 요약 분량도 원문 길이에
 # 비례해서 늘어나도록 구간을 나눈다 — 짧은 문서를 억지로 늘리거나 긴 문서를 3~5문장으로
@@ -161,7 +202,7 @@ def _summarize_length_guide(length: int) -> str:
     return _SUMMARIZE_LENGTH_TIERS[-1][1]
 
 
-def _summarize_attachment(text: str, filename: str) -> str:
+def _summarize_attachment(text: str, filename: str, parent_context: str = "") -> str:
     """첨부파일 원문 전체를 그대로 보여주면 '번잡스럽고 정리 안 된' 느낌이라는 사용자
     피드백에 따라, 적재 시점에 핵심만 추린 요약을 미리 만들어 저장해둔다. 요약 분량은
     원문 길이에 맞춰 조절한다(짧은 문서=짧은 요약, 긴 문서=더 여유로운 요약)."""
@@ -170,7 +211,7 @@ def _summarize_attachment(text: str, filename: str) -> str:
     result = chat_parse(
         messages=[
             {"role": "system", "content": prompt},
-            {"role": "user", "content": f"[파일명: {filename}]\n{truncated}"},
+            {"role": "user", "content": f"{parent_context}[파일명: {filename}]\n{truncated}"},
         ],
         response_format=_AttachmentSummary,
     )
@@ -213,7 +254,8 @@ def _build_entries_for_text(
     처리해 Qdrant에 넣을 (source_id, payload) 목록으로 만든다. 수동 파이프라인
     (ingest_attachments)과 신규 이력 자동처리 파이프라인이 공용으로 쓴다."""
     text = _strip_page_numbers(text)
-    summary = _summarize_attachment(text, filename)
+    parent_context = _attachment_parent_context(data_type, parent_id)
+    summary = _summarize_attachment(text, filename, parent_context)
     chunks = _split_chunks(text)
     entries: list[tuple[str, dict]] = []
     for idx, chunk_text in enumerate(chunks):
