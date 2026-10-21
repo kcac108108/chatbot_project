@@ -1,5 +1,6 @@
 import re
 import uuid
+from datetime import date
 
 from qdrant_client.http import models as qmodels
 
@@ -985,7 +986,20 @@ def _strip_untraceable_filters(analysis: QueryAnalysis, question: str, history: 
     if analysis.filters.신청일이전 and analysis.filters.신청일이전 not in _before_dates:
         updates["신청일이전"] = None
     org_name = analysis.filters.기관명
-    if (
+    # 기관명이 사용자 발화 어디에도 없고 오직 챗봇 자신의 과거 답변에만 등장했을 때도
+    # 새어듦이 재현됨(2026-10-21 — "심의위원회 안건 중에 올해 처리된거 알려줘"는 질문에
+    # 기관명이 전혀 없는데, 그 답변이 "한국석유관리원" 안건이라고 답한 뒤 "그럼 재작년에는
+    # 없었어?"를 물으면 필터가 그 답변 속 기관명을 조건으로 멋대로 채워버림 — 사용자는
+    # 4턴 내내 그 기관명을 한 번도 말한 적 없음). 다른 _TEXT_TRACE_FILTER_FIELDS와 동일하게
+    # 전체 사용자 발화 이력(과거 턴 포함)에 흔적이 있는지로 검증하되, 키워드 유무와 무관하게
+    # 적용한다 — "수수료는 얼마야?" 같은 정상 후속질문은 기관명이 보통 더 앞선 사용자 턴에서
+    # 실제로 언급됐으므로(normalized_user_text가 전체 이력을 합친 것이라) 이 검사를 통과하고,
+    # 챗봇 답변에만 존재하는 기관명만 걸러진다.
+    if org_name and "".join(str(org_name).split()) not in normalized_user_text:
+        updates["기관명"] = None
+        if org_name in analysis.standalone_question:
+            updates["standalone_question"] = question
+    elif (
         org_name
         and analysis.filters.키워드
         and org_name not in question
@@ -1664,6 +1678,40 @@ _RECENT_INGESTION_RE = re.compile(
 )
 _YEAR_MENTION_RE = re.compile(r"\d{4}\s*년")
 
+# "작년/올해/내년" 같은 상대적 날짜 표현은 구조화 필터(연도 등)가 전혀 못 담아 LLM이 그냥
+# None으로 비우는데, 답변 생성 LLM이 top-K 결과 중에서 "이게 작년 것"이라고 스스로 연도를
+# 추측해버려 완전히 틀린 연도를 확신에 차서 제시하는 버그가 재현됨(2026-10-21, "한국환경공단
+# 관련된 거 중에 작년에 신청한거 있어?"를 오늘(2026-10-21)에 물었는데 "2022년에 신청한
+# 자료가 있습니다"라고 답하면서 그 안에 2021년 레코드까지 섞여 나옴 — 자기모순까지 포함된
+# 심각한 지어내기). 2026-10-15에 LLM에게 "오늘 날짜를 알려주고 계산하라"는 프롬프트로
+# 시도했다가 날짜 변환 자체는 여전히 실패하면서 "이 질문엔 답할 수 있다"는 신호만 추가로
+# 줘서 오히려 더 확신에 찬 오답을 만드는 역효과를 겪고 롤백한 전례가 있음 — 이번엔 LLM에게
+# 맡기지 않고, 질문 텍스트의 상대 표현 자체를 코드가 실제 연도로 치환한 뒤 `_analyze_query`에
+# 넘겨서, 이후 경로(연도 필터 추출·`_YEAR_MENTION_RE` 기반 가드)가 전부 평범한 "YYYY년"
+# 질문과 동일하게 안전히 처리하도록 한다. "재작년"이 "작년"을 부분문자열로 포함하므로
+# 긴 표현부터 순서대로 치환한다.
+_RELATIVE_YEAR_WORDS = [
+    ("재작년", -2),
+    ("그러께", -2),
+    ("내후년", 2),
+    ("작년", -1),
+    ("지난해", -1),
+    ("올해", 0),
+    ("금년", 0),
+    ("내년", 1),
+]
+
+
+def _resolve_relative_year_words(text: str) -> str:
+    if not text:
+        return text
+    this_year = date.today().year
+    resolved = text
+    for word, offset in _RELATIVE_YEAR_WORDS:
+        if word in resolved:
+            resolved = resolved.replace(word, f"{this_year + offset}년")
+    return resolved
+
 # "요즘 심의위원회에서 가장 최근에 처리된 안건이 뭐야?"처럼 "가장/제일 최근·최신·오래된"은
 # 날짜 기준 최댓값/최솟값을 묻는 집계 질문인데, is_aggregation_question이 이를 포착하지
 # 못해 top-6/20 검색 결과 중 하나를 LLM이 그냥 골라 "가장 최근"이라고 확신에 차서 답하는
@@ -2005,7 +2053,10 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         session_store.append_turn(session_id, question, MULTI_ORG_COMPARISON_REFUSAL)
         return ChatResponse(session_id=session_id, answer=MULTI_ORG_COMPARISON_REFUSAL, sources=[])
 
-    analysis = _analyze_query(question, history)
+    # 질문분석에는 "작년/올해/내년" 등을 실제 연도로 치환한 사본을 넘긴다 — session_store
+    # 저장·정규식 가드·이후 _answer_question_text 등은 사용자가 입력한 원문(question) 그대로
+    # 유지해, 상대 날짜 치환이 이 함수의 다른 동작에 영향을 주지 않게 한다.
+    analysis = _analyze_query(_resolve_relative_year_words(question), history)
     allowed_data_types = _MENU_SCOPE_DATA_TYPES.get(menu_scope)
 
     # "내부자료에서 댓글 달린 글 알려줘"/"~있는거 알려줘"처럼 "~달린/있는" 서술형 수식이
