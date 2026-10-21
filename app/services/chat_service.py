@@ -1257,7 +1257,17 @@ def _search(
     # (예: 이력 자체가 없는 기관에도 "신청이력"으로 채워서, 기관명은 맞는데 데이터유형과의
     # AND 조합이 항상 0건이 되는 문제가 재현됨). 다른 필터(기관명 등)는 신뢰할 수 있는
     # 값이니 유지한 채 데이터유형만 제거하고 먼저 재검색한다.
+    # ⚠️ 이 완화 자체는 안전하지만(결과 레코드는 실제 자신의 데이터유형을 그대로 달고
+    # 나옴), "내부자료 중에..."처럼 사용자가 메뉴를 명시한 질문에서 그 메뉴에만 없는
+    # 필드(예: 내부자료는 기관명 자체가 없음) 때문에 완화가 발동하면, 답변 생성 LLM이
+    # 질문 속 메뉴 단어("내부자료")를 실제 자료 타입(신청이력 등)과 무관하게 그대로
+    # 베껴 써서 확신에 찬 오답을 만드는 문제가 실측 확인됨(2026-10-21, "건강보험심사
+    # 평가원이랑 거래한 내부자료 중에 가장 비용이 많이 든 건" — 신청이력 레코드를
+    # "내부자료"라고 단정). 완화가 실제로 발동했는지 플래그로 남겨 호출자(ask())가
+    # 답변 생성 프롬프트에 안내를 붙일 수 있게 한다.
+    data_type_relaxed = False
     if not results and analysis.filters.데이터유형 is not None:
+        data_type_relaxed = True
         relaxed = analysis.filters.model_copy(update={"데이터유형": None})
         relaxed_limit = FILTERED_SEARCH_LIMIT if _has_narrowing_filter(relaxed) else CHAT_TOP_K
         results = vector_search(vector, _build_filter(relaxed, allowed_data_types), relaxed_limit)
@@ -1504,7 +1514,7 @@ def _search(
 
     merged_fragments, fragments_truncated = _merge_attachment_fragments(merged)
     merged_identity, identity_truncated = _merge_by_display_identity(merged_fragments, scan_confirmed_files)
-    return merged_identity, possibly_truncated or fragments_truncated or identity_truncated
+    return merged_identity, possibly_truncated or fragments_truncated or identity_truncated, data_type_relaxed
 
 
 AGGREGATION_REFUSAL = (
@@ -2192,7 +2202,7 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         excluded_org = analysis.filters.기관명
         analysis.filters = analysis.filters.model_copy(update={"기관명": None})
 
-    results, possibly_truncated = _search(analysis, carried_over, allowed_data_types)
+    results, possibly_truncated, data_type_relaxed = _search(analysis, carried_over, allowed_data_types)
 
     if excluded_org:
         results = [r for r in results if r.get("기관명") != excluded_org]
@@ -2569,6 +2579,22 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
                 "그 단어나 명확히 같은 의미의 내용을 실제로 다루는 근거가 없으면 no_result=true로 답하라."
             )
 
+    # 질문이 특정 메뉴(데이터유형)를 명시했는데 그 메뉴에서 0건이라 코드가 데이터유형
+    # 조건을 지우고 재검색했다면(_search의 data_type_relaxed), 아래 [자료]는 사용자가
+    # 요청한 그 메뉴가 아니라 다른 메뉴에서 찾은 것일 수 있다 — 질문 속 메뉴 단어를
+    # 그대로 베껴 쓰면 "내부자료 중 가장 비용이 많이 든 건"처럼 실제로는 신청이력인
+    # 자료를 내부자료라고 단정하는 심각한 오답이 나온다(2026-10-21 실측 확인). 각
+    # 자료가 실제로 어느 데이터유형인지는 이미 [자료 N] 레이블에 명시돼 있으니, 그걸
+    # 그대로 쓰도록 안내한다.
+    data_type_relaxed_note = ""
+    if data_type_relaxed and analysis.filters.데이터유형:
+        data_type_relaxed_note = (
+            f"\n\n[안내] 질문에서 '{analysis.filters.데이터유형}'를 언급했지만, 그 메뉴에는 조건에 맞는 "
+            "자료가 없어서 다른 메뉴의 자료를 대신 찾아왔다. 답변에서 질문 속 메뉴 이름을 그대로 베껴 "
+            "쓰지 말고, 각 [자료]에 실제로 표시된 데이터유형(예: 신청이력/외부요청/심의위원회 등)을 "
+            "정확히 써라 — 다른 메뉴의 자료를 질문 속 메뉴인 것처럼 단정하지 마라."
+        )
+
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     # ⚠️ 2026-10-20 발견 — 답변 생성 LLM에 대화 history를 그대로 넘기면, 직전 턴에서 비슷한
     # 질문에 "찾지 못했습니다"로 답했을 경우 그 패턴에 "앵커링"되어 이번 턴은 조건이 달라
@@ -2619,7 +2645,7 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         {
             "role": "user",
             "content": (
-                f"[자료]\n{context_text}\n\n[질문]\n{_answer_question_text}{keyword_note}{truncation_note}"
+                f"[자료]\n{context_text}\n\n[질문]\n{_answer_question_text}{keyword_note}{truncation_note}{data_type_relaxed_note}"
             ),
         }
     )
