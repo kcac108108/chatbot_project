@@ -1027,13 +1027,26 @@ def _strip_untraceable_filters(analysis: QueryAnalysis, question: str, history: 
     return analysis
 
 
+_HANGUL_RE = re.compile(r"[가-힣]")
+_TRANSLATION_REQUEST_RE = re.compile(r"번역|영어로|일본어로|중국어로|불어로|프랑스어로|독일어로")
+
+
 def _analyze_query(question: str, history: list[dict]) -> QueryAnalysis:
     messages = [{"role": "system", "content": QUERY_ANALYSIS_PROMPT}]
     messages.extend(history)
     messages.append({"role": "user", "content": question})
     analysis = _clean_query_analysis(chat_parse(messages, QueryAnalysis))
     analysis = _apply_date_direction_guard(analysis, question)
-    return _strip_untraceable_filters(analysis, question, history)
+    analysis = _strip_untraceable_filters(analysis, question, history)
+    # "영어로 번역해서 요약해줘" 같은 요청에서 검색용 standalone_question 자체가 번역돼
+    # 버리는 경우가 재현됨(2026-10-21, 8회 중 7회) — 데이터가 전부 한국어라 벡터 임베딩
+    # 검색과 한글 기반 패턴 매칭(_looks_like_full_org_history_question 등)이 영어
+    # standalone_question에선 전부 깨져 "찾지 못함"으로 조용히 실패함. 번역은 이 시스템이
+    # 애초에 지원하는 기능이 아니므로, standalone_question에 한글이 전혀 없으면 검색
+    # 경로만 안전하게 원문으로 되돌린다(답변 생성 단계에서 번역을 시도할지는 건드리지 않음).
+    if question and not _HANGUL_RE.search(analysis.standalone_question or ""):
+        analysis.standalone_question = question
+    return analysis
 
 
 KEYWORD_SCAN_LIMIT = 30
@@ -2163,7 +2176,18 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # is_out_of_scope를 잘못 true로 판단해도 코드가 무시한다 — 애매할 때 거절 쪽으로
     # 잘못 판단하면 진짜 검색 질문을 막아버리는 게 더 나쁘다. (filters는 _analyze_query에서
     # 이미 _clean_query_analysis로 "null" 문자열 등을 실제 None으로 정리한 뒤라 안전하다.)
-    has_any_filter = bool(analysis.filters.model_dump(exclude_none=True))
+    #
+    # "심의위원회 안건을 일본어로 알려줘"/"수수료를 영어로 알려줘"처럼 조건 없이 메뉴·주제만
+    # 언급한 질문에 번역 요청이 얹히면, 필터가 하나도 안 뽑혀서(원래도 조건 없는 질문이라
+    # 기관명 등 필터가 없는 게 정상) 위 has_any_filter 안전장치를 못 빠져나가는데, LLM이
+    # "일본어로/영어로 알려줘"라는 포맷 지시만 보고 업무 무관 요청(인사말/잡담류)으로 잘못
+    # 분류하는 경우가 재현됨(2026-10-21, "일본어로" 3/3, 반면 "영어로" 없는 동일 질문은
+    # 정상 검색됨 — 번역 요청 유무만 차이). 번역 언어 표현이 있으면 이 안전장치도 함께
+    # 적용해 거절을 건너뛴다(틀린 쪽으로 기울어도 결과는 안전한 "찾지 못함"일 뿐이라
+    # 위험 없음).
+    has_any_filter = bool(analysis.filters.model_dump(exclude_none=True)) or bool(
+        _TRANSLATION_REQUEST_RE.search(question)
+    )
     if analysis.is_out_of_scope and not has_any_filter:
         session_store.append_turn(session_id, question, OUT_OF_SCOPE_GREETING)
         return ChatResponse(session_id=session_id, answer=OUT_OF_SCOPE_GREETING, sources=[])
@@ -2692,6 +2716,14 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         if _skip_registration_sub
         else _REGISTRATION_WORD_RE.sub(lambda m: "신청" + m.group(1), analysis.standalone_question)
     )
+    # "일본어로 알려줘"/"영어로 번역해서 요약해줘"처럼 번역 요청이 섞인 질문은, [자료]가
+    # 전부 한국어인데 다른 언어로 답해야 한다는 지시를 받으면 답변 생성 LLM이 혼란스러워
+    # (summary는 채워지는데도) no_result=True를 반환하는 내부 모순이 실측 확인됨(2026-10-21
+    # — 검색은 6건 정확히 찾는데도 답변만 통째로 실패). 이 시스템 데이터가 전부 한국어라
+    # 번역 자체를 지원할 수 없으므로, 답변 생성에 보여줄 질문 사본에서만 번역 지시 구문을
+    # 제거해 평범한 한국어 질문으로 되돌린다(검색용 standalone_question과 세션 저장용
+    # question은 건드리지 않음).
+    _answer_question_text = _TRANSLATION_REQUEST_RE.sub("", _answer_question_text).strip() or _answer_question_text
     messages.append(
         {
             "role": "user",
