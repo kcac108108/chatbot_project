@@ -346,17 +346,23 @@
 
   .history-wrap { margin-top: 8px; padding-top: 8px; width: 100%; border-top: 1px dashed rgba(255,255,255,.14); }
   .history-toggle-btn {
+    display: inline-flex; align-items: center; gap: 5px;
     font-size: 10.5px; background: rgba(255,255,255,.05); color: var(--ink-dark-soft);
     border: 1px solid rgba(255,255,255,.16); border-radius: 999px; padding: 3px 9px;
     cursor: pointer; font-family: inherit; transition: background .15s, border-color .15s;
   }
   .history-toggle-btn:hover { background: rgba(255,255,255,.09); border-color: rgba(255,255,255,.3); }
+  .history-wrap.open .history-toggle-btn .chip-chevron { transform: rotate(90deg); }
   .history-body { display: none; margin-top: 6px; font-size: 12px; color: var(--ink-dark-soft); }
   .history-wrap.open .history-body { display: block; }
   .history-count-label { font-size: 10px; margin-bottom: 4px; color: var(--ink-dark-soft); }
   .history-row { cursor: pointer; }
   .history-row:hover td { background: rgba(255,255,255,.07); }
   .history-row.open td { background: rgba(255,255,255,.09); }
+  /* 이력 표 행도 근거자료 칩과 동일하게 클릭 가능 표시를 준다 — 원본ID 칸에
+     텍스트+화살표를 나란히 배치(2026-10-21, 사용자 피드백). */
+  .history-row-id-wrap { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+  .history-row.open .history-row-id-wrap .chip-chevron { transform: rotate(90deg); }
   .history-detail-row td { padding: 10px 8px; background: rgba(255,255,255,.03); }
 
   .typing {
@@ -765,7 +771,13 @@ function buildSourceChip(s, orgGroupMeta) {
     const histBtn = document.createElement("button");
     histBtn.className = "history-toggle-btn";
     histBtn.type = "button";
-    histBtn.textContent = "이력 보기";
+    const histBtnLabel = document.createElement("span");
+    histBtnLabel.textContent = "이력 보기";
+    histBtn.appendChild(histBtnLabel);
+    const histBtnChevron = document.createElement("span");
+    histBtnChevron.className = "chip-chevron";
+    histBtnChevron.textContent = "▸";
+    histBtn.appendChild(histBtnChevron);
     histWrap.appendChild(histBtn);
 
     const histBody = document.createElement("div");
@@ -890,9 +902,24 @@ function renderHistoryTable(container, items) {
   items.forEach(it => {
     const tr = document.createElement("tr");
     tr.className = "history-row";
-    [it.신청일 || "-", it.사업명 || "-", it.원본ID].forEach(v => {
+    [it.신청일 || "-", it.사업명 || "-", it.원본ID].forEach((v, idx) => {
       const td = document.createElement("td");
-      td.textContent = v;
+      if (idx === 2) {
+        // 원본ID 칸에 클릭 가능 표시(chevron) 추가 — 행 전체가 클릭 영역이라
+        // 마지막 칸에 두면 표 오른쪽 끝에서 자연스럽게 눈에 띈다.
+        const wrap = document.createElement("div");
+        wrap.className = "history-row-id-wrap";
+        const idLabel = document.createElement("span");
+        idLabel.textContent = v;
+        wrap.appendChild(idLabel);
+        const chevron = document.createElement("span");
+        chevron.className = "chip-chevron";
+        chevron.textContent = "▸";
+        wrap.appendChild(chevron);
+        td.appendChild(wrap);
+      } else {
+        td.textContent = v;
+      }
       tr.appendChild(td);
     });
     tbody.appendChild(tr);
