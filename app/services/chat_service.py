@@ -292,6 +292,16 @@ def _find_related_attachments(
         related.append(item)
         if keyword and keyword_matches(keyword, chunk.get("text") or "", chunk.get("요약") or ""):
             matched.append(item)
+    # "점검사항 4", "점검사항 1", "점검사항 3"...처럼 Qdrant 조회 순서(저장 순서) 그대로
+    # 나와서 파일명에 적힌 번호와 화면 표시 순서가 안 맞는다는 사용자 제보(2026-10-21,
+    # 스크린샷으로 확인) — 파일명에 포함된 첫 숫자를 기준으로 정렬해 "점검사항 1, 2, 3..."
+    # 처럼 사람이 기대하는 순서로 보여준다. 숫자가 없는 파일명은 맨 뒤로(안정 정렬이라
+    # 숫자 없는 파일끼리는 원래 순서 유지).
+    _sort_key = lambda item: (
+        int(m.group()) if (m := re.search(r"\d+", item.첨부파일명 or "")) else float("inf")
+    )
+    related.sort(key=_sort_key)
+    matched.sort(key=_sort_key)
     if keyword and matched:
         return matched
     return related
