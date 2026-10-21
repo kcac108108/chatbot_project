@@ -8,7 +8,13 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 
 from app.core.config import ATTACHMENT_BASE_DIR, CHAT_REQUEST_TIMEOUT_SECONDS
-from app.models.schemas import ChatRequest, ChatResponse, OrganizationHistoryResponse, SourceItem
+from app.models.schemas import (
+    AttachmentDetailResponse,
+    ChatRequest,
+    ChatResponse,
+    OrganizationHistoryResponse,
+    SourceItem,
+)
 from app.services import chat_service
 
 router = APIRouter()
@@ -49,6 +55,14 @@ def record_detail(data_type: str, source_id: str) -> SourceItem:
     if detail is None:
         raise HTTPException(404, "레코드를 찾을 수 없습니다")
     return detail
+
+
+# 첨부 미리보기 밑 "상세" 버튼 — 사전 생성 요약보다 더 자세한 설명을 사용자가 클릭한
+# 그 순간에 실시간으로 생성한다(요청마다 GPT 호출 발생, 호출 빈도가 낮아 비용 문제 없음).
+@router.get("/attachment-detail", response_model=AttachmentDetailResponse)
+def attachment_detail(data_type: str, source_id: str, filename: str) -> AttachmentDetailResponse:
+    detail = chat_service.generate_attachment_detail(data_type, source_id, filename)
+    return AttachmentDetailResponse(상세=detail)
 
 
 # 내용은 안 보여주기로 한 첨부(테이블/SQL 정보성 자료)를 대신 다운로드할 수 있게 하는

@@ -2,6 +2,7 @@ import re
 import uuid
 from datetime import date
 
+from pydantic import BaseModel
 from qdrant_client.http import models as qmodels
 
 from app.core.config import CHAT_TOP_K
@@ -305,6 +306,61 @@ def _find_related_attachments(
     if keyword and matched:
         return matched
     return related
+
+
+class _AttachmentDetail(BaseModel):
+    상세: str
+
+
+_DETAIL_INPUT_LIMIT = 12000
+
+_DETAIL_PROMPT = (
+    "다음은 첨부파일에서 추출한 원문 내용이다. 사용자가 미리 보여준 간략한 요약보다 "
+    "더 자세한 상세 설명을 요청했다. 원문에서 확인 가능한 내용을 최대한 풍부하게 담아 서술하라.\n"
+    "- 구체적 수치(건수·금액·날짜 등), 배경/근거, 적용 기간·조건은 전부 포함\n"
+    "- 요약에선 생략됐을 수 있는 담당자·결재자·문서번호 등 행정 정보도 원문에 있으면 포함\n"
+    "- 항목 나열이 아니라 자연스러운 문장으로 서술(문단 나눠도 됨)\n"
+    "- 원문에 없는 내용을 지어내지 마라\n"
+    "- 8~15문장 정도로, 요약보다 명확히 더 상세하게 작성"
+)
+
+
+def generate_attachment_detail(data_type: str, source_id: str, filename: str) -> str | None:
+    """근거자료 카드의 첨부 미리보기는 기본적으로 사전 생성된 짧은 요약을 보여주는데(
+    _find_related_attachments), 사용자가 "더 자세히" 보고 싶어할 때를 위한 실시간 생성
+    상세 설명(2026-10-21 사용자 요청: 요약이 너무 간략해서 상세 내용을 더 보고 싶다).
+    사전 생성 요약과 달리 적재 시점이 아니라 사용자가 "상세" 버튼을 클릭한 그 순간에
+    GPT를 호출한다 — 매번 비용이 들지만 호출 빈도가 낮아(사용자가 명시적으로 요청할
+    때만) 적재 파이프라인에 전부 미리 만들어두는 것보다 간단하고, 프롬프트를 나중에
+    바꿔도 재적재가 필요 없다는 장점이 있다.
+
+    경로전용(SQL/카탈로그성) 첨부는 애초에 내용을 안 보여주기로 한 자료라 상세도 없음
+    (None) — 큰 파일이 여러 조각으로 쪼개져 있으면 _merge_attachment_fragments로 먼저
+    합쳐서 원문 전체를 복원한 뒤 GPT에 넘긴다."""
+    attachment_type = _ATTACHMENT_TYPE_OF.get(data_type)
+    if not attachment_type:
+        return None
+    chunks = [
+        c for c in find_by_type_and_source(attachment_type, source_id)
+        if (c.get("첨부파일명") or "첨부파일") == filename
+    ]
+    if not chunks or chunks[0].get("경로전용"):
+        return None
+    merged, _truncated = _merge_attachment_fragments(chunks)
+    if not merged:
+        return None
+    text = merged[0].get("text", "")
+    if not text.strip():
+        return None
+    truncated_text = text if len(text) <= _DETAIL_INPUT_LIMIT else text[:_DETAIL_INPUT_LIMIT]
+    result = chat_parse(
+        messages=[
+            {"role": "system", "content": _DETAIL_PROMPT},
+            {"role": "user", "content": f"[파일명: {filename}]\n{truncated_text}"},
+        ],
+        response_format=_AttachmentDetail,
+    )
+    return result.상세
 
 
 def _build_source_item(payload: dict, keyword: str | None = None) -> SourceItem:

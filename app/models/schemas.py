@@ -25,6 +25,10 @@ class RelatedAttachment(BaseModel):
     파일경로: Optional[str] = None
 
 
+class AttachmentDetailResponse(BaseModel):
+    상세: Optional[str] = None
+
+
 class HistoryItem(BaseModel):
     원본ID: str
     신청일: Optional[str] = None

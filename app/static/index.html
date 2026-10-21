@@ -305,6 +305,20 @@
   }
   .attachment-download-link:hover { background: rgba(52,201,163,.14); border-color: rgba(52,201,163,.6); }
 
+  /* 첨부 미리보기 밑 "요약/상세" 토글 — 사전 생성된 짧은 요약이 기본(디폴트)이고,
+     사용자가 "상세"를 누르면 그 순간 GPT로 더 자세한 설명을 실시간 생성한다
+     (2026-10-21, 사용자 요청: 요약이 너무 간략해서 더 상세한 내용을 보고 싶을 때). */
+  .attachment-mode-btns { display: flex; gap: 4px; margin-top: 6px; }
+  .attachment-mode-btn {
+    font-size: 9.5px; background: transparent; color: var(--ink-dark-soft);
+    border: 1px solid rgba(255,255,255,.14); border-radius: 999px; padding: 2px 9px;
+    cursor: pointer; font-family: inherit; transition: background .15s, border-color .15s, color .15s;
+  }
+  .attachment-mode-btn:hover { border-color: rgba(255,255,255,.3); }
+  .attachment-mode-btn.active {
+    background: rgba(52,201,163,.16); border-color: rgba(52,201,163,.5); color: var(--mint); font-weight: 700;
+  }
+
   .extracted-table-wrap { overflow-x: auto; margin: 6px 0; }
   .extracted-table { border-collapse: collapse; width: 100%; font-size: 11px; }
   .extracted-table th, .extracted-table td {
@@ -645,7 +659,8 @@ function buildSourceChip(s, orgGroupMeta) {
       item.appendChild(attPreview);
 
       // 내용은 안 보여주기로 한 자료(테이블/SQL 정보성)는 요약 대신 파일 자체를
-      // 내려받을 수 있는 링크를 추가로 보여준다.
+      // 내려받을 수 있는 링크를 추가로 보여준다 — 이런 자료는 내용 자체가 없으므로
+      // "상세" 버튼도 의미가 없어 추가하지 않는다.
       if (att.파일경로) {
         const downloadLink = document.createElement("a");
         downloadLink.className = "attachment-download-link";
@@ -653,6 +668,63 @@ function buildSourceChip(s, orgGroupMeta) {
         downloadLink.textContent = "파일 다운로드";
         downloadLink.addEventListener("click", (e) => e.stopPropagation());
         attPreview.appendChild(downloadLink);
+      } else {
+        // "요약"(기본, 사전 생성)/"상세"(클릭 시 실시간 생성) 토글 — 상세는 처음 누를
+        // 때만 서버에 요청하고 결과를 캐시해 재조회하지 않는다("이력 보기" 버튼과 동일
+        // 패턴). 요약으로 돌아가면 다시 렌더링 없이 원래 미리보기를 그대로 보여준다.
+        const modeBtns = document.createElement("div");
+        modeBtns.className = "attachment-mode-btns";
+        const summaryBtn = document.createElement("button");
+        summaryBtn.className = "attachment-mode-btn active";
+        summaryBtn.type = "button";
+        summaryBtn.textContent = "요약";
+        const detailBtn = document.createElement("button");
+        detailBtn.className = "attachment-mode-btn";
+        detailBtn.type = "button";
+        detailBtn.textContent = "상세";
+        modeBtns.appendChild(summaryBtn);
+        modeBtns.appendChild(detailBtn);
+        item.appendChild(modeBtns);
+
+        const summaryText = att.미리보기;
+        let detailText = null;
+        let detailLoading = false;
+
+        summaryBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          summaryBtn.classList.add("active");
+          detailBtn.classList.remove("active");
+          renderRichText(attPreview, summaryText);
+        });
+
+        detailBtn.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          summaryBtn.classList.remove("active");
+          detailBtn.classList.add("active");
+          if (detailText !== null) {
+            renderRichText(attPreview, detailText);
+            return;
+          }
+          if (detailLoading) return;
+          detailLoading = true;
+          attPreview.textContent = "상세 내용을 생성하는 중...";
+          try {
+            const params = new URLSearchParams({
+              data_type: s.데이터유형, source_id: s.원본ID, filename: att.첨부파일명,
+            });
+            const res = await fetch(`/attachment-detail?${params.toString()}`);
+            const data = await res.json();
+            detailText = data.상세 || "상세 내용을 생성하지 못했습니다.";
+          } catch (err) {
+            detailText = "상세 내용을 불러오지 못했습니다.";
+          }
+          detailLoading = false;
+          // 버튼 전환 사이에 사용자가 다시 "요약"을 눌렀을 수 있으니, 여전히 상세가
+          // 선택된 상태일 때만 반영한다.
+          if (detailBtn.classList.contains("active")) {
+            renderRichText(attPreview, detailText);
+          }
+        });
       }
 
       attChip.addEventListener("click", (e) => {
