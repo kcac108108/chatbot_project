@@ -425,6 +425,15 @@ _EXCLUSION_NAME_RE = re.compile(
 )
 
 
+# "2024년 거만 빼고 알려줘"("것만"의 구어체 축약)에서 "거만"이 통째로 이름으로 오매칭돼,
+# 전혀 무관한 기관명 제외 로직(org_excluded, _build_filter와 별개 경로)이 잘못 발동해
+# 검색 결과가 통째로 사라지는 버그가 실측 확인됨(2026-10-21 — 연도 제외 기능을 새로 만들던
+# 중 우연히 발견, 5/5 결정론적 재현). "거/것(+이/그/저)+만"은 사람 이름일 수 없는 지시대명사+
+# 보조사 조합이므로, 캡처된 이름이 이 패턴과 정확히 일치하면 무효로 친다("홍길동만 빼고"처럼
+# 진짜 이름 뒤에 "만"이 붙는 경우는 캡처가 "홍길동만"이라 이 패턴과 다르므로 영향 없음).
+_PRONOUN_WITH_PARTICLE_RE = re.compile(r"^(?:이|그|저)?(?:것|거)만$")
+
+
 def _excluded_role_values(text: str) -> list[str]:
     m = _EXCLUSION_NAME_RE.search(text or "")
     if not m:
@@ -432,7 +441,29 @@ def _excluded_role_values(text: str) -> list[str]:
     names = [m.group(1).strip()]
     if m.group(2):
         names.append(m.group(2).strip())
-    return names
+    return [n for n in names if not _PRONOUN_WITH_PARTICLE_RE.match(n)]
+
+
+def _has_genuine_exclusion_phrase(text: str) -> bool:
+    m = _EXCLUSION_NAME_RE.search(text or "")
+    if not m:
+        return False
+    names = [m.group(1)] + ([m.group(2)] if m.group(2) else [])
+    return any(not _PRONOUN_WITH_PARTICLE_RE.match(n) for n in names)
+
+
+# "건강보험심사평가원 중에 2024년 거만 빼고 알려줘" 같은 연도 제외 질문이 5/5 결정론적으로
+# "찾지 못함"으로 실패하는 게 재현됨(2026-10-21) — `filters.연도`는 "포함할 값"만 담을 수
+# 있어 제외 의미를 표현 못 하고, `_YEAR_MENTION_RE`가 "2024년"을 보고 "조건이 있다"고 판단해
+# 전체이력 우회는 안전하게 피하지만(그 자체는 올바른 동작), 넘어간 일반 검색 경로에서
+# 데이터는 완전하게(narrowing search로 16건 전부) 가져오는데도 답변 생성 LLM이 "2024년 제외"
+# 필터링을 직접 해내지 못하고 통째로 포기함. 기관명 제외(`_EXCLUSION_NAME_RE`)와 동일한
+# 전략 — 코드가 직접 그 연도를 결과에서 제거한다.
+_EXCLUDED_YEAR_RE = re.compile(r"(\d{4})\s*년.{0,10}(?:빼고|제외|말고)")
+
+
+def _excluded_years(text: str) -> list[str]:
+    return _EXCLUDED_YEAR_RE.findall(text or "")
 
 
 # 2026-10-20 추가 — "2024-01-01 이후에 등록된 이력 있어?" 류 날짜 임계값 질문에서, 검색은
@@ -2270,7 +2301,7 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 결과가 되므로, 검색 전에 필터에서 기관명을 빼고 검색 후 결과에서 그 기관명을 제거한다.
     org_excluded = bool(
         analysis.filters.기관명
-        and (_EXCLUSION_NAME_RE.search(question) or _EXCLUSION_NAME_RE.search(analysis.standalone_question))
+        and (_has_genuine_exclusion_phrase(question) or _has_genuine_exclusion_phrase(analysis.standalone_question))
     )
     excluded_org = None
     if org_excluded:
@@ -2359,6 +2390,12 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         ]
         if len(_excluded_filtered) < len(results):
             results = _excluded_filtered
+
+    excluded_years = _excluded_years(question) or _excluded_years(analysis.standalone_question)
+    if excluded_years:
+        _year_excluded_filtered = [r for r in results if r.get("연도") not in excluded_years]
+        if len(_year_excluded_filtered) < len(results):
+            results = _year_excluded_filtered
 
     # 날짜 필터링이 첨부 청크의 부모 레코드를 조회할 때 쓰는 캐시 — 아래 _attachment_
     # metadata_header도 같은 (base_type, source_id)→parent 캐시 구조라 그대로 공유해
@@ -2601,6 +2638,12 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
                 "직접 확인했다(요청자·제공자·담당자·결재자 필드 전부 확인). 이 제외 조건을 "
                 "이미 만족하는 것으로 신뢰하고, 본문에 그 사실이 적혀있는지 스스로 재확인하려 "
                 "하지 마라.] " + text
+            )
+        if excluded_years:
+            text = (
+                f"[이 자료는 {'/'.join(excluded_years)}년이 아닌 것으로 코드가 직접 확인했다. "
+                "이 제외 조건을 이미 만족하는 것으로 신뢰하고, 본문에 그 사실이 적혀있는지 "
+                "스스로 재확인하려 하지 마라.] " + text
             )
         if context_blocks and context_chars + len(text) > _CONTEXT_CHAR_BUDGET:
             context_truncated = True
