@@ -411,6 +411,12 @@ _PERSON_ROLE_FIELDS = {"요청자", "제공자", "담당자", "결재자"}
 # 기능 전체를 새로 만드는 대신, 이미 뽑힌 결과에서 명백히 틀린 레코드만 빼는 좁은 범위의 수정.
 _TITLE_SUFFIX = r"(?:\s*(?:계장|팀장|과장|대리|주임|사원|선임|책임|부장|차장|실장|국장|원장|소장))?"
 _EXCLUSION_NAME_RE = re.compile(
+    # "2021년은 빼고"에서 "년은"(2021 바로 뒤에 붙은 한자+조사)이 사람 이름으로 오매칭돼
+    # 깨진 제외 안내문("[이 자료는 년은 중 누구의 것도 아닌...]")이 [자료]에 섞여 들어가는
+    # 버그가 실측 확인됨(2026-10-21, 복수 연도 제외 질문을 디버깅하다 발견) — 사람 이름은
+    # 연도 숫자 바로 뒤에 조사 없이 붙어 나올 수 없으므로, 캡처 시작 직전이 숫자면 매치하지
+    # 않는다(negative lookbehind).
+    r"(?<![0-9])"
     # 이름 캡처를 lazy(`{2,4}?`)로 해서, "전봉석이랑"처럼 이름 바로 뒤에 연결어가 붙는
     # 경우 탐욕적 매칭이 조사까지 삼켜 "전봉석이"로 잘못 캡처되는 걸 방지한다(2026-10-20
     # 발견 — 탐욕적이면 2~4글자 범위에서 가능한 한 많이 먹으려 해 "전봉석이"(4글자)까지
@@ -459,11 +465,25 @@ def _has_genuine_exclusion_phrase(text: str) -> bool:
 # 데이터는 완전하게(narrowing search로 16건 전부) 가져오는데도 답변 생성 LLM이 "2024년 제외"
 # 필터링을 직접 해내지 못하고 통째로 포기함. 기관명 제외(`_EXCLUSION_NAME_RE`)와 동일한
 # 전략 — 코드가 직접 그 연도를 결과에서 제거한다.
-_EXCLUDED_YEAR_RE = re.compile(r"(\d{4})\s*년.{0,10}(?:빼고|제외|말고)")
+#
+# ⚠️ "2020년이랑 2021년은 빼고"처럼 복수 연도를 제외할 때, 첫 버전(단일 캡처+`.{0,10}`로
+# 제외어까지 거리 확인)이 "2020년"만 잡고 "2021년"을 놓치는 버그가 재현됨(2026-10-21) —
+# `findall`은 겹치지 않는 매치만 찾는데, "2020년"에서 시작한 매치가 "2020년과 2021년을
+# 제외하고" 전체를 통째로 소비해버려서 "2021년"이 그 매치 안에 묻혀 별도로 캡처되지 않음.
+# 제외어(빼고/제외/말고) 앞쪽 구간에 등장하는 모든 연도를 찾는 방식으로 교체 — 연도 개수와
+# 무관하게 전부 잡힌다.
+_EXCLUSION_TRIGGER_RE = re.compile(r"빼고|제외|말고")
+_YEAR_TOKEN_RE = re.compile(r"(\d{4})\s*년")
 
 
 def _excluded_years(text: str) -> list[str]:
-    return _EXCLUDED_YEAR_RE.findall(text or "")
+    if not text:
+        return []
+    m = _EXCLUSION_TRIGGER_RE.search(text)
+    if not m:
+        return []
+    window = text[max(0, m.start() - 20) : m.start()]
+    return _YEAR_TOKEN_RE.findall(window)
 
 
 # 2026-10-20 추가 — "2024-01-01 이후에 등록된 이력 있어?" 류 날짜 임계값 질문에서, 검색은
@@ -2382,9 +2402,18 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
 
     excluded_names = _excluded_role_values(question) or _excluded_role_values(analysis.standalone_question)
     if excluded_names:
+        # "박상용 계장 말고 다른 사람이 요청한 외부요청은 없어?"에서 외부요청이 실제로
+        # 0건이면, 기존 데이터유형 완화(data_type_relaxed)가 역할필드 자체가 없는 다른
+        # 메뉴(신청이력 등, 요청자/제공자/담당자/결재자 개념 자체가 없음)의 무관한 레코드를
+        # 끌어오고, 그걸 "박상용 말고"라는 제외 조건과 전혀 무관하게 "~와 관련된 자료가
+        # 있습니다"라고 제시하는 문제가 실측 확인됨(2026-10-21) — 역할필드가 하나도 없는
+        # 레코드는 "제외 대상이 아님"을 애초에 검증할 방법이 없으므로, 이름 일치 여부와
+        # 무관하게 함께 걸러낸다(제외 조건을 검증 못 하는 레코드를 보여주는 것 자체가
+        # "~말고"라는 질문 의도와 안 맞음).
         _excluded_filtered = [
             r for r in results
-            if not any(
+            if any((r.get(f) or "") for f in _PERSON_ROLE_FIELDS)
+            and not any(
                 name in (r.get(f) or "") for name in excluded_names for f in _PERSON_ROLE_FIELDS
             )
         ]
@@ -2767,6 +2796,15 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 제거해 평범한 한국어 질문으로 되돌린다(검색용 standalone_question과 세션 저장용
     # question은 건드리지 않음).
     _answer_question_text = _TRANSLATION_REQUEST_RE.sub("", _answer_question_text).strip() or _answer_question_text
+    # "2020년이랑 2021년은 빼고"처럼 복수 연도를 제외하는 질문에서, standalone_question
+    # 재작성이 "제외" 의미를 안정적으로 보존하지 못하고 가끔 "2022년과 2023년의 내용을
+    # 알려주세요"처럼 완전히 다른(그리고 지어낸) 연도 조건으로 바꿔버리는 게 실측 확인됨
+    # (2026-10-21 — excluded_years 추출 자체는 원문 question에서 하므로 정확한데, 답변
+    # 생성에 전달되는 질문 텍스트만 틀어져 10회 중 8회 "찾지 못함"으로 실패). 이 틀어진
+    # standalone_question에 실제 제외 연도가 전혀 안 남아있으면, 번역 치환과 동일한 패턴으로
+    # 답변용 질문 사본만 원문 question으로 되돌린다(검색은 이미 완료된 뒤라 영향 없음).
+    if excluded_years and not all(y in _answer_question_text for y in excluded_years):
+        _answer_question_text = question
     messages.append(
         {
             "role": "user",
