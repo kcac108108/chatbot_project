@@ -591,9 +591,14 @@ function renderRichText(container, text) {
   }
 }
 
-function buildSourceChip(s, orgGroupMeta) {
+function buildSourceChip(s, orgGroupMeta, opts) {
+  // opts.alwaysOpen: 이미 다른 동작(표 행 클릭 등)으로 "펼쳐서 보여주겠다"는 의도가
+  // 명확한 맥락에서 쓴다 — 칩 자체를 처음부터 펼친 채 고정하고 클릭 토글(화살표 포함)을
+  // 아예 없앤다. 그냥 매번 chip.click()으로 강제로 펼치는 방식은 이중 토글(행 토글+칩
+  // 토글)처럼 보여 "화살표를 눌러도 안 닫힌다"는 혼란을 줬다(2026-10-21, 사용자 피드백).
+  const alwaysOpen = !!(opts && opts.alwaysOpen);
   const srow = document.createElement("div");
-  srow.className = "source-row";
+  srow.className = "source-row" + (alwaysOpen ? " open" : "");
 
   const chip = document.createElement("button");
   chip.className = "source-chip";
@@ -810,7 +815,7 @@ function buildSourceChip(s, orgGroupMeta) {
     hasToggleContent = true;
   }
 
-  if (hasToggleContent) {
+  if (hasToggleContent && !alwaysOpen) {
     const chevron = document.createElement("span");
     chevron.className = "chip-chevron";
     chevron.textContent = "▸";
@@ -953,8 +958,10 @@ function renderHistoryTable(container, items) {
           if (!res.ok) throw new Error("not found");
           const source = await res.json();
           detailTd.innerHTML = "";
-          const sourceRow = buildSourceChip(source);
-          sourceRow.classList.add("open"); // 이미 행을 클릭했으니 한 번 더 누르지 않아도 바로 펼쳐서 보여줌
+          // 이미 행을 클릭했으니 한 번 더 누르지 않아도 바로 펼쳐서 보여준다 — 칩 자체의
+          // 독립 토글(화살표)은 끈다(alwaysOpen), 행 토글과 칩 토글이 중첩되면 "화살표를
+          // 눌러도 안 닫힌다"는 혼란을 준다(2026-10-21, 사용자 피드백).
+          const sourceRow = buildSourceChip(source, null, { alwaysOpen: true });
           detailTd.appendChild(sourceRow);
         } catch (err) {
           detailTd.textContent = "상세 내용을 불러오지 못했습니다.";
