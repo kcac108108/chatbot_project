@@ -248,11 +248,18 @@
   .org-group-banner-sub { font-size: 10.3px; color: var(--ink-dark-soft); margin-top: 2px; }
   .detail-source-row { margin-top: 8px; }
   .source-chip {
+    display: inline-flex; align-items: center; gap: 5px;
     font-size: 10.8px; background: rgba(52,201,163,.12); color: var(--mint);
     border: 1px solid rgba(52,201,163,.35); border-radius: 999px; padding: 4px 10px;
     cursor: pointer; font-family: inherit; transition: background .15s, border-color .15s;
   }
   .source-chip:hover { background: rgba(52,201,163,.22); border-color: rgba(52,201,163,.55); }
+  /* 클릭하면 펼쳐진다는 걸 처음 보는 사용자도 바로 알 수 있도록 chevron 아이콘을
+     달아준다(2026-10-21, 사용자 피드백: "클릭해야 하는 걸 모를 수도 있다") —
+     detail-chevron(건별 상세 아코디언)과 동일한 패턴, 펼치면 90도 회전. */
+  .chip-chevron { color: var(--mint); flex-shrink: 0; transition: transform .15s; font-size: 11px; }
+  .source-row.open .source-chip .chip-chevron,
+  .attachment-item.open .attachment-chip .chip-chevron { transform: rotate(90deg); }
   .source-preview {
     display: none; margin-top: 4px; padding: 9px 11px; width: 100%;
     background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.08);
@@ -286,11 +293,13 @@
   .attachment-item { margin-bottom: 6px; }
   .attachment-item:last-child { margin-bottom: 0; }
   .attachment-chip {
-    display: block; width: 100%; text-align: left;
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    width: 100%; text-align: left;
     font-size: 10.5px; background: rgba(255,255,255,.05); color: var(--ink-dark-soft);
     border: 1px solid rgba(255,255,255,.16); border-radius: 8px; padding: 4px 9px;
     cursor: pointer; font-family: inherit; transition: background .15s, border-color .15s;
   }
+  .attachment-chip .chip-chevron { color: var(--ink-dark-soft); }
   .attachment-chip:hover { background: rgba(255,255,255,.09); border-color: rgba(255,255,255,.3); }
   .attachment-preview {
     display: none; margin-top: 4px; padding: 8px 10px;
@@ -579,7 +588,9 @@ function buildSourceChip(s, orgGroupMeta) {
   const chip = document.createElement("button");
   chip.className = "source-chip";
   chip.type = "button";
-  chip.textContent = `[${s.데이터유형}] ${s.원본ID}` + (s.기관명 ? ` · ${s.기관명}` : "");
+  const chipLabel = document.createElement("span");
+  chipLabel.textContent = `[${s.데이터유형}] ${s.원본ID}` + (s.기관명 ? ` · ${s.기관명}` : "");
+  chip.appendChild(chipLabel);
 
   // 기관정보 카드는 "이력 보기"까지 하나의 상자에 담는다(아래 해당 분기 참고). 같은
   // 기관명이 여러 건 중복 등록돼 있으면(orgGroupMeta.total > 1) 순번 배지도 붙인다.
@@ -650,7 +661,13 @@ function buildSourceChip(s, orgGroupMeta) {
       const attChip = document.createElement("button");
       attChip.className = "attachment-chip";
       attChip.type = "button";
-      attChip.textContent = att.첨부파일명;
+      const attLabel = document.createElement("span");
+      attLabel.textContent = att.첨부파일명;
+      attChip.appendChild(attLabel);
+      const attChevron = document.createElement("span");
+      attChevron.className = "chip-chevron";
+      attChevron.textContent = "▸";
+      attChip.appendChild(attChevron);
       item.appendChild(attChip);
 
       const attPreview = document.createElement("div");
@@ -778,6 +795,10 @@ function buildSourceChip(s, orgGroupMeta) {
   }
 
   if (hasToggleContent) {
+    const chevron = document.createElement("span");
+    chevron.className = "chip-chevron";
+    chevron.textContent = "▸";
+    chip.appendChild(chevron);
     chip.addEventListener("click", (e) => {
       e.stopPropagation();
       srow.classList.toggle("open");
