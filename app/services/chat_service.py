@@ -737,6 +737,33 @@ def _excluded_trade_types(text: str) -> list[str]:
     return excluded
 
 
+_LIST_NARROWING_CONTINUATION_RE = re.compile(r"그\s*중에|그중에|이\s*중에|이중에|그\s*안에")
+
+
+def _carried_exclusion_text(question: str, history: list[dict]) -> str:
+    """"그 중에 2016년 자료는 뭐야?"처럼 "그 중에" 류 표현으로 직전 턴의 결과 목록을
+    좁히는 후속질문은, standalone_question 재작성이 직전 턴의 제외 조건(예: "통관기초통계
+    아닌")을 통째로 누락시키고, 심지어 그 값을 긍정 필터로 거꾸로 채워버리는 문제가 실측
+    확인됨(2026-10-22 — 1턴 "통관기초통계 아닌" 다음 2턴 "그 중에 2016년 자료는?"에서
+    재작성된 standalone_question엔 제외 조건이 전혀 안 남고, `필터.통계종류='통관기초통계'`로
+    정반대로 채워짐 — 2016년 8건 중 통관기초통계인 2건이 그대로 섞여 나옴). 질문에 그런
+    "목록 좁히기" 신호가 있을 때만 바로 직전 사용자 턴 텍스트를 함께 제외 탐지 대상에 넣는다.
+    ⚠️ 처음엔 더 넓은 `_CONTINUATION_REFERENCE_WORDS`("그"/"거기"/"해당" 등, 기관명 암묵
+    계승용으로 이미 쓰이던 목록)를 그대로 재사용했는데, "그 기관 2020년 이력도 있어?"처럼
+    **목록을 좁히려는 게 아니라 그 기관에 대한 새 질문**인 경우까지 과거 턴의 제외 조건을
+    잘못 끌고 와서, 실제론 있는 2020년 통관기초통계 레코드 3건을 조용히 숨기는 완전성
+    회귀가 실측으로 발견됨(검증 중 확인) — "그 중에/이 중에" 류 좁고 명시적인 패턴으로
+    범위를 제한해 이 오탐을 피한다. 전체 히스토리를 다 뒤지면 2026-10-20에 이미 확인된
+    "오래된 조건이 무관한 후속 턴에 영구 재적용되는" 문제가 재발하므로, 직전 턴 하나로도
+    범위를 좁혀 안전하게 한다."""
+    if not _LIST_NARROWING_CONTINUATION_RE.search(question):
+        return question
+    user_turns = [m["content"] for m in history if m.get("role") == "user"]
+    if not user_turns:
+        return question
+    return question + " " + user_turns[-1]
+
+
 # 2026-10-20 추가 — "2024-01-01 이후에 등록된 이력 있어?" 류 날짜 임계값 질문에서, 검색은
 # 항상 정답 레코드를 정확히 찾아내는데도 답변 생성 LLM이 "이 날짜가 기준 이후인가"를
 # 판단하는 단계에서 불안정함이 반복 측정으로 확인됨(10회 중 2회만 성공, 특히 기준일에
@@ -2883,7 +2910,8 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # LLM이 하필 제외 대상 그 값 자체를 유효한 값으로 채우면(예: "원안수용") 정반대로
     # 좁혀버리는 사고를 막기 위해 명시적으로도 지운다.
     excluded_results = (
-        _excluded_committee_results(question) or _excluded_committee_results(analysis.standalone_question)
+        _excluded_committee_results(_carried_exclusion_text(question, history))
+        or _excluded_committee_results(analysis.standalone_question)
     )
     if excluded_results and analysis.filters.심의결과 in excluded_results:
         analysis.filters = analysis.filters.model_copy(update={"심의결과": None})
@@ -2895,7 +2923,8 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # "아닌" 나머지 41건과는 정반대). 동의어 그룹(_resolve_statistics_type_group) 전체를
     # 제외 대상으로 확장해 필터링한다.
     excluded_stat_types = (
-        _excluded_statistics_types(question) or _excluded_statistics_types(analysis.standalone_question)
+        _excluded_statistics_types(_carried_exclusion_text(question, history))
+        or _excluded_statistics_types(analysis.standalone_question)
     )
     excluded_stat_group: set[str] = set()
     for _v in excluded_stat_types:
@@ -2907,7 +2936,8 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 피해가는" 문제(2026-10-22, 같은 날 발견). "수출"이 "수출입"의 유효한 값이라 그대로
     # 포함 필터로 쓰여 정반대 결과를 낸다.
     excluded_trade_types = (
-        _excluded_trade_types(question) or _excluded_trade_types(analysis.standalone_question)
+        _excluded_trade_types(_carried_exclusion_text(question, history))
+        or _excluded_trade_types(analysis.standalone_question)
     )
     if excluded_trade_types and analysis.filters.수출입구분 in excluded_trade_types:
         analysis.filters = analysis.filters.model_copy(update={"수출입구분": None})
