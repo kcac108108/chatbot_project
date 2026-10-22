@@ -419,6 +419,12 @@ def _build_source_item(payload: dict, keyword: str | None = None) -> SourceItem:
 
 
 def _resolve_source(idx: int, results: list[dict], keyword: str | None = None) -> SourceItem | None:
+    # 자료가 정확히 1개뿐이면 어느 번호를 가리키든 모호함이 없으므로 그 1개로 강제한다.
+    # "전봉석이 담당한 보안 관련 자료" 같은 질문에서 검색 결과가 1건으로 정확히 좁혀졌는데도
+    # LLM이 source_index=2(존재하지 않는 번호)를 만들어내, 답변은 "있다"면서 sources가
+    # 완전히 비어버리는 자기모순이 실측 확인됨(2026-10-22, 10회 중 3회 재현).
+    if len(results) == 1:
+        idx = 1
     if not (1 <= idx <= len(results)):
         return None
     payload = results[idx - 1]
@@ -2485,7 +2491,26 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     results, possibly_truncated, data_type_relaxed = _search(analysis, carried_over, allowed_data_types)
 
     if excluded_org:
-        results = [r for r in results if r.get("기관명") != excluded_org]
+        # 첨부 청크는 기관명 필드 자체가 없어(None) 이 비교를 그냥 통과하는데, 화면에
+        # 보여줄 때는 _resolve_source가 부모 레코드로 승격시키면서 실제 기관명(하필 제외
+        # 대상)이 드러나는 괴리가 실측 확인됨(2026-10-22 — raw payload 기준 필터는 통과했지만
+        # 최종 sources엔 제외하라고 한 한국환경공단이 13건이나 섞여 나옴). 부모 레코드를
+        # 조회해 승격 후 실제로 보일 기관명 기준으로 비교한다.
+        _org_excl_cache: dict = {}
+
+        def _effective_org_for_exclusion(r: dict) -> str | None:
+            if r.get("기관명"):
+                return r.get("기관명")
+            base_type = _BASE_TYPE_OF.get(r.get("데이터유형"))
+            if not base_type:
+                return None
+            cache_key = (base_type, r.get("원본ID"))
+            if cache_key not in _org_excl_cache:
+                parents = find_by_type_and_source(base_type, r.get("원본ID"), limit=1)
+                _org_excl_cache[cache_key] = parents[0].get("기관명") if parents else None
+            return _org_excl_cache[cache_key]
+
+        results = [r for r in results if _effective_org_for_exclusion(r) != excluded_org]
 
     # "수수료 제일 비싼/저렴한 거" 같은 금액 최상급 질문도 날짜 최상급과 동일한 문제를
     # 겪는 게 실측 확인됨(2026-10-20 — 한국환경공단 83건 중 narrowing top-20만 보고 LLM이
@@ -2555,6 +2580,13 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
                 ]
 
     excluded_names = _excluded_role_values(question) or _excluded_role_values(analysis.standalone_question)
+    # "한국환경공단 말고 다른 기관..."처럼 기관명 제외 질문에서, _EXCLUSION_NAME_RE가
+    # "말고" 바로 앞의 2~4글자("공단")를 사람 이름으로 오매칭하는 버그가 실측 확인됨
+    # (2026-10-22 — 역할필드가 전부 None인 첨부 청크만 있을 때 아래 _excluded_filtered가
+    # 전부 걸러버려 27건→0건으로 완전히 사라짐). 이미 계산된 excluded_org(진짜 기관명 제외
+    # 대상)의 접미사와 겹치는 이름 후보는 역할필드 제외 대상이 아니므로 제거한다.
+    if excluded_org:
+        excluded_names = [n for n in excluded_names if n not in excluded_org]
     if excluded_names:
         # "박상용 계장 말고 다른 사람이 요청한 외부요청은 없어?"에서 외부요청이 실제로
         # 0건이면, 기존 데이터유형 완화(data_type_relaxed)가 역할필드 자체가 없는 다른
@@ -2808,6 +2840,18 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
                 "최댓값/최솟값이다. 본문 속 다른 수수료 값과 혼동해서 스스로 재비교하지 말고, "
                 "이 자료를 답으로 삼아라.] " + text
             )
+        if excluded_org:
+            # "한국환경공단 말고 다른 기관" 같은 제외 질문에서, 코드가 이미 기관명으로
+            # 제외 대상이 아님을 확인한 레코드만 여기 도달하는데(excluded_names와 동일 구조),
+            # 안내 문구가 빠져있어 답변 생성 LLM이 전부 no_result로 거절하는 문제가 실측
+            # 확인됨(2026-10-22 — 27건 중 20여 건이 본문에 "한국환경공단은..."으로 시작하는
+            # 첨부 승격 레코드라, 코드 필터는 통과시켰지만 LLM이 본문만 보고 "대부분 한국환경
+            # 공단"이라 판단해 제외 대상이 아닌 나머지 7건까지 통째로 거절한 것으로 추정).
+            text = (
+                f"[이 자료는 {excluded_org}가 아닌 것으로 코드가 직접 확인했다(원본ID 소속 "
+                "기관을 조회해 검증함). 본문에 그 사실이 적혀있는지 스스로 재확인하려 하지 "
+                "말고, 이 자료를 그대로 답변에 포함하라.] " + text
+            )
         if excluded_names:
             # "전봉석이랑 차영경 말고 다른 사람이 담당한 자료 있어?" 같은 제외 질문에서,
             # 코드가 이미 요청자/제공자/담당자/결재자 필드로 제외 대상이 아님을 확인한
@@ -3008,7 +3052,11 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
                 continue
             seen.add(key)
             sources.append(source)
-            used_payloads.append(results[idx - 1])
+            # _resolve_source는 results가 1개뿐이면 idx를 내부적으로 1로 보정하지만, 이
+            # 루프의 idx는 LLM이 준 원래 값(예: 2) 그대로라 results[idx-1]이 범위를 벗어나
+            # IndexError가 날 수 있다 — 같은 보정을 여기서도 적용한다.
+            effective_idx = 1 if len(results) == 1 else idx
+            used_payloads.append(results[effective_idx - 1])
 
     session_store.append_turn(session_id, question, history_text)
     session_store.set_last_sources(session_id, used_payloads)
