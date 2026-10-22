@@ -588,6 +588,7 @@ def _has_genuine_exclusion_phrase(text: str) -> bool:
 # 무관하게 전부 잡힌다.
 _EXCLUSION_TRIGGER_RE = re.compile(r"빼고|제외|말고")
 _YEAR_TOKEN_RE = re.compile(r"(\d{4})\s*년")
+_ROUND_TOKEN_RE = re.compile(r"(\d+)\s*차")
 
 
 def _excluded_years(text: str) -> list[str]:
@@ -598,6 +599,22 @@ def _excluded_years(text: str) -> list[str]:
         return []
     window = text[max(0, m.start() - 20) : m.start()]
     return _YEAR_TOKEN_RE.findall(window)
+
+
+def _excluded_rounds(text: str) -> list[int]:
+    """"1차 빼고" 같은 차수 제외 질문도 연도와 같은 구조적 한계를 겪는다(2026-10-22
+    발견) — `filters.차수`는 포함할 값 하나만 담을 수 있어, LLM이 "제외"라는 의미를
+    이해 못 하고 엉뚱한(존재하지도 않는) 차수를 지어내 채우는 사례까지 확인됨("1차
+    빼고"를 `차수=2`로 — 제외 대상도 아니고 그 기관에 아예 없는 차수). `_excluded_years`와
+    동일한 전략(코드가 직접 텍스트에서 제외 대상을 뽑아 결과를 거른다)으로 해결한다.
+    차수는 Qdrant payload·FilterExtraction 둘 다 int로 저장되므로 int로 변환해 반환."""
+    if not text:
+        return []
+    m = _EXCLUSION_TRIGGER_RE.search(text)
+    if not m:
+        return []
+    window = text[max(0, m.start() - 20) : m.start()]
+    return [int(v) for v in _ROUND_TOKEN_RE.findall(window)]
 
 
 # 2026-10-20 추가 — "2024-01-01 이후에 등록된 이력 있어?" 류 날짜 임계값 질문에서, 검색은
@@ -2515,12 +2532,23 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         excluded_org = analysis.filters.기관명
         analysis.filters = analysis.filters.model_copy(update={"기관명": None})
 
+    # "1차 빼고" 같은 차수 제외 질문도 기관명과 같은 문제를 겪는다 — `filters.차수`는
+    # 포함할 값만 담을 수 있어, LLM이 제외 대상을 그대로 채우거나(기관명 패턴과 동일)
+    # 심지어 그 기관에 존재하지도 않는 엉뚱한 차수를 지어내 채우는 사례까지 확인됨
+    # (2026-10-22 — "대한무역투자진흥공사(1차/3차만 존재) 안건 중에 1차 빼고"가
+    # `차수=2`로 지어내져 AND 필터가 항상 0건). 제외 표현이 감지되면 LLM이 뽑은 값을
+    # 아예 신뢰하지 않고 필터에서 제거, 검색 후 결과에서 제외 대상만 걸러낸다.
+    excluded_rounds = _excluded_rounds(question) or _excluded_rounds(analysis.standalone_question)
+    if excluded_rounds and analysis.filters.차수 is not None:
+        analysis.filters = analysis.filters.model_copy(update={"차수": None})
+
     _pre_force_narrowing = bool(
         excluded_org
         or _excluded_role_values(question)
         or _excluded_role_values(analysis.standalone_question)
         or _excluded_years(question)
         or _excluded_years(analysis.standalone_question)
+        or excluded_rounds
     )
     results, possibly_truncated, data_type_relaxed = _search(
         analysis, carried_over, allowed_data_types, force_narrowing=_pre_force_narrowing
@@ -2647,6 +2675,11 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         _year_excluded_filtered = [r for r in results if r.get("연도") not in excluded_years]
         if len(_year_excluded_filtered) < len(results):
             results = _year_excluded_filtered
+
+    if excluded_rounds:
+        _round_excluded_filtered = [r for r in results if r.get("차수") not in excluded_rounds]
+        if len(_round_excluded_filtered) < len(results):
+            results = _round_excluded_filtered
 
     # 날짜 필터링이 첨부 청크의 부모 레코드를 조회할 때 쓰는 캐시 — 아래 _attachment_
     # metadata_header도 같은 (base_type, source_id)→parent 캐시 구조라 그대로 공유해
@@ -3038,6 +3071,14 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # standalone_question에 실제 제외 연도가 전혀 안 남아있으면, 번역 치환과 동일한 패턴으로
     # 답변용 질문 사본만 원문 question으로 되돌린다(검색은 이미 완료된 뒤라 영향 없음).
     if excluded_years and not all(y in _answer_question_text for y in excluded_years):
+        _answer_question_text = question
+    # "1차 빼고"도 연도 제외와 완전히 같은 문제를 겪는다(2026-10-22 발견) — standalone_question
+    # 재작성이 제외 의미를 못 지키고 심지어 그 기관에 존재하지도 않는 엉뚱한 차수("2차")로
+    # 지어내는 경우까지 확인됨. 그러면 [자료]엔 올바른 레코드(3차)가 있는데 [질문]은 "2차
+    # 안건을 알려달라"고 모순되게 요구해, 답변 생성 LLM이 "질문과 안 맞는다"며 no_result로
+    # 거절함(재현 10회 중 9회) — 검색 자체는 이미 정확히 완료된 뒤이므로 답변용 질문 사본만
+    # 원문으로 되돌린다.
+    if excluded_rounds and not all(f"{r}차" in _answer_question_text for r in excluded_rounds):
         _answer_question_text = question
     messages.append(
         {
