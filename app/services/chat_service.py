@@ -661,6 +661,31 @@ def _excluded_rounds(text: str) -> list[int]:
     return [int(v) for v in _ROUND_TOKEN_RE.findall(window)]
 
 
+# "원안수용 아닌거 있어?" 같은 심의결과 제외 질문도 연도·차수와 같은 구조적 한계를 겪는다
+# (2026-10-22 발견) — `filters.심의결과`는 포함할 값만 담을 수 있어, LLM이 "~아닌"을 그대로
+# 문자열로 채워(예: "원안수용 아닌") 존재하지 않는 값이 되거나, 완화되며 제외 의도 자체가
+# 사라져(필터가 전부 풀려 심의결과 무관하게 20건을 가져옴) 결과가 뒤섞인 채 답변 생성 LLM이
+# 혼란스러워하다 아예 no_result로 포기하는 사례까지 확인됨("2015~2018년 중 원안수용 아닌거" —
+# ground truth 7건인데 0건 응답). 연도/차수와 달리 값 자체가 숫자 토큰이 아니라 다글자
+# 문자열이라 토큰 정규식 대신 알려진 값(_KNOWN_COMMITTEE_RESULTS) 각각이 본문에 등장하는지
+# 직접 찾고, 그 바로 뒤에 제외 신호("아닌"/빼고/제외/말고)가 있는지 확인한다.
+_RESULT_EXCLUSION_TAIL_RE = re.compile(r"^\s*(?:이|가)?\s*(?:아닌|빼고|제외|말고)")
+
+
+def _excluded_committee_results(text: str) -> list[str]:
+    if not text:
+        return []
+    excluded = []
+    for value in _KNOWN_COMMITTEE_RESULTS:
+        idx = text.find(value)
+        if idx == -1:
+            continue
+        tail = text[idx + len(value) : idx + len(value) + 8]
+        if _RESULT_EXCLUSION_TAIL_RE.match(tail):
+            excluded.append(value)
+    return excluded
+
+
 # 2026-10-20 추가 — "2024-01-01 이후에 등록된 이력 있어?" 류 날짜 임계값 질문에서, 검색은
 # 항상 정답 레코드를 정확히 찾아내는데도 답변 생성 LLM이 "이 날짜가 기준 이후인가"를
 # 판단하는 단계에서 불안정함이 반복 측정으로 확인됨(10회 중 2회만 성공, 특히 기준일에
@@ -928,6 +953,13 @@ def _build_filter(
     # 그대로 유지한 채 검색한다.
     if values.get("통계종류") and values["통계종류"] not in _KNOWN_STATISTICS_TYPES:
         values.pop("통계종류", None)
+
+    # "원안수용 아닌거 있어?" 같은 심의결과 제외 질문에서 LLM이 부정 표현을 그대로
+    # 심의결과 필드에 문자열로 채우는 경우(예: "원안수용 아닌")를 방어한다(2026-10-22
+    # 발견) — 통계종류와 동일한 원리: 실제 DB에 없는 값이라 정확매칭이 항상 0건이 되고,
+    # 제외 의도 자체는 아래 `_excluded_committee_results`(ask())가 별도로 처리한다.
+    if values.get("심의결과") and values["심의결과"] not in _KNOWN_COMMITTEE_RESULTS:
+        values.pop("심의결과", None)
 
     # 대화 히스토리가 있으면 "위원회 안건" 같은 표현에서 "위원회"처럼 질문 속 일반명사를
     # 기관명으로 잘못 지어내는 경우를 방어한다(2026-10-20 발견) — DB에 실제로 존재하지
@@ -1224,7 +1256,12 @@ def _apply_date_direction_guard(analysis: QueryAnalysis, question: str) -> Query
 # "2020년 이후" 질문 — ground truth 5건 중 1건만 반환). 날짜와 동일한 전략으로 연도+방향도
 # 코드가 직접 정규식으로 뽑는다. "년" 바로 뒤에 월/일이 오는 전체 날짜 표현과는 이 정규식이
 # 구조적으로 겹치지 않는다(월/일이 끼면 "년" 다음이 방향어가 아니라 "N월"이라 매치 안 됨).
-_YEAR_RANGE_RE = re.compile(r"(\d{4})년\s*(이후|부터|이상|이전|까지|이하)")
+# "사이"도 포함한다(2026-10-22, 이어서) — "2015년부터 2018년 사이"처럼 "부터 ~ 사이" 범위
+# 표현에서 두 번째 연도 뒤의 "사이"가 이 목록에 없어 매치 자체가 안 되는 바람에 상한이 통째로
+# 누락되는 버그가 실측 확인됨(심의위원회 "2015년부터 2018년 사이" 질문 — ground truth 7건이
+# 0건으로 응답됨). _ABS_DATE_DIRECTION_RE(절대 날짜)는 이미 "사이"를 상한(before)으로 처리하고
+# 있어 그 선례를 그대로 따른다.
+_YEAR_RANGE_RE = re.compile(r"(\d{4})년\s*(이후|부터|이상|이전|까지|이하|사이)")
 
 
 def _apply_year_range_guard(analysis: QueryAnalysis, question: str) -> QueryAnalysis:
@@ -2773,6 +2810,16 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     if excluded_rounds and analysis.filters.차수 is not None:
         analysis.filters = analysis.filters.model_copy(update={"차수": None})
 
+    # "원안수용 아닌거 있어?" 같은 심의결과 제외도 동일한 구조적 한계 — `_build_filter`가
+    # 이미 알려지지 않은 심의결과 값은 걸러내지만(위 `_KNOWN_COMMITTEE_RESULTS` 체크),
+    # LLM이 하필 제외 대상 그 값 자체를 유효한 값으로 채우면(예: "원안수용") 정반대로
+    # 좁혀버리는 사고를 막기 위해 명시적으로도 지운다.
+    excluded_results = (
+        _excluded_committee_results(question) or _excluded_committee_results(analysis.standalone_question)
+    )
+    if excluded_results and analysis.filters.심의결과 in excluded_results:
+        analysis.filters = analysis.filters.model_copy(update={"심의결과": None})
+
     _pre_force_narrowing = bool(
         excluded_org
         or _excluded_role_values(question)
@@ -2780,6 +2827,7 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         or _excluded_years(question)
         or _excluded_years(analysis.standalone_question)
         or excluded_rounds
+        or excluded_results
     )
     results, possibly_truncated, data_type_relaxed = _search(
         analysis, carried_over, allowed_data_types, force_narrowing=_pre_force_narrowing
@@ -2911,6 +2959,11 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         _round_excluded_filtered = [r for r in results if r.get("차수") not in excluded_rounds]
         if len(_round_excluded_filtered) < len(results):
             results = _round_excluded_filtered
+
+    if excluded_results:
+        _result_excluded_filtered = [r for r in results if r.get("심의결과") not in excluded_results]
+        if len(_result_excluded_filtered) < len(results):
+            results = _result_excluded_filtered
 
     # 날짜 필터링이 첨부 청크의 부모 레코드를 조회할 때 쓰는 캐시 — 아래 _attachment_
     # metadata_header도 같은 (base_type, source_id)→parent 캐시 구조라 그대로 공유해
@@ -3204,6 +3257,12 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
                 "이 제외 조건을 이미 만족하는 것으로 신뢰하고, 본문에 그 사실이 적혀있는지 "
                 "스스로 재확인하려 하지 마라.] " + text
             )
+        if excluded_results:
+            text = (
+                f"[이 자료의 심의결과는 {'/'.join(excluded_results)} 중 어느 것도 아닌 것으로 "
+                "코드가 직접 확인했다. 이 제외 조건을 이미 만족하는 것으로 신뢰하고, 본문에 "
+                "그 사실이 적혀있는지 스스로 재확인하려 하지 마라.] " + text
+            )
         if context_blocks and context_chars + len(text) > _CONTEXT_CHAR_BUDGET:
             context_truncated = True
             break
@@ -3342,6 +3401,10 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 거절함(재현 10회 중 9회) — 검색 자체는 이미 정확히 완료된 뒤이므로 답변용 질문 사본만
     # 원문으로 되돌린다.
     if excluded_rounds and not all(f"{r}차" in _answer_question_text for r in excluded_rounds):
+        _answer_question_text = question
+    # 심의결과 제외도 연도·차수와 동일한 재작성 왜곡을 겪을 수 있어 같은 방어를 적용한다
+    # (2026-10-22 발견, "N차 빼고"와 같은 날).
+    if excluded_results and not all(v in _answer_question_text for v in excluded_results):
         _answer_question_text = question
     messages.append(
         {
