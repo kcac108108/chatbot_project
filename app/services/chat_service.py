@@ -1062,12 +1062,29 @@ def _build_filter(
     # 좁혀지는 버그가 있었다(2026-10-19, "심의위원회 제공불가 안건" 질문 디버깅 중 발견 —
     # 심의결과 필드가 비어서 첨부 청크가 전부 메타데이터 없이 반환되는 걸 보고 추적함).
     # data_type_value 자체가 scope에 이미 정확히 속하면 그게 가장 구체적이니 최우선으로 쓴다.
+    # ⚠️ "첨부파일" 스코프(5개 메뉴 첨부타입 전부)에서는 이 우선순위가 역효과를 낸다
+    # (2026-10-22 발견) — "한국철강협회 관련 첨부파일 중에 통관기초통계 아닌거 있어?"처럼
+    # 질문이 특정 메뉴를 전혀 언급하지 않았는데도 LLM이 데이터유형='기관정보'를 (2026-09-22에
+    # 이미 "혼재 버그"로 확인된 바로 그 불안정한 습관으로) 추측해 채우면, 이 우선순위가
+    # 그 추측 하나만으로 5개 중 1개 메뉴(기관정보첨부)로 좁혀버려 나머지 4개 메뉴(이 사례의
+    # 진짜 정답 29건이 있던 신청이력첨부 포함)가 통째로 사라진다. "첨부파일"처럼 전부
+    # 첨부타입으로만 구성된 스코프(_ATTACHMENT_TYPE_OF의 값 집합 부분집합)에서는, 질문에
+    # 그 메뉴 이름이 실제로 명시된 경우만(`_confirmed_menu_data_type`) 이 narrowing을
+    # 허용한다 — 2026-10-14에 이 기능을 처음 만들 때의 테스트 사례("건강보험심사평가원
+    # 2021년 심의위원회 첨부파일 있어?")도 메뉴 이름을 실제로 명시했으므로 영향 없다.
+    _attachment_only_scope = bool(
+        allowed_data_types is not None and allowed_data_types <= set(_ATTACHMENT_TYPE_OF.values())
+    )
     if allowed_data_types is not None:
-        if data_type_value in allowed_data_types:
+        if data_type_value in allowed_data_types and (
+            not _attachment_only_scope or _confirmed_menu_data_type(data_type_value, question_text)
+        ):
             resolved_types = {data_type_value}
         else:
             mapped_type = _ATTACHMENT_TYPE_OF.get(data_type_value, data_type_value)
-            if mapped_type in allowed_data_types:
+            if mapped_type in allowed_data_types and (
+                not _attachment_only_scope or _confirmed_menu_data_type(data_type_value, question_text)
+            ):
                 resolved_types = {mapped_type}
             else:
                 resolved_types = allowed_data_types
