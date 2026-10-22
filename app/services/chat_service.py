@@ -237,6 +237,10 @@ _ATTACHMENT_METADATA_FIELDS = (
     "기관명", "연도", "통계종류", "수출입구분", "요청자", "제공자", "담당자", "결재자", "심의결과", "차수",
 )
 
+# 역할필드는 "김인태, 전봉석"처럼 콤마로 여러 명이 저장될 수 있어 정확매칭이 아니라
+# 부분 문자열 포함으로 검증해야 한다(_search()의 키워드 스캔 블록에서 사용, 2026-10-22).
+_ROLE_FIELDS_FOR_SCAN = ("요청자", "제공자", "담당자", "결재자")
+
 
 def _attachment_metadata_header(payload: dict, cache: dict) -> str:
     base_type = _BASE_TYPE_OF.get(payload.get("데이터유형"))
@@ -1538,6 +1542,13 @@ def _search(
     scan_confirmed_files = set()
 
     keyword = analysis.filters.키워드
+    # 첨부 청크는 기관명 등 메타필드 자체가 없어 바로 아래 값비교 체크를 그냥 통과하는데
+    # (2026-10-19 당시 "완벽하진 않지만" 수용했던 한계), 기관명이 걸린 질문에서 흔한
+    # 단어("폐기물" 등)가 전혀 무관한 다른 기관의 첨부까지 대거 끌어오는 심각한 교차오염이
+    # 재현됨(2026-10-22 — "한국환경공단 관련 첨부파일 중 폐기물" 질문에 한국광업진흥공사/
+    # 정보통신기획평가원 등 무관한 기관 자료가 섞임). 부모 레코드를 조회해 기관명을 직접
+    # 확인한다(_build_filter의 2026-10-13 수정과 같은 원리를 스캔 경로에도 적용).
+    attachment_org_cache: dict[tuple, dict | None] = {}
     if keyword:
         scan_ran = True
         scan_results = scan_text_contains(keyword, KEYWORD_SCAN_LIMIT)
@@ -1550,11 +1561,10 @@ def _search(
             # 처럼 흔한 키워드는 완전히 무관한 다른 기관(국민건강보험공단 등)의 레코드도 전수
             # 스캔에 대거 걸려서, 기관명 조건이 사실상 무시되고 섞여 나오는 교차오염이 즉흥
             # 테스트로 재현됨(2026-10-19) — 스캔 결과가 명백히 다른 기관 소속이면 제외한다.
-            # 첨부 청크처럼 해당 필드 자체가 없는 경우(None)는 구분이 불가능하니 그대로
-            # 통과시킨다(완벽하진 않지만, 본문 레벨의 명백한 교차오염은 확실히 막는다).
+            # 첨부 청크처럼 해당 필드 자체가 없는 경우(None)는 아래 부모 조회로 별도 확인한다.
             # 같은 버그를 연도 필터로도 재현 확인("2024년에 보안 관련 신청된 자료" →
-            # 2016년 레코드도 섞임) — 역할필드(요청자 등)는 콤마 다중값이라 단순 값비교가
-            # 틀릴 수 있어 제외하고, 단일값 필드만 체크한다.
+            # 2016년 레코드도 섞임) — 역할필드(요청자 등)는 바로 아래서 별도로(콤마 다중값
+            # 고려한 부분 문자열 방식으로) 체크하므로 여기서는 제외한다.
             if any(
                 getattr(analysis.filters, f, None)
                 and payload.get(f)
@@ -1562,6 +1572,38 @@ def _search(
                 for f in ("기관명", "연도", "통계종류", "수출입구분", "심의결과", "차수")
             ):
                 continue
+            # 첨부 청크는 메타필드가 전혀 없어(None) 위 체크 자체가 통과되므로, 기관명이나
+            # 역할필드 조건이 있을 때만 부모 레코드를 조회해 실제 값으로 검증한다.
+            effective = payload
+            if analysis.filters.기관명 and not payload.get("기관명") or any(
+                getattr(analysis.filters, f, None) and not payload.get(f) for f in _ROLE_FIELDS_FOR_SCAN
+            ):
+                base_type = _BASE_TYPE_OF.get(payload.get("데이터유형"))
+                if base_type:
+                    cache_key = (base_type, payload.get("원본ID"))
+                    if cache_key not in attachment_org_cache:
+                        parents = find_by_type_and_source(base_type, payload.get("원본ID"), limit=1)
+                        attachment_org_cache[cache_key] = parents[0] if parents else None
+                    parent = attachment_org_cache[cache_key]
+                    if parent:
+                        effective = parent
+            if analysis.filters.기관명 and effective.get("기관명") and effective.get("기관명") != analysis.filters.기관명:
+                continue
+            # 역할필드(요청자/제공자/담당자/결재자)는 "김인태, 전봉석"처럼 콤마로 여러 명이
+            # 저장될 수 있어 부분 문자열 포함 여부로 확인한다. 이 값비교 자체가 기존에 빠져
+            # 있어서, 역할필드가 있는 질문에서 흔한 키워드("계약" 등)가 역할 조건과 무관하게
+            # 전부 매칭되는 훨씬 심각한 지어내기가 재현됨(2026-10-22 — "박민우가 담당한 계약
+            # 관련 자료"에 박민우와 무관한 24건이 "확인된 자료"로 섞임, 실제 담당 1건뿐).
+            # 질문에 역할필드 조건이 하나라도 있으면, 그중 하나라도 실제 값과 일치해야 통과
+            # — 그 역할 개념 자체가 없는 메뉴(값이 None)는 검증 불가하므로 제외한다.
+            role_filters = [
+                (f, getattr(analysis.filters, f, None)) for f in _ROLE_FIELDS_FOR_SCAN
+            ]
+            if any(v for _, v in role_filters):
+                if not any(
+                    v and effective.get(f) and v in str(effective.get(f)) for f, v in role_filters
+                ):
+                    continue
             key = _pool_key(payload)
             scan_confirmed_keys.add(key)
             scan_confirmed_files.add(_file_identity(payload))
