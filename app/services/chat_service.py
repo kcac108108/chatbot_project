@@ -1902,6 +1902,20 @@ _THRESHOLD_CONDITION_RE = re.compile(r"(이상|이하|초과|미만|넘는|넘�
 # 담을 방법이 없다(2026-10-15 즉흥 테스트로 발견, 같은 전체이력 반복 패턴 재현).
 _NEGATIVE_CONDITION_RE = re.compile(r"(없는\s*(거|것|건)|이\s*아닌|아닌\s*(거|것|건))")
 
+# "제공주기가 반기인거 있어?"/"전송방식이 공문인거"처럼 자유텍스트 세부항목(제공주기·
+# 전송방식·요청구분 등 FilterExtraction에 구조화 필드가 아예 없는 값) 조건도 같은 계열
+# — 연도/임계값/부정조건과 달리 담을 구조화 필드 자체가 없어 LLM이 통째로 비워버리고
+# "조건 없음"으로 오판, 틀린 전체이력 통짜 답이 그대로 나온다(2026-10-22 즉흥 테스트로
+# 재현 — 한국환경공단 83건 중 실제로는 0건/31건인 제공주기 조건에도 매번 "83건"
+# 반복). "N이/가 M인 거/것/건" 구조(한국어 서술형 narrowing 질문의 일반적 형태) 자체를
+# 신호로 삼아 전체이력 우회를 막는다 — 완벽한 값 필터링까지는 보장 못 해도 최소한
+# 조건을 완전히 무시한 반복 답변만큼은 피한다. "전송방식이 TRASS Upload인거"처럼 값에
+# 영문 단어 사이 공백이 섞이는 경우("TRASS Upload")도 있어 값 부분은 공백을 허용하되
+# lazy(non-greedy)로 매칭해 "~인(것|거|건)" 경계를 최대한 좁게 잡는다.
+_ATTRIBUTE_VALUE_CONDITION_RE = re.compile(
+    r"[가-힣]{2,10}\s*(?:이|가)\s*[가-힣A-Za-z0-9][가-힣A-Za-z0-9\s]{0,19}?\s*인\s*(?:것|거|건)"
+)
+
 
 def _looks_like_recent_ingestion_question(question: str) -> bool:
     if _YEAR_MENTION_RE.search(question):
@@ -2120,6 +2134,7 @@ def _looks_like_full_org_history_question(text: str, filters: FilterExtraction) 
         _YEAR_MENTION_RE.search(text)
         or _THRESHOLD_CONDITION_RE.search(text)
         or _NEGATIVE_CONDITION_RE.search(text)
+        or _ATTRIBUTE_VALUE_CONDITION_RE.search(text)
     ):
         return False
     # "거기 말고 다른 기관 이력도 있어?"처럼 직전 기관을 명시적으로 제외하는 질문도 "이력"
