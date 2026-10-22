@@ -1429,11 +1429,19 @@ def _merge_by_display_identity(
 
 
 def _search(
-    analysis: QueryAnalysis, carried_over: list[dict], allowed_data_types: set[str] | None = None
+    analysis: QueryAnalysis,
+    carried_over: list[dict],
+    allowed_data_types: set[str] | None = None,
+    force_narrowing: bool = False,
 ) -> tuple[list[dict], bool]:
     vector = embed_texts([analysis.standalone_question])[0]
     query_filter = _build_filter(analysis.filters, allowed_data_types)
-    search_limit = FILTERED_SEARCH_LIMIT if _has_narrowing_filter(analysis.filters) else CHAT_TOP_K
+    # "A 말고" 류 제외 조건(기관명/역할필드/연도)은 filters가 아니라 질문 원문에서 정규식으로
+    # 뽑아 _search() 반환 이후 결과를 걸러내는 방식이라, 여기선 narrowing 신호로 전혀 안
+    # 보임(filters엔 그 값이 없거나 오히려 None임) — "외부요청 8건 중 2024년 아닌 거"처럼
+    # 전체가 소수인 메뉴에서도 top-6만 가져와 2건이 조용히 누락되는 문제가 실측 확인됨
+    # (2026-10-22). 호출부가 제외 조건 존재 여부를 미리 판단해 넘겨주면 top-20으로 넓힌다.
+    search_limit = FILTERED_SEARCH_LIMIT if (_has_narrowing_filter(analysis.filters) or force_narrowing) else CHAT_TOP_K
 
     results = vector_search(vector, query_filter, search_limit)
     limit_used = search_limit
@@ -2500,7 +2508,16 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         excluded_org = analysis.filters.기관명
         analysis.filters = analysis.filters.model_copy(update={"기관명": None})
 
-    results, possibly_truncated, data_type_relaxed = _search(analysis, carried_over, allowed_data_types)
+    _pre_force_narrowing = bool(
+        excluded_org
+        or _excluded_role_values(question)
+        or _excluded_role_values(analysis.standalone_question)
+        or _excluded_years(question)
+        or _excluded_years(analysis.standalone_question)
+    )
+    results, possibly_truncated, data_type_relaxed = _search(
+        analysis, carried_over, allowed_data_types, force_narrowing=_pre_force_narrowing
+    )
 
     if excluded_org:
         # 첨부 청크는 기관명 필드 자체가 없어(None) 이 비교를 그냥 통과하는데, 화면에
