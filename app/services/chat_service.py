@@ -243,6 +243,32 @@ _ATTACHMENT_METADATA_FIELDS = (
 _ROLE_FIELDS_FOR_SCAN = ("요청자", "제공자", "담당자", "결재자")
 
 
+def _effective_field(payload: dict, field: str, cache: dict) -> object | None:
+    """payload 자신에게 그 필드 값이 있으면 그대로, 없으면(첨부 청크 — 기관명·연도·
+    통계종류 등 메타데이터가 전부 부모 레코드에만 있음, 2026-10-13 확정) 부모 레코드를
+    조회해 가져온다. `_effective_org_for_exclusion`/`_attachment_metadata_header`와
+    동일한 (base_type, 원본ID)→parent 캐시 패턴 — 2026-10-22 발견: 연도/차수/심의결과/
+    통계종류/수출입구분 제외 후처리 필터(`r.get("연도") not in excluded_years` 등)가
+    이 부모조회 없이 raw payload만 봐서, 첨부 청크는 그 필드가 항상 None이라 "제외
+    조건을 만족한다"고 조용히 통과시켜버리는 버그가 있었음("한국환경공단 관련 첨부파일
+    중에 2016년 아닌거 있어?"가 2016년 첨부 7건을 전부 "2016년이 아닌 것으로 확인됨"
+    이라며 거꾸로 보여줌 — 심지어 그 중 2건은 2016년 통관기초통계로, 직전에 고친
+    통계종류 제외 버그까지 동시에 재현된 최악의 사례)."""
+    value = payload.get(field)
+    if value is not None:
+        return value
+    base_type = _BASE_TYPE_OF.get(payload.get("데이터유형"))
+    if not base_type:
+        return None
+    source_id = payload.get("원본ID")
+    cache_key = (base_type, source_id)
+    if cache_key not in cache:
+        parents = find_by_type_and_source(base_type, source_id, limit=1)
+        cache[cache_key] = parents[0] if parents else None
+    parent = cache[cache_key]
+    return parent.get(field) if parent else None
+
+
 def _attachment_metadata_header(payload: dict, cache: dict) -> str:
     base_type = _BASE_TYPE_OF.get(payload.get("데이터유형"))
     if not base_type:
@@ -2960,12 +2986,25 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     if excluded_trade_types and analysis.filters.수출입구분 in excluded_trade_types:
         analysis.filters = analysis.filters.model_copy(update={"수출입구분": None})
 
+    # "2016년 아닌거 있어?" 같은 연도 제외도 차수와 완전히 같은 문제를 겪는다(2026-10-22
+    # 발견, 가장 심각한 사례) — `filters.연도`는 포함할 값만 담을 수 있는데, LLM이 "아닌"을
+    # 못 이해하고 제외 대상 그 연도를 그대로 포함 필터로 채워버림(2016년 실재하는 값이라
+    # `_build_filter`의 "알려지지 않은 값 제거" 방어도 안 걸림). 그 결과 검색 자체가 "2016년
+    # 것만" 정확매칭으로 좁혀지고, 뒤이은 제외 후처리가 그 2016년 결과를 전부 걷어내 0건이
+    # 되는 식으로 깨짐 — 더 심각한 건, 이 가드 없이도 `_search()`가 돌기 전까지는 이 사실이
+    # 전혀 드러나지 않아서(아래 `excluded_years` 변수는 검색 후 후처리에만 쓰이는 줄 알았으나
+    # 실은 검색 전에 filters.연도를 지워야 하는 차수와 동일한 선행 조건이었음을 놓쳤던 것).
+    # 여기서 미리 계산해두고(아래 line ~3126의 `excluded_years`와 동일한 값, 중복 계산이지만
+    # 그쪽은 검색 후 결과 필터링용이라 그대로 유지) 차수와 동일하게 clear한다.
+    _excluded_years_precheck = _excluded_years(_carried_text) or _excluded_years(analysis.standalone_question)
+    if _excluded_years_precheck and analysis.filters.연도 in _excluded_years_precheck:
+        analysis.filters = analysis.filters.model_copy(update={"연도": None})
+
     _pre_force_narrowing = bool(
         excluded_org
         or _excluded_role_values(_carried_text)
         or _excluded_role_values(analysis.standalone_question)
-        or _excluded_years(_carried_text)
-        or _excluded_years(analysis.standalone_question)
+        or _excluded_years_precheck
         or excluded_rounds
         or excluded_results
         or excluded_stat_group
@@ -3091,36 +3130,57 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         if len(_excluded_filtered) < len(results):
             results = _excluded_filtered
 
+    # 날짜 필터링+아래 5개 제외 필터가 첨부 청크의 부모 레코드를 조회할 때 쓰는 캐시 —
+    # 아래 _attachment_metadata_header도 같은 (base_type, source_id)→parent 캐시
+    # 구조라 그대로 공유해 중복 조회를 피한다(선언을 여기로 앞당김, 원래는 context_blocks
+    # 생성부에서만 선언됨).
+    _metadata_header_cache: dict = {}
+
     excluded_years = _excluded_years(_carried_text) or _excluded_years(analysis.standalone_question)
     if excluded_years:
-        _year_excluded_filtered = [r for r in results if r.get("연도") not in excluded_years]
+        # 2026-10-22 발견: 첨부 청크는 "연도" 등 메타데이터 필드가 전부 None이라
+        # (2026-10-13 확정 — 메타데이터는 부모 레코드에만 있음) r.get()으로 직접 보면
+        # 제외 조건을 항상 만족하는 것처럼 조용히 통과해버림("2016년 아닌거"가 2016년
+        # 첨부 7건을 전부 "2016년이 아님"이라며 거꾸로 보여주는 자기모순 재현됨) —
+        # _effective_field로 부모 레코드까지 확인해야 정확히 걸러짐.
+        _year_excluded_filtered = [
+            r for r in results
+            if _effective_field(r, "연도", _metadata_header_cache) not in excluded_years
+        ]
         if len(_year_excluded_filtered) < len(results):
             results = _year_excluded_filtered
 
     if excluded_rounds:
-        _round_excluded_filtered = [r for r in results if r.get("차수") not in excluded_rounds]
+        _round_excluded_filtered = [
+            r for r in results
+            if _effective_field(r, "차수", _metadata_header_cache) not in excluded_rounds
+        ]
         if len(_round_excluded_filtered) < len(results):
             results = _round_excluded_filtered
 
     if excluded_results:
-        _result_excluded_filtered = [r for r in results if r.get("심의결과") not in excluded_results]
+        _result_excluded_filtered = [
+            r for r in results
+            if _effective_field(r, "심의결과", _metadata_header_cache) not in excluded_results
+        ]
         if len(_result_excluded_filtered) < len(results):
             results = _result_excluded_filtered
 
     if excluded_stat_group:
-        _stat_excluded_filtered = [r for r in results if r.get("통계종류") not in excluded_stat_group]
+        _stat_excluded_filtered = [
+            r for r in results
+            if _effective_field(r, "통계종류", _metadata_header_cache) not in excluded_stat_group
+        ]
         if len(_stat_excluded_filtered) < len(results):
             results = _stat_excluded_filtered
 
     if excluded_trade_types:
-        _trade_excluded_filtered = [r for r in results if r.get("수출입구분") not in excluded_trade_types]
+        _trade_excluded_filtered = [
+            r for r in results
+            if _effective_field(r, "수출입구분", _metadata_header_cache) not in excluded_trade_types
+        ]
         if len(_trade_excluded_filtered) < len(results):
             results = _trade_excluded_filtered
-
-    # 날짜 필터링이 첨부 청크의 부모 레코드를 조회할 때 쓰는 캐시 — 아래 _attachment_
-    # metadata_header도 같은 (base_type, source_id)→parent 캐시 구조라 그대로 공유해
-    # 중복 조회를 피한다(선언을 여기로 앞당김, 원래는 context_blocks 생성부에서만 선언됨).
-    _metadata_header_cache: dict = {}
 
     if analysis.filters.신청일이후 or analysis.filters.신청일이전:
         results = [
