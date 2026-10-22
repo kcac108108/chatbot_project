@@ -808,7 +808,7 @@ _KNOWN_STATISTICS_TYPES = {
 
 
 def _build_filter(
-    extracted: FilterExtraction, allowed_data_types: set[str] | None = None
+    extracted: FilterExtraction, allowed_data_types: set[str] | None = None, question_text: str = ""
 ) -> qmodels.Filter | None:
     values = {}
     for field, value in extracted.model_dump(exclude_none=True).items():
@@ -874,7 +874,15 @@ def _build_filter(
     # 나와버려서 기존의 "0건이면 데이터유형 제거 후 재검색" 방어도 발동하지 않음). 키워드
     # 스캔(scan_text_contains)은 어차피 데이터유형과 무관하게 전수 스캔하니, 여기서 벡터
     # 검색까지 굳이 좁힐 필요가 없다 — 키워드가 있으면 데이터유형은 신뢰하지 않는다.
-    if extracted.키워드:
+    # ⚠️ 단, "내부자료 중에 보안점검 관련 글 있어?"처럼 사용자가 메뉴 이름을 질문에 직접
+    # 써서 명시한 경우까지 이 규칙으로 뭉개버리면, 벡터 검색이 데이터유형 제약 없이 전체
+    # 컬렉션을 훑어 완전히 무관한 다른 메뉴 레코드(흔한 보일러플레이트 문구 등으로 우연히
+    # 키워드와 매칭된 것)를 "보안점검 관련 자료"라며 보여주는 교차오염이 실측 확인됨
+    # (2026-10-22 — 질문이 "내부자료"를 명시했는데 결과 전부가 신청이력첨부였음). 위
+    # "과신해서 채움" 문제는 LLM이 질문에 없는 메뉴를 스스로 추측해 채우는 경우였지,
+    # 사용자가 실제로 그 메뉴 이름을 말한 경우는 아니었다 — `_MENU_KEYWORDS`로 추출된
+    # 데이터유형의 리터럴 메뉴 이름이 질문 텍스트에 실제로 있으면 신뢰하고 유지한다.
+    if extracted.키워드 and not _confirmed_menu_data_type(data_type_value, question_text):
         data_type_value = None
 
     # 웹 화면에서 사용자가 메뉴를 명시적으로 고정한 경우(allowed_data_types), 그게 최종
@@ -1476,7 +1484,7 @@ def _search(
     force_narrowing: bool = False,
 ) -> tuple[list[dict], bool]:
     vector = embed_texts([analysis.standalone_question])[0]
-    query_filter = _build_filter(analysis.filters, allowed_data_types)
+    query_filter = _build_filter(analysis.filters, allowed_data_types, analysis.standalone_question)
     # "A 말고" 류 제외 조건(기관명/역할필드/연도)은 filters가 아니라 질문 원문에서 정규식으로
     # 뽑아 _search() 반환 이후 결과를 걸러내는 방식이라, 여기선 narrowing 신호로 전혀 안
     # 보임(filters엔 그 값이 없거나 오히려 None임) — "외부요청 8건 중 2024년 아닌 거"처럼
@@ -1604,14 +1612,33 @@ def _search(
     # 정보통신기획평가원 등 무관한 기관 자료가 섞임). 부모 레코드를 조회해 기관명을 직접
     # 확인한다(_build_filter의 2026-10-13 수정과 같은 원리를 스캔 경로에도 적용).
     attachment_org_cache: dict[tuple, dict | None] = {}
+    # "내부자료 중에 보안점검 관련 글 있어?"처럼 사용자가 메뉴를 질문에 직접 명시했는데도
+    # 스캔(scan_text_contains)은 allowed_data_types(사이드바 스코프)만 보고 analysis.filters.
+    # 데이터유형은 전혀 반영 안 해서, 완전히 무관한 다른 메뉴의 레코드(흔한 보일러플레이트
+    # 문구로 우연히 키워드와 글자 그대로 일치하는 것)가 섞여 나오는 교차오염이 실측 확인됨
+    # (2026-10-22 — "보안점검"이 여러 신청이력첨부 계약서의 표준 보안조항에 그대로 등장해
+    # 글자 매칭 자체는 정당한데도, 질문이 명시한 "내부자료"와는 무관). `_build_filter`와
+    # 동일한 `_confirmed_menu_data_type`로 메뉴가 확인되면, 그 메뉴 본문+첨부 변형으로
+    # 스캔 결과도 좁힌다(첨부까지 포함해야 하는 이유: 내부자료의 진짜 유일한 매치가
+    # 본문이 아니라 내부자료첨부였음 — 메뉴 범위는 원래부터 본문+첨부를 함께 가리킴).
+    confirmed_scan_type = _confirmed_menu_data_type(analysis.filters.데이터유형, analysis.standalone_question)
+    # ⚠️ 루프 안에서 사후 필터링(스캔이 다 끝난 뒤 걸러내기)만으로는 부족했다 — "보안점검"
+    # 전체 183건 중 174건이 신청이력첨부라 scan_text_contains의 limit(30)이 전부 그
+    # 노이즈로 채워져, 내부자료첨부의 유일한 진짜 매치(1건)는 애초에 scan 결과 자체에
+    # 들어오지도 못했다(2026-10-22 실측). scan_text_contains에 data_types를 직접 넘겨
+    # Qdrant 스캔 단계에서부터 걸러야 noise가 limit을 잠식하지 않는다.
+    scan_data_types = None
+    if allowed_data_types is not None or confirmed_scan_type:
+        scan_data_types = set(allowed_data_types or set())
+        if confirmed_scan_type:
+            confirmed_set = {confirmed_scan_type, _ATTACHMENT_TYPE_OF.get(confirmed_scan_type)}
+            scan_data_types = (scan_data_types & confirmed_set) if allowed_data_types is not None else confirmed_set
     if keyword:
         scan_ran = True
-        scan_results = scan_text_contains(keyword, KEYWORD_SCAN_LIMIT)
+        scan_results = scan_text_contains(keyword, KEYWORD_SCAN_LIMIT, scan_data_types)
         if len(scan_results) >= KEYWORD_SCAN_LIMIT:
             scan_incomplete = True
         for payload in scan_results:
-            if allowed_data_types is not None and payload["데이터유형"] not in allowed_data_types:
-                continue
             # 기관명이 필터로 걸려있는데(예: "한국환경공단 신청이력 중 수수료 0원인거") "수수료"
             # 처럼 흔한 키워드는 완전히 무관한 다른 기관(국민건강보험공단 등)의 레코드도 전수
             # 스캔에 대거 걸려서, 기관명 조건이 사실상 무시되고 섞여 나오는 교차오염이 즉흥
@@ -2079,6 +2106,19 @@ _FIELD_TOPIC_PARTICLE = {"업체명": "은", "담당자": "는", "결재자": "�
 # 재확인한다 (언급이 전혀 없는데도 지어내거나, 대화 후속 질문에서 감지를 놓치는 경우가
 # 반복 재현됨 — "명시 안 됐으면 null" 지침이 프롬프트만으로는 지켜지지 않음)
 _MENU_KEYWORDS = {"외부요청": "외부요청", "심의위원회": "심의위원회", "내부자료": "내부자료"}
+
+
+def _confirmed_menu_data_type(data_type_value: str | None, question_text: str) -> str | None:
+    """LLM이 뽑은 데이터유형이 질문 원문에 그 메뉴 이름을 실제로 포함하는지 확인한다.
+    "내부자료 중에 보안점검 관련 글 있어?"처럼 사용자가 메뉴를 직접 명시한 경우만
+    신뢰하고, 그 외(기관정보/신청이력처럼 _MENU_KEYWORDS에 없는 값, 또는 명시 안 된
+    경우)는 None을 반환해 "LLM이 추측해 채웠을 수 있다"고 보수적으로 처리한다."""
+    keyword = _MENU_KEYWORDS.get(data_type_value)
+    if keyword and question_text and keyword in question_text:
+        return data_type_value
+    return None
+
+
 _LIST_FIELD_KEYWORDS = {"담당자": ("담당자",), "결재자": ("결재자",), "업체명": ("업체", "기관", "회사")}
 _LIST_ASK_WORDS = ("목록", "리스트", "어디", "뭐가 있", "누가 있", "뭐 있", "누구")
 # "몇 개"/"몇 명"은 넣지 않는다 — "총 몇 개야" 같은 집계 질문에도 흔히 쓰이는 표현이라

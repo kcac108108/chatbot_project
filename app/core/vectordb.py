@@ -129,7 +129,7 @@ def find_by_type_and_fields(data_type: str, fields: dict[str, str], limit: int =
     return [p.payload for p in points]
 
 
-def scan_text_contains(keyword: str, limit: int) -> list[dict]:
+def scan_text_contains(keyword: str, limit: int, data_types: set[str] | None = None) -> list[dict]:
     """벡터 유사도가 아니라 본문에 특정 단어가 실제로 포함됐는지 전수 스캔한다.
     한글은 조사·복합어 때문에 Qdrant 내장 전문검색 토크나이저로는 매칭이 불안정해,
     지금 규모(수백~천 단위 청크)에서는 파이썬 쪽 부분 문자열 검사가 더 안정적이다.
@@ -139,7 +139,13 @@ def scan_text_contains(keyword: str, limit: int) -> list[dict]:
     첨부 청크는 원문(text)뿐 아니라 사전 생성된 요약(요약)도 같이 본다 — 원문은 표·수치
     나열이라 특정 단어가 문자 그대로는 없는데 요약에서는 그 개념으로 풀어써서(예: 원문엔
     인증서 파일 목록만 있고 "SSL 인증서"라는 표현 자체는 요약에만 등장) 원문만 보면 놓치는
-    사례가 재현됨(2026-09-21)."""
+    사례가 재현됨(2026-09-21).
+    data_types를 주면 그 데이터유형들만 스캔 결과로 센다(scan_field_contains의 data_type과
+    같은 목적) — 흔한 보일러플레이트 문구(예: 계약서 표준 보안조항 "보안점검")가 특정
+    메뉴(신청이력첨부 등)에 압도적으로 많으면, 사용자가 질문에 다른 메뉴("내부자료")를
+    명시했는데도 그 노이즈가 limit을 먼저 채워버려 정작 찾아야 할 소수 레코드가 아예
+    scan 범위 밖으로 밀리는 문제가 재현됨(2026-10-22 — "보안점검" 전체 183건 중
+    174건이 신청이력첨부, 내부자료첨부는 단 1건이라 limit=30 안에 전혀 안 들어옴)."""
     matches: list[dict] = []
     offset = None
     while True:
@@ -151,6 +157,8 @@ def scan_text_contains(keyword: str, limit: int) -> list[dict]:
             with_vectors=False,
         )
         for p in points:
+            if data_types is not None and p.payload.get("데이터유형") not in data_types:
+                continue
             text = p.payload.get("text", "")
             summary = p.payload.get("요약", "") or ""
             if keyword_matches(keyword, text, summary):
