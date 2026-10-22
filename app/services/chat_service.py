@@ -764,7 +764,13 @@ def _carried_exclusion_text(question: str, history: list[dict]) -> str:
     회귀가 실측으로 발견됨(검증 중 확인) — "그 중에/이 중에" 류 좁고 명시적인 패턴으로
     범위를 제한해 이 오탐을 피한다. 전체 히스토리를 다 뒤지면 2026-10-20에 이미 확인된
     "오래된 조건이 무관한 후속 턴에 영구 재적용되는" 문제가 재발하므로, 직전 턴 하나로도
-    범위를 좁혀 안전하게 한다."""
+    범위를 좁혀 안전하게 한다.
+
+    처음엔 심의결과/통계종류/수출입구분 3곳에만 적용했는데, "3차 아닌거 있어?" 다음 "그
+    중에 OO가 요청한거"처럼 narrowing 후속질문에서 연도·차수·기관명·역할필드 제외는 여전히
+    풀려서 3차 레코드가 그대로 섞여 나오는 동일 문제가 실측 확인됨(2026-10-22, 같은 날
+    이어서) — 6개 제외 탐지 전부(기관명/역할필드/연도/차수/심의결과/통계종류/수출입구분)에
+    일관되게 적용한다."""
     if not _LIST_NARROWING_CONTINUATION_RE.search(question):
         return question
     user_turns = [m["content"] for m in history if m.get("role") == "user"]
@@ -2895,9 +2901,15 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 세션 맥락으로 해석해 그 제외 대상 기관명을 filters.기관명에 그대로 채워버린다(2026-10-20
     # 즉흥 테스트로 재현). 검색을 그 기관명으로 좁히면 제외하려는 대상만 나오는 정반대
     # 결과가 되므로, 검색 전에 필터에서 기관명을 빼고 검색 후 결과에서 그 기관명을 제거한다.
+    # ⚠️ "그 중에" 류 narrowing 후속질문에서도 직전 턴의 제외 조건을 유지해야 한다
+    # (2026-10-22 — 3차/연도 제외는 이 확장을 먼저 적용했는데, 기관명·역할필드 제외는
+    # 아직 "그 중에"를 못 받아서, "3차 아닌거" 다음 "그 중에 OO가 요청한거"처럼 narrowing
+    # 후속질문에서 제외가 풀려 3차 레코드가 그대로 섞여 나오는 걸 실측으로 확인함). 아래
+    # `_carried_exclusion_text(question, history)`를 6개 제외 탐지 전부에 일관되게 적용한다.
+    _carried_text = _carried_exclusion_text(question, history)
     org_excluded = bool(
         analysis.filters.기관명
-        and (_has_genuine_exclusion_phrase(question) or _has_genuine_exclusion_phrase(analysis.standalone_question))
+        and (_has_genuine_exclusion_phrase(_carried_text) or _has_genuine_exclusion_phrase(analysis.standalone_question))
     )
     excluded_org = None
     if org_excluded:
@@ -2910,7 +2922,7 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # (2026-10-22 — "대한무역투자진흥공사(1차/3차만 존재) 안건 중에 1차 빼고"가
     # `차수=2`로 지어내져 AND 필터가 항상 0건). 제외 표현이 감지되면 LLM이 뽑은 값을
     # 아예 신뢰하지 않고 필터에서 제거, 검색 후 결과에서 제외 대상만 걸러낸다.
-    excluded_rounds = _excluded_rounds(question) or _excluded_rounds(analysis.standalone_question)
+    excluded_rounds = _excluded_rounds(_carried_text) or _excluded_rounds(analysis.standalone_question)
     if excluded_rounds and analysis.filters.차수 is not None:
         analysis.filters = analysis.filters.model_copy(update={"차수": None})
 
@@ -2919,8 +2931,7 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # LLM이 하필 제외 대상 그 값 자체를 유효한 값으로 채우면(예: "원안수용") 정반대로
     # 좁혀버리는 사고를 막기 위해 명시적으로도 지운다.
     excluded_results = (
-        _excluded_committee_results(_carried_exclusion_text(question, history))
-        or _excluded_committee_results(analysis.standalone_question)
+        _excluded_committee_results(_carried_text) or _excluded_committee_results(analysis.standalone_question)
     )
     if excluded_results and analysis.filters.심의결과 in excluded_results:
         analysis.filters = analysis.filters.model_copy(update={"심의결과": None})
@@ -2932,8 +2943,7 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # "아닌" 나머지 41건과는 정반대). 동의어 그룹(_resolve_statistics_type_group) 전체를
     # 제외 대상으로 확장해 필터링한다.
     excluded_stat_types = (
-        _excluded_statistics_types(_carried_exclusion_text(question, history))
-        or _excluded_statistics_types(analysis.standalone_question)
+        _excluded_statistics_types(_carried_text) or _excluded_statistics_types(analysis.standalone_question)
     )
     excluded_stat_group: set[str] = set()
     for _v in excluded_stat_types:
@@ -2945,17 +2955,16 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 피해가는" 문제(2026-10-22, 같은 날 발견). "수출"이 "수출입"의 유효한 값이라 그대로
     # 포함 필터로 쓰여 정반대 결과를 낸다.
     excluded_trade_types = (
-        _excluded_trade_types(_carried_exclusion_text(question, history))
-        or _excluded_trade_types(analysis.standalone_question)
+        _excluded_trade_types(_carried_text) or _excluded_trade_types(analysis.standalone_question)
     )
     if excluded_trade_types and analysis.filters.수출입구분 in excluded_trade_types:
         analysis.filters = analysis.filters.model_copy(update={"수출입구분": None})
 
     _pre_force_narrowing = bool(
         excluded_org
-        or _excluded_role_values(question)
+        or _excluded_role_values(_carried_text)
         or _excluded_role_values(analysis.standalone_question)
-        or _excluded_years(question)
+        or _excluded_years(_carried_text)
         or _excluded_years(analysis.standalone_question)
         or excluded_rounds
         or excluded_results
@@ -3055,7 +3064,7 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
                     if (r.get("데이터유형"), r.get("원본ID")) != _fee_key
                 ]
 
-    excluded_names = _excluded_role_values(question) or _excluded_role_values(analysis.standalone_question)
+    excluded_names = _excluded_role_values(_carried_text) or _excluded_role_values(analysis.standalone_question)
     # "한국환경공단 말고 다른 기관..."처럼 기관명 제외 질문에서, _EXCLUSION_NAME_RE가
     # "말고" 바로 앞의 2~4글자("공단")를 사람 이름으로 오매칭하는 버그가 실측 확인됨
     # (2026-10-22 — 역할필드가 전부 None인 첨부 청크만 있을 때 아래 _excluded_filtered가
@@ -3082,7 +3091,7 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         if len(_excluded_filtered) < len(results):
             results = _excluded_filtered
 
-    excluded_years = _excluded_years(question) or _excluded_years(analysis.standalone_question)
+    excluded_years = _excluded_years(_carried_text) or _excluded_years(analysis.standalone_question)
     if excluded_years:
         _year_excluded_filtered = [r for r in results if r.get("연도") not in excluded_years]
         if len(_year_excluded_filtered) < len(results):
