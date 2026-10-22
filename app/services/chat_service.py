@@ -553,6 +553,22 @@ _EXCLUSION_NAME_RE = re.compile(
 # 진짜 이름 뒤에 "만"이 붙는 경우는 캡처가 "홍길동만"이라 이 패턴과 다르므로 영향 없음).
 _PRONOUN_WITH_PARTICLE_RE = re.compile(r"^(?:이|그|저)?(?:것|거)만$")
 
+# "수입 말고 수출 관련된거 있어?"에서 "수입"이 사람 이름으로 오매칭돼, 신청이력처럼
+# 요청자/제공자/담당자/결재자 개념 자체가 없는 메뉴의 결과를 전부 걸러내 0건으로 만드는
+# 버그가 실측 확인됨(2026-10-22 — 검색은 정확히 2건을 찾아내는데도 이 오매칭 때문에
+# `excluded_names` 후처리 필터가 "역할필드가 하나도 없다"며 전부 제거, 10/10 결정론적
+# 재현). "거만"(지시대명사+조사) 패턴과 같은 계열 — 통계종류·수출입구분처럼 이 자료 안에서
+# 실제로 쓰이는 알려진 도메인 명사도 사람 이름일 수 없으므로 함께 제외한다.
+_NON_NAME_DOMAIN_WORDS = {"수입", "수출", "수출입"}
+
+
+def _is_non_name_token(name: str) -> bool:
+    if _PRONOUN_WITH_PARTICLE_RE.match(name):
+        return True
+    if name in _NON_NAME_DOMAIN_WORDS or name in _KNOWN_STATISTICS_TYPES:
+        return True
+    return False
+
 
 def _excluded_role_values(text: str) -> list[str]:
     m = _EXCLUSION_NAME_RE.search(text or "")
@@ -561,7 +577,7 @@ def _excluded_role_values(text: str) -> list[str]:
     names = [m.group(1).strip()]
     if m.group(2):
         names.append(m.group(2).strip())
-    return [n for n in names if not _PRONOUN_WITH_PARTICLE_RE.match(n)]
+    return [n for n in names if not _is_non_name_token(n)]
 
 
 def _has_genuine_exclusion_phrase(text: str) -> bool:
@@ -569,7 +585,7 @@ def _has_genuine_exclusion_phrase(text: str) -> bool:
     if not m:
         return False
     names = [m.group(1)] + ([m.group(2)] if m.group(2) else [])
-    return any(not _PRONOUN_WITH_PARTICLE_RE.match(n) for n in names)
+    return any(not _is_non_name_token(n) for n in names)
 
 
 # "건강보험심사평가원 중에 2024년 거만 빼고 알려줘" 같은 연도 제외 질문이 5/5 결정론적으로
