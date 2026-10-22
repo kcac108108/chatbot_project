@@ -2458,7 +2458,7 @@ def _looks_like_list_question(text: str, filters: FilterExtraction) -> bool:
     return bool(field) and any(w in text for w in _LIST_ASK_WORDS)
 
 
-def _list_field_answer(field: str, menu: str | None) -> str:
+def _list_field_answer(field: str, menu: str | None, exclude: str | None = None) -> str:
     table_map = _LIST_FIELD_REGISTRY.get(field)
     if not table_map:
         return AGGREGATION_REFUSAL
@@ -2472,12 +2472,24 @@ def _list_field_answer(field: str, menu: str | None) -> str:
     # 똑같은 이름이 나열되는 문제 방지. "업체명 목록"이 원하는 건 건수가 아니라 고유한 이름들.
     rows = fetch_all(f"SELECT DISTINCT {column} FROM {table} WHERE {column} IS NOT NULL ORDER BY {column}")
     values = [r[column] for r in rows]
+    # "목록에서 OO 빼고 알려줘" — direct SQL 조회라 제외 하나쯤은 완전하고 정확하게 처리
+    # 가능(2026-10-22). 부분 문자열 포함으로 비교해 "한국환경공단"뿐 아니라 그 값이 포함된
+    # 콤마 다중값("김인태, 전봉석" 등)에도 대응한다.
+    excluded_note = ""
+    if exclude:
+        _before = len(values)
+        values = [v for v in values if exclude not in v]
+        if len(values) < _before:
+            excluded_note = f"({exclude} 제외) "
     particle = _FIELD_TOPIC_PARTICLE.get(field, "은")
     # 값 자체가 콤마로 여러 사람을 묶어 저장된 경우("김인태, 전봉석" 등, 담당자 필드에서
     # 흔함)가 있어 ", "로 이어붙이면 실제 고유값 10개인데 11명이 있는 것처럼 헷갈리게
     # 읽힌다(2026-10-13 실측 확인: "총 10개"인데 목록을 세면 11개로 보임). 콤마와 뚜렷이
     # 구분되는 구분자를 써서, 값 내부의 콤마와 목록 구분용 콤마를 혼동하지 않게 한다.
-    return f"{_MENU_LABELS[chosen_menu]}의 {field}{particle} 총 {len(values)}개입니다.\n\n" + " · ".join(values)
+    return (
+        f"{_MENU_LABELS[chosen_menu]}의 {field}{particle} {excluded_note}총 {len(values)}개입니다.\n\n"
+        + " · ".join(values)
+    )
 
 
 # 웹 화면 드릴다운에서 사용자가 메뉴를 명시적으로 고정했을 때(menu_scope), 그 메뉴에 해당하는
@@ -2871,13 +2883,24 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 조건이 있어도 목록조회로 빠지면 안 된다 — "수입 통계 신청한 기관들 알려줘"가 "수입"
     # 조건을 완전히 무시하고 조건 없는 전체 업체명 32개를 마치 답인 것처럼 보여주는 버그가
     # 즉흥 테스트로 재현됨(2026-10-19). 기관명만 체크하던 가드를 모든 narrowing 필드로 확장.
+    # "목록에서 한국환경공단 빼고 알려줘"처럼 특정 기관으로 좁히는 게 아니라 오히려
+    # 제외하는 경우는, 위 2865행 가드(narrowing 의도로 오판 방지)와는 정반대 의도다 —
+    # `_list_field_answer`가 direct SQL 조회라 제외 하나쯤은 완전하고 정확하게 처리할 수
+    # 있는데, 가드가 막아버리면 일반 검색(LLM 요약, top-K 불완전+"일부만" 면책 문구)으로
+    # 떨어져서 더 나쁜 답이 된다(2026-10-22 발견 — 100개 중 19개만 보여주고 "더 있을 수
+    # 있다"고 얼버무림, 틀린 답은 아니지만 완전한 답을 줄 수 있는데 안 주는 꼴).
+    _list_exclude_org = None
+    if analysis.filters.기관명 and (
+        _has_genuine_exclusion_phrase(question) or _has_genuine_exclusion_phrase(analysis.standalone_question)
+    ):
+        _list_exclude_org = analysis.filters.기관명
     _has_other_narrowing_filter = any(
         getattr(analysis.filters, f, None) for f in (*_TEXT_TRACE_FILTER_FIELDS, "차수")
     )
     is_list_question = (
         not analysis.is_aggregation_question
         and not analysis.filters.키워드
-        and not analysis.filters.기관명
+        and (not analysis.filters.기관명 or _list_exclude_org)
         and not _has_other_narrowing_filter
         and (analysis.is_full_list_question or _looks_like_list_question(analysis.standalone_question, analysis.filters))
     )
@@ -2900,7 +2923,7 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
             # 심의위원회 업체명이 나오는 버그가 있었다(2026-10-15 즉흥 테스트로 발견). 텍스트에
             # 메뉴 언급이 전혀 없는 질문("업체 목록 알려줘")에서만 스코프로 폴백한다.
             menu = _resolve_list_menu(analysis.standalone_question) or _MENU_SCOPE_LIST_MENU.get(menu_scope)
-            answer_text = _list_field_answer(field, menu)
+            answer_text = _list_field_answer(field, menu, exclude=_list_exclude_org)
             session_store.append_turn(session_id, question, answer_text)
             return ChatResponse(session_id=session_id, answer=answer_text, sources=[])
         # field를 끝내 못 정했으면(요청자/제공자처럼 전체목록조회 자체를 지원 안 하는 항목)
