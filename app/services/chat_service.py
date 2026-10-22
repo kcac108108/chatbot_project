@@ -2474,6 +2474,18 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         session_store.append_turn(session_id, question, AGGREGATION_REFUSAL)
         return ChatResponse(session_id=session_id, answer=AGGREGATION_REFUSAL, sources=[])
 
+    # "한국환경공단에서 박민우가 담당한거 있어?"처럼 기관명+담당자/결재자 조합은 구조적으로
+    # 항상 모순이다 — 담당자/결재자는 내부자료 전용 필드인데, 내부자료는 기관명 개념 자체가
+    # 없다(2026-08-01에 이미 확정). AND 필터가 항상 0건이라 완화 캐스케이드가 결국 필터를
+    # 전부 지우고, 그 결과 완전히 무관한 벡터 유사도 상위 레코드(엉뚱한 다른 기관)가 노이즈로
+    # 섞여 LLM이 "그 기관에서 그 사람이 담당한"이라고 확신에 차서 지어내는 심각한 사례가
+    # 실측 확인됨(2026-10-22 — "한국환경공단에서 박민우가 담당한 myCTI/한국은행 자료" 등
+    # 매번 다른 틀린 기관을 지어냄, 6/6 결정론적 재현). 요청자/제공자는 외부요청 메뉴 안에서
+    # 기관명과 공존 가능하므로 모순이 아니라 제외한다.
+    if analysis.filters.기관명 and (analysis.filters.담당자 or analysis.filters.결재자):
+        session_store.append_turn(session_id, question, "관련 이력을 찾지 못했습니다.")
+        return ChatResponse(session_id=session_id, answer="관련 이력을 찾지 못했습니다.", sources=[])
+
     # 기관명도 역할필드(요청자 등)와 같은 구조적 한계를 겪는다 — filters.기관명은 "포함할
     # 값"만 담을 수 있어 "A 말고 다른 기관"의 제외 의도를 표현 못 하고, LLM은 "거기"를
     # 세션 맥락으로 해석해 그 제외 대상 기관명을 filters.기관명에 그대로 채워버린다(2026-10-20
