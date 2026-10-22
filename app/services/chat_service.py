@@ -707,6 +707,49 @@ def _extract_application_date(payload: dict, cache: dict | None = None) -> str |
     return None
 
 
+def _extract_year(payload: dict, cache: dict | None = None) -> int | None:
+    """payload 자신의 연도 필드, 없으면(첨부 청크) 부모 레코드의 연도를 대신 본다 —
+    _extract_application_date와 동일한 부모조회+캐시 패턴(같은 cache를 공유해도 안전,
+    둘 다 (base_type, 원본ID)→parent payload 구조로 키가 같다)."""
+    year = payload.get("연도")
+    if year is not None:
+        try:
+            return int(year)
+        except (TypeError, ValueError):
+            pass
+    if cache is not None:
+        base_type = _BASE_TYPE_OF.get(payload.get("데이터유형"))
+        if base_type:
+            source_id = payload.get("원본ID")
+            cache_key = (base_type, source_id)
+            if cache_key not in cache:
+                parents = find_by_type_and_source(base_type, source_id, limit=1)
+                cache[cache_key] = parents[0] if parents else None
+            parent = cache[cache_key]
+            if parent and parent.get("연도") is not None:
+                try:
+                    return int(parent["연도"])
+                except (TypeError, ValueError):
+                    return None
+    return None
+
+
+def _matches_year_threshold(
+    payload: dict, after: str | None, before: str | None, cache: dict | None = None
+) -> bool:
+    """연도가 after 이상·before 이하 범위를 만족하는지 확인한다. 연도 필드 자체가 없는
+    레코드(부모 조회로도 못 찾은 경우)는 판단 근거가 없으므로 안전하게 통과시킨다 —
+    _matches_date_threshold와 동일한 보수적 원칙."""
+    year = _extract_year(payload, cache)
+    if year is None:
+        return True
+    if after and year < int(after):
+        return False
+    if before and year > int(before):
+        return False
+    return True
+
+
 # 최상급("가장 최근/오래된") 질문을 코드가 직접 비교해 해결하는 전략(아래 `ask()`의 recency
 # 블록)이 처음엔 신청이력/외부요청/내부자료(ISO 날짜 필드 있음)만 지원했는데, 심의위원회는
 # 세부항목에 날짜 자체가 없어 "가장 최근 심의위원회 안건은?"류 질문에서 여전히 top-K
@@ -842,22 +885,30 @@ def _build_filter(
         if field == "키워드":
             # 청크 payload의 필드명이 아니라 본문 부분 문자열 검색용 — _search()에서 별도 처리
             continue
-        if field in ("신청일이후", "신청일이전"):
-            # Qdrant payload에 이런 필드 자체가 없다 — 세부항목 리스트 안의 날짜를 코드가
-            # 직접 비교하는 애플리케이션 레벨 후처리 전용 필드다(`_matches_date_threshold`,
-            # `ask()`에서 적용). 그런데도 여기 values에 섞여 들어가면 Qdrant 필터에
-            # FieldCondition(key="신청일이후", ...)로 그대로 추가돼 **항상 0건**이 된다
-            # (2026-10-20 발견 — 비첨부 경로는 0건→단계적 필터 완화를 거쳐 결국 "전체 필터
-            # 제거" 최종 폴백까지 간 뒤 코드 후처리로 우연히 정답을 찾아 증상이 안 보였을
-            # 뿐이고, 첨부 경로는 이 값이 섞인 채로 부모 레코드 조회(아래 "첨부 청크는
-            # 메타데이터가 없다" 블록)까지 들어가 조건에 맞는 부모가 "전혀 없다"고 잘못
-            # 판단해 __no_such_parent__ 안전폴백으로 바로 0건 확정 — "한국환경공단 관련
-            # 첨부파일 중 2024년 이후 등록된거"가 실제로 있는데도 17건 전부 못 찾음).
+        if field in ("신청일이후", "신청일이전", "연도이후", "연도이전"):
+            # Qdrant payload에 이런 필드 자체가 없다 — 세부항목/연도를 코드가 직접 비교하는
+            # 애플리케이션 레벨 후처리 전용 필드다(`_matches_date_threshold`/
+            # `_matches_year_threshold`, `ask()`에서 적용). 그런데도 여기 values에 섞여
+            # 들어가면 Qdrant 필터에 FieldCondition(key="신청일이후", ...)로 그대로 추가돼
+            # **항상 0건**이 된다(2026-10-20 발견 — 비첨부 경로는 0건→단계적 필터 완화를
+            # 거쳐 결국 "전체 필터 제거" 최종 폴백까지 간 뒤 코드 후처리로 우연히 정답을
+            # 찾아 증상이 안 보였을 뿐이고, 첨부 경로는 이 값이 섞인 채로 부모 레코드 조회
+            # (아래 "첨부 청크는 메타데이터가 없다" 블록)까지 들어가 조건에 맞는 부모가 "전혀
+            # 없다"고 잘못 판단해 __no_such_parent__ 안전폴백으로 바로 0건 확정 — "한국환경
+            # 공단 관련 첨부파일 중 2024년 이후 등록된거"가 실제로 있는데도 17건 전부 못
+            # 찾음). 연도이후/이전도 2026-10-22에 동일한 이유로 추가.
             continue
         # 구조화 출력이 값 없음을 실제 null 대신 문자열 "null" 등으로 채우는 경우 방어
         if _is_nullish(value):
             continue
         values[field] = value
+
+    # "2020년 이후"처럼 연도 범위 조건이 있으면, LLM이 동시에 채운 단일값 `연도`(예: '2020')는
+    # 정확매칭으로 그 해 하나만 남겨 범위의 나머지(2021년 이후 등)를 가린다 — 범위가 더
+    # 구체적이고 신뢰할 수 있으니 그쪽을 우선한다(2026-10-22, 심의위원회 "2020년 이후" 질문이
+    # ground truth 5건 중 1건만 반환되던 버그).
+    if extracted.연도이후 or extracted.연도이전:
+        values.pop("연도", None)
 
     # "제공불가"/"원안수용" 같은 심의결과 값이 기관명 필드에 잘못 채워지는 경우를 방어
     # (2026-10-19 발견, _KNOWN_COMMITTEE_RESULTS 정의부 참고) — 그런 기관은 존재하지
@@ -995,6 +1046,8 @@ def _build_filter(
         # 1/3만 걸림). 날짜 조건을 만족하는 부모만 먼저 골라 원본ID 후보 자체를 작게
         # 줄이면(83개→2~3개), 뒤이은 벡터검색 top-K가 그 적은 후보를 전부 커버할 수 있다.
         _date_after, _date_before = extracted.신청일이후, extracted.신청일이전
+        # 연도이후/이전도 날짜 임계값과 동일하게 여기서 부모 레코드에 직접 적용한다(2026-10-22).
+        _year_after, _year_before = extracted.연도이후, extracted.연도이전
 
         source_ids = set()
         if role_only:
@@ -1008,6 +1061,10 @@ def _build_filter(
                         payload, _date_after, _date_before
                     ):
                         continue
+                    if (_year_after or _year_before) and not _matches_year_threshold(
+                        payload, _year_after, _year_before
+                    ):
+                        continue
                     source_ids.add(payload["원본ID"])
         else:
             for base_type in base_types:
@@ -1015,6 +1072,10 @@ def _build_filter(
                 for p in matches:
                     if (_date_after or _date_before) and not _matches_date_threshold(
                         p, _date_after, _date_before
+                    ):
+                        continue
+                    if (_year_after or _year_before) and not _matches_year_threshold(
+                        p, _year_after, _year_before
                     ):
                         continue
                     source_ids.add(p["원본ID"])
@@ -1157,6 +1218,47 @@ def _apply_date_direction_guard(analysis: QueryAnalysis, question: str) -> Query
     return analysis
 
 
+# 2026-10-22 추가 — "2020년 이후인거 알려줘"처럼 연도만으로 범위를 묻는 질문(월/일 없음)은
+# 위 _ABS_DATE_DIRECTION_RE(월/일까지 필수)에 안 걸려 LLM의 단일값 `연도` 필드에만 의존하게
+# 되는데, "이후/이전" 의미를 담지 못해 그 해 하나로만 좁혀지는 문제가 실측 확인됨(심의위원회
+# "2020년 이후" 질문 — ground truth 5건 중 1건만 반환). 날짜와 동일한 전략으로 연도+방향도
+# 코드가 직접 정규식으로 뽑는다. "년" 바로 뒤에 월/일이 오는 전체 날짜 표현과는 이 정규식이
+# 구조적으로 겹치지 않는다(월/일이 끼면 "년" 다음이 방향어가 아니라 "N월"이라 매치 안 됨).
+_YEAR_RANGE_RE = re.compile(r"(\d{4})년\s*(이후|부터|이상|이전|까지|이하)")
+
+
+def _apply_year_range_guard(analysis: QueryAnalysis, question: str) -> QueryAnalysis:
+    matches = _YEAR_RANGE_RE.findall(question)
+    if not matches:
+        return analysis
+    after_year = None
+    before_year = None
+    for year, direction in matches:
+        if direction in ("이후", "부터", "이상"):
+            after_year = year
+        else:
+            before_year = year
+    updates = {}
+    if after_year is not None and analysis.filters.연도이후 != after_year:
+        updates["연도이후"] = after_year
+    if before_year is not None and analysis.filters.연도이전 != before_year:
+        updates["연도이전"] = before_year
+    if len(matches) == 1:
+        if after_year is not None and analysis.filters.연도이전 is not None:
+            updates["연도이전"] = None
+        if before_year is not None and analysis.filters.연도이후 is not None:
+            updates["연도이후"] = None
+        # "~이후/~이전" 단일 방향 범위는 정확매칭 연도 필드가 같이 남아있으면 그 해 하나로만
+        # 좁아진다(신청일이후/이전이 중복된 연도 필드를 지우는 것과 동일한 이유) — 범위를
+        # 명시한 해와 filters.연도가 일치하면 제거한다.
+        matched_year = matches[0][0]
+        if analysis.filters.연도 == matched_year:
+            updates["연도"] = None
+    if updates:
+        analysis.filters = analysis.filters.model_copy(update=updates)
+    return analysis
+
+
 # 대화 이력에 챗봇이 이전에 언급한 세부사실(연도·통계종류·수출입구분·요청자·제공자·
 # 심의결과·담당자·결재자·차수 등)이 있으면, 이번 질문이 그 값으로 좁혀달라고 한 게 아닌데도
 # LLM이 "이미 아는 사실"로 착각해 필터에 채워버리는 경우가 있다(2026-10-15 "결과가 어떻게
@@ -1219,6 +1321,15 @@ def _strip_untraceable_filters(analysis: QueryAnalysis, question: str, history: 
         updates["신청일이후"] = None
     if analysis.filters.신청일이전 and analysis.filters.신청일이전 not in _before_dates:
         updates["신청일이전"] = None
+    # 연도이후/이전도 같은 이유(범위 "조건"은 사실이 아니라 그 질문 하나에만 유효)로 이번
+    # 질문 원문 하나로만 검증한다 — 신청일이후/이전과 동일한 패턴.
+    _after_years, _before_years = set(), set()
+    for year, direction in _YEAR_RANGE_RE.findall(question):
+        (_after_years if direction in ("이후", "부터", "이상") else _before_years).add(year)
+    if analysis.filters.연도이후 and analysis.filters.연도이후 not in _after_years:
+        updates["연도이후"] = None
+    if analysis.filters.연도이전 and analysis.filters.연도이전 not in _before_years:
+        updates["연도이전"] = None
     org_name = analysis.filters.기관명
     # 기관명이 사용자 발화 어디에도 없고 오직 챗봇 자신의 과거 답변에만 등장했을 때도
     # 새어듦이 재현됨(2026-10-21 — "심의위원회 안건 중에 올해 처리된거 알려줘"는 질문에
@@ -1271,6 +1382,7 @@ def _analyze_query(question: str, history: list[dict]) -> QueryAnalysis:
     messages.append({"role": "user", "content": question})
     analysis = _clean_query_analysis(chat_parse(messages, QueryAnalysis))
     analysis = _apply_date_direction_guard(analysis, question)
+    analysis = _apply_year_range_guard(analysis, question)
     analysis = _strip_untraceable_filters(analysis, question, history)
     # "영어로 번역해서 요약해줘" 같은 요청에서 검색용 standalone_question 자체가 번역돼
     # 버리는 경우가 재현됨(2026-10-21, 8회 중 7회) — 데이터가 전부 한국어라 벡터 임베딩
@@ -1302,7 +1414,7 @@ KEYWORD_SCAN_LIMIT = 30
 _NARROWING_FILTER_FIELDS = {
     "기관명", "요청자", "제공자", "담당자", "결재자",
     "연도", "통계종류", "수출입구분", "심의결과", "차수",
-    "신청일이후", "신청일이전",
+    "신청일이후", "신청일이전", "연도이후", "연도이전",
 }
 FILTERED_SEARCH_LIMIT = 20
 
@@ -2295,7 +2407,7 @@ _SUPERLATIVE_SELECTOR_RE = re.compile(r"(제일|가장)\s*.{1,6}?(거|것|건)")
 # 있으면(예: "OO 기관 2020년 이력") 그 조건에 맞는 일반 검색을 그대로 써야 하므로 제외한다.
 _FULL_HISTORY_OTHER_FILTER_FIELDS = (
     "연도", "통계종류", "수출입구분", "요청자", "제공자", "담당자", "결재자", "심의결과", "차수", "키워드",
-    "신청일이후", "신청일이전",
+    "신청일이후", "신청일이전", "연도이후", "연도이전",
 )
 
 
@@ -2826,6 +2938,20 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         if _date_verified:
             results = _date_verified
 
+    # 연도이후/이전도 신청일이후/이전과 동일한 패턴으로 적용한다(2026-10-22) — 연도는 신청일과
+    # 달리 거의 모든 메뉴(기관정보/신청이력/외부요청/내부자료/심의위원회)에 직접 있는 필드라
+    # "검증 불가"로 통과되는 경우는 주로 첨부 청크(부모 조회로도 못 찾을 때)뿐이다.
+    if analysis.filters.연도이후 or analysis.filters.연도이전:
+        results = [
+            r for r in results
+            if _matches_year_threshold(
+                r, analysis.filters.연도이후, analysis.filters.연도이전, _metadata_header_cache
+            )
+        ]
+        _year_verified = [r for r in results if _extract_year(r, _metadata_header_cache) is not None]
+        if _year_verified:
+            results = _year_verified
+
     # 키워드 질문인데 매칭된 자료가 있으면, 매칭 안 된 자료는 컨텍스트에서 아예 제거한다.
     # 예전엔 "[자료 N]은 이미 키워드 포함이 확인됐다"고 LLM에게 안내만 하고 나머지는 그대로
     # 보여줬는데, LLM이 그 안내를 무시하고 매칭 안 된 다른 번호를 엉뚱하게 인용하는 사례가
@@ -2967,6 +3093,7 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # "이미 확인됐다"고 구체적인 날짜를 명시해 재판단을 막는다(2026-08-10 keyword_note와
     # 동일한 패턴 — 막연한 안내만으론 부족해서 실패했던 적이 있으니 구체적 값을 못박는다).
     _date_threshold_set = bool(analysis.filters.신청일이후 or analysis.filters.신청일이전)
+    _year_threshold_set = bool(analysis.filters.연도이후 or analysis.filters.연도이전)
 
     context_blocks = []
     context_chars = 0
@@ -2998,6 +3125,23 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
                     "없다. 날짜 조건을 만족/불만족한다고 단정하지 말고, 이 자료만으로 날짜 조건에 "
                     "대한 no_result 판단을 내리지 마라 — 다른 자료 중 날짜가 확인된 것이 있으면 "
                     "그것을 근거로 답하라.] " + text
+                )
+        if _year_threshold_set:
+            # 연도이후/이전도 신청일이후/이전과 동일한 패턴(2026-10-22) — "이 자료는 연도
+            # 조건을 이미 만족한다"고 구체적으로 명시해, 본문 속 다른 연도 표현(기안연도 등)과
+            # 혼동한 재판단으로 no_result가 나오는 걸 막는다.
+            _rec_year = _extract_year(payload, _metadata_header_cache)
+            if _rec_year is not None:
+                text = (
+                    f"[이 자료의 연도는 {_rec_year}로, 질문의 연도 범위 조건을 이미 만족하는 "
+                    "것으로 코드가 직접 확인했다. 본문 속 다른 연도 표현과 혼동해서 스스로 "
+                    "재판단하지 말고, 이 확인을 그대로 신뢰해 no_result=false로 답하라.] " + text
+                )
+            else:
+                text = (
+                    "[이 자료는 연도 정보가 없어 질문의 연도 범위 조건을 검증할 수 없다. 조건을 "
+                    "만족/불만족한다고 단정하지 말고, 이 자료만으로 no_result 판단을 내리지 마라 "
+                    "— 다른 자료 중 연도가 확인된 것이 있으면 그것을 근거로 답하라.] " + text
                 )
         if _recency_extreme_date:
             _this_date = _extract_recency_key(payload, _recency_base_type, _metadata_header_cache)
