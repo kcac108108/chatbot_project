@@ -1,3 +1,4 @@
+import calendar
 import re
 import uuid
 from datetime import date
@@ -1969,6 +1970,39 @@ def _resolve_relative_year_words(text: str) -> str:
             resolved = resolved.replace(word, f"{this_year + offset}년")
     return resolved
 
+
+# "이번 달/지난달"도 "작년/올해"와 완전히 같은 문제를 겪는다(2026-10-22 발견) — "한국환경공단
+# 이력 중에 이번달에 신청된거 있어?"가 구조화 필터(신청일이후/이전)로 전혀 반영 안 돼, 답변
+# 생성 LLM이 top-K 결과 중 하나를 골라 "이번 달 것"이라고 확신에 차서 제시(2023년 12월 레코드를
+# "이번 달"이라고 답한 사례 확인, 실제 이번 달 해당 레코드는 0건). 연도와 동일한 전략으로
+# 코드가 직접 실제 날짜 범위로 치환한다 — 기존 _ABS_DATE_DIRECTION_RE가 인식하는
+# "YYYY년 M월 D일 부터/사이" 형식으로 변환해, 그 뒤 파이프라인(_apply_date_direction_guard
+# 등)이 평범한 절대 날짜 범위 질문과 동일하게 처리하도록 한다. "이번 달"은 미래 날짜가 있을
+# 수 없으므로 1일~오늘까지로, "지난달"은 이미 끝난 달이므로 1일~말일 전체로 범위를 잡는다.
+_RELATIVE_MONTH_WORDS_THIS = ("이번달", "이번 달", "금월")
+_RELATIVE_MONTH_WORDS_LAST = ("지난달", "전달", "저번달", "저번 달")
+
+
+def _resolve_relative_month_words(text: str) -> str:
+    if not text:
+        return text
+    today = date.today()
+    resolved = text
+    if any(word in resolved for word in _RELATIVE_MONTH_WORDS_THIS):
+        range_text = f"{today.year}년 {today.month}월 1일부터 {today.year}년 {today.month}월 {today.day}일 사이"
+        for word in _RELATIVE_MONTH_WORDS_THIS:
+            resolved = resolved.replace(word, range_text)
+    if any(word in resolved for word in _RELATIVE_MONTH_WORDS_LAST):
+        last_month_year = today.year if today.month > 1 else today.year - 1
+        last_month = today.month - 1 if today.month > 1 else 12
+        last_day = calendar.monthrange(last_month_year, last_month)[1]
+        range_text = (
+            f"{last_month_year}년 {last_month}월 1일부터 {last_month_year}년 {last_month}월 {last_day}일 사이"
+        )
+        for word in _RELATIVE_MONTH_WORDS_LAST:
+            resolved = resolved.replace(word, range_text)
+    return resolved
+
 # "요즘 심의위원회에서 가장 최근에 처리된 안건이 뭐야?"처럼 "가장/제일 최근·최신·오래된"은
 # 날짜 기준 최댓값/최솟값을 묻는 집계 질문인데, is_aggregation_question이 이를 포착하지
 # 못해 top-6/20 검색 결과 중 하나를 LLM이 그냥 골라 "가장 최근"이라고 확신에 차서 답하는
@@ -2325,10 +2359,12 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         session_store.append_turn(session_id, question, MULTI_ORG_COMPARISON_REFUSAL)
         return ChatResponse(session_id=session_id, answer=MULTI_ORG_COMPARISON_REFUSAL, sources=[])
 
-    # 질문분석에는 "작년/올해/내년" 등을 실제 연도로 치환한 사본을 넘긴다 — session_store
-    # 저장·정규식 가드·이후 _answer_question_text 등은 사용자가 입력한 원문(question) 그대로
-    # 유지해, 상대 날짜 치환이 이 함수의 다른 동작에 영향을 주지 않게 한다.
-    analysis = _analyze_query(_resolve_relative_year_words(question), history)
+    # 질문분석에는 "작년/올해/내년"·"이번 달/지난달" 등을 실제 날짜로 치환한 사본을 넘긴다 —
+    # session_store 저장·정규식 가드·이후 _answer_question_text 등은 사용자가 입력한 원문
+    # (question) 그대로 유지해, 상대 날짜 치환이 이 함수의 다른 동작에 영향을 주지 않게 한다.
+    analysis = _analyze_query(
+        _resolve_relative_month_words(_resolve_relative_year_words(question)), history
+    )
     allowed_data_types = _MENU_SCOPE_DATA_TYPES.get(menu_scope)
 
     # "내부자료에서 댓글 달린 글 알려줘"/"~있는거 알려줘"처럼 "~달린/있는" 서술형 수식이
