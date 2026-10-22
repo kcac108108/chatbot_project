@@ -387,7 +387,14 @@ def generate_attachment_detail(data_type: str, source_id: str, filename: str) ->
     if not text.strip():
         return None
     truncated_text = text if len(text) <= _DETAIL_INPUT_LIMIT else text[:_DETAIL_INPUT_LIMIT]
-    parent_context = _attachment_parent_context(data_type, source_id)
+    # ⚠️ _attachment_parent_context()는 attachment type(예: "기관정보첨부")을 받아
+    # _BASE_TYPE_OF로 역변환하는데, 여기서 쓸 수 있는 data_type은 이 함수의 매개변수인
+    # base type(예: "기관정보")이다 — data_type을 그대로 넘기면 _BASE_TYPE_OF.get()이
+    # 항상 None을 반환해(키가 반대 방향) parent_context가 매번 빈 문자열이 되는 버그가
+    # 있었다(2026-10-22 발견, "상세" 기능이 어떤 건이든 부모 기관명·목적을 전혀 못 받고
+    # 있었음 — 어제 검증 땐 _attachment_parent_context를 직접 올바른 인자로 호출해서
+    # 우연히 통과했을 뿐). 이미 위에서 계산해둔 attachment_type을 넘긴다.
+    parent_context = _attachment_parent_context(attachment_type, source_id)
     result = chat_parse(
         messages=[
             {"role": "system", "content": _DETAIL_PROMPT},
