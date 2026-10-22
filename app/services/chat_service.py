@@ -267,12 +267,34 @@ def _find_related_attachments(
     attachment_type = _ATTACHMENT_TYPE_OF.get(data_type)
     if not attachment_type:
         return []
-    chunks = find_by_type_and_source(attachment_type, source_id)
+    # ⚠️ find_by_type_and_source 기본 limit(20)에 그대로 걸리면, 첨부파일이 여러 개고
+    # 각각 또 여러 조각으로 쪼개진 레코드(실측: 7개 파일이 20개 넘는 조각으로 나뉨)에서
+    # 정작 키워드가 실제로 들어있는 조각이 20번째 밖으로 밀려 아예 안 읽혀서, 바로 아래
+    # keyword_matches 필터가 "매칭 0건"으로 오판해 조용히 "전체 목록으로 폴백"해버리는
+    # 버그가 실측 확인됨(2026-10-22 — "내부자료 중에 보안점검 관련 글 있어?"의 관련
+    # 첨부 7개가 keyword 유무와 무관하게 똑같이 전부 나옴, 실제로는 7개 중 1개만
+    # "보안점검"을 포함). 넉넉한 상한(200, KEYWORD_SCAN_LIMIT와 동일 규모)으로 올려
+    # 한 부모 레코드의 모든 조각을 빠짐없이 본다.
+    chunks = find_by_type_and_source(attachment_type, source_id, limit=200)
     # 키워드 검색으로 찾아온 답변인데 그 이력에 첨부가 여러 개(예: 보안점검 zip 8~9개)면,
     # 전부 다 나열해서 사용자가 일일이 열어보며 그 안에서 진짜 관련된 걸 또 찾아야 하는
     # 문제가 있었다(2026-09-23 사용자 지적: "저렇게 많으면 SSL 관련된 내용만 보여줄 수
     # 없어?"). 키워드가 있으면 그 단어가 실제로 포함된 첨부만 추려서 보여준다 — 매칭이
     # 하나도 없으면(요약·본문 표기가 애매해 놓친 경우 대비) 안전하게 전체 목록으로 폴백.
+    # ⚠️ "파일명이 이미 봤으면 건너뛴다"는 중복 제거를 먼저 하고 나서 그 남은 chunk에만
+    # keyword_matches를 적용하면, 큰 파일의 여러 조각 중 키워드가 실제로 들어있는 조각이
+    # 어쩌다 두 번째 이후에 등장할 경우(실측: "TRASS BIG FINANCE" 파일 4조각 중 3번째
+    # 조각에만 "보안점검"이 있음) 그 조각 자체가 중복 제거로 스킵돼 keyword_matches 검사를
+    # 아예 못 받는 버그가 있었다(2026-10-22 — limit=200으로 올려 모든 조각을 가져와도
+    # 여전히 매칭 0건으로 "전체 목록 폴백"됨). 미리보기/표시용 대표 chunk를 고르기 전에,
+    # 파일명별로 "그 파일의 어느 조각이든 하나라도 매치하면" 매치로 보는 집합을 먼저 만든다.
+    matched_filenames: set[str] = set()
+    if keyword:
+        for chunk in chunks:
+            filename = chunk.get("첨부파일명") or "첨부파일"
+            if keyword_matches(keyword, chunk.get("text") or "", chunk.get("요약") or ""):
+                matched_filenames.add(filename)
+
     seen_files: set[str] = set()
     related: list[RelatedAttachment] = []
     matched: list[RelatedAttachment] = []
@@ -296,7 +318,7 @@ def _find_related_attachments(
             preview = chunk.get("요약") or _preview(chunk.get("text"), attachment_type) or ""
             item = RelatedAttachment(첨부파일명=filename, 미리보기=preview)
         related.append(item)
-        if keyword and keyword_matches(keyword, chunk.get("text") or "", chunk.get("요약") or ""):
+        if keyword and filename in matched_filenames:
             matched.append(item)
     # "점검사항 4", "점검사항 1", "점검사항 3"...처럼 Qdrant 조회 순서(저장 순서) 그대로
     # 나와서 파일명에 적힌 번호와 화면 표시 순서가 안 맞는다는 사용자 제보(2026-10-21,
@@ -375,8 +397,13 @@ def generate_attachment_detail(data_type: str, source_id: str, filename: str) ->
     attachment_type = _ATTACHMENT_TYPE_OF.get(data_type)
     if not attachment_type:
         return None
+    # find_by_type_and_source 기본 limit(20)에 걸리면, 부모 레코드에 첨부 여러 개가 각각
+    # 여러 조각으로 쪼개져 있을 때(실측: 7개 파일, 20개 넘는 조각) 이 filename의 조각
+    # 일부 또는 전부가 잘려나가 상세가 불완전하거나 아예 생성이 실패할 수 있다
+    # (2026-10-22, _find_related_attachments의 같은 버그를 고치며 함께 발견) — 동일하게
+    # 넉넉한 상한으로 올린다.
     chunks = [
-        c for c in find_by_type_and_source(attachment_type, source_id)
+        c for c in find_by_type_and_source(attachment_type, source_id, limit=200)
         if (c.get("첨부파일명") or "첨부파일") == filename
     ]
     if not chunks or chunks[0].get("경로전용"):
