@@ -3103,6 +3103,11 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
                     if (r.get("데이터유형"), r.get("원본ID")) != _fee_key
                 ]
 
+    # 역할필드 제외 필터(및 아래 5개 제외 필터)가 첨부 청크의 부모 레코드를 조회할 때
+    # 쓰는 캐시 — _attachment_metadata_header도 같은 (base_type, source_id)→parent
+    # 캐시 구조라 그대로 공유해 중복 조회를 피한다(선언을 여기로 앞당김).
+    _metadata_header_cache: dict = {}
+
     excluded_names = _excluded_role_values(_carried_text) or _excluded_role_values(analysis.standalone_question)
     # "한국환경공단 말고 다른 기관..."처럼 기관명 제외 질문에서, _EXCLUSION_NAME_RE가
     # "말고" 바로 앞의 2~4글자("공단")를 사람 이름으로 오매칭하는 버그가 실측 확인됨
@@ -3120,22 +3125,26 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         # 레코드는 "제외 대상이 아님"을 애초에 검증할 방법이 없으므로, 이름 일치 여부와
         # 무관하게 함께 걸러낸다(제외 조건을 검증 못 하는 레코드를 보여주는 것 자체가
         # "~말고"라는 질문 의도와 안 맞음).
-        _excluded_filtered = [
-            r for r in results
-            if any((r.get(f) or "") for f in _PERSON_ROLE_FIELDS)
-            and not any(
-                name in (r.get(f) or "") for name in excluded_names for f in _PERSON_ROLE_FIELDS
-            )
-        ]
+        # ⚠️ 2026-10-22 추가 발견: 첨부 청크는 raw payload의 역할필드가 항상 None이라
+        # (메타데이터는 부모 레코드에만 있음, 2026-10-13 확정) 위 "검증 불가능하면 제외"
+        # 규칙이 **실제로 검증 가능한** 첨부 레코드까지 전부 걸러버림("박상용 계장 말고
+        # 다른 사람이 담당한 첨부파일 있어?"가 ground truth 13건 존재하는데도 0건 응답).
+        # `_effective_field`로 부모 레코드를 먼저 조회해 진짜 역할필드 값을 확인하고,
+        # 그래도 값이 없을 때만(그 메뉴에 그 역할 개념 자체가 없는 경우) 기존처럼 제외한다.
+        _excluded_filtered = []
+        for r in results:
+            _roles = {
+                f: (_effective_field(r, f, _metadata_header_cache) or "") for f in _PERSON_ROLE_FIELDS
+            }
+            if not any(_roles.values()):
+                continue
+            if any(name in v for name in excluded_names for v in _roles.values()):
+                continue
+            _excluded_filtered.append(r)
         if len(_excluded_filtered) < len(results):
             results = _excluded_filtered
 
-    # 날짜 필터링+아래 5개 제외 필터가 첨부 청크의 부모 레코드를 조회할 때 쓰는 캐시 —
-    # 아래 _attachment_metadata_header도 같은 (base_type, source_id)→parent 캐시
-    # 구조라 그대로 공유해 중복 조회를 피한다(선언을 여기로 앞당김, 원래는 context_blocks
-    # 생성부에서만 선언됨).
-    _metadata_header_cache: dict = {}
-
+    # (아래 5개 제외 필터도 _metadata_header_cache를 그대로 공유 — 위에서 이미 선언됨)
     excluded_years = _excluded_years(_carried_text) or _excluded_years(analysis.standalone_question)
     if excluded_years:
         # 2026-10-22 발견: 첨부 청크는 "연도" 등 메타데이터 필드가 전부 None이라
