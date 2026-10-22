@@ -686,6 +686,35 @@ def _excluded_committee_results(text: str) -> list[str]:
     return excluded
 
 
+def _excluded_statistics_types(text: str) -> list[str]:
+    """"통관기초통계 아닌거 있어?"도 심의결과와 완전히 동일한 구조적 한계를 겪는다
+    (2026-10-22, 이어서 발견) — 질문 속 값이 `_KNOWN_STATISTICS_TYPES`에 실제로 존재하는
+    유효한 값이라(심의결과 버전과 달리 "존재하지 않는 값이라 필터가 깨지는" 경로가 아님),
+    `_build_filter`의 "알려지지 않은 값은 버림" 방어도 안 걸리고 그대로 포함(inclusion)
+    필터로 쓰여 정반대 결과(100% 그 값만 반환)가 나옴 — 심의결과보다 더 위험한 방향의
+    실패(0건이 아니라 질문과 정반대인 확신에 찬 오답). 통계종류는 긴 값이 짧은 값을
+    부분문자열로 포함할 수 있어(예: "통관기초통계"가 "통관기초"를 포함) 긴 값부터
+    매칭하고 이미 매칭된 구간은 건너뛴다. 길이 1인 플레이스홀더("-"/".")는 질문
+    어디서나 우연히 매칭될 위험이 커 기존 리터럴 매칭(2026-10-20)과 동일하게 제외."""
+    if not text:
+        return []
+    excluded: list[str] = []
+    matched_spans: list[tuple[int, int]] = []
+    for value in sorted(_KNOWN_STATISTICS_TYPES, key=len, reverse=True):
+        if len(value) < 2:
+            continue
+        idx = text.find(value)
+        if idx == -1:
+            continue
+        if any(start <= idx < end for start, end in matched_spans):
+            continue
+        tail = text[idx + len(value) : idx + len(value) + 8]
+        if _RESULT_EXCLUSION_TAIL_RE.match(tail):
+            excluded.append(value)
+            matched_spans.append((idx, idx + len(value)))
+    return excluded
+
+
 # 2026-10-20 추가 — "2024-01-01 이후에 등록된 이력 있어?" 류 날짜 임계값 질문에서, 검색은
 # 항상 정답 레코드를 정확히 찾아내는데도 답변 생성 LLM이 "이 날짜가 기준 이후인가"를
 # 판단하는 단계에서 불안정함이 반복 측정으로 확인됨(10회 중 2회만 성공, 특히 기준일에
@@ -2820,6 +2849,21 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     if excluded_results and analysis.filters.심의결과 in excluded_results:
         analysis.filters = analysis.filters.model_copy(update={"심의결과": None})
 
+    # "통관기초통계 아닌거 있어?" — 심의결과와 동일한 문제지만 더 위험한 방향으로 깨진다.
+    # 통계종류는 "통관기초통계"가 실제 유효한 값이라 `_build_filter`의 "알려지지 않은 값
+    # 제거" 방어가 안 걸리고, 그대로 포함(inclusion) 필터로 쓰여 정반대 결과(그 값만 100%
+    # 반환)가 나온다(2026-10-22 발견, 한국환경공단 83건 중 통관기초통계 42건만 반환 —
+    # "아닌" 나머지 41건과는 정반대). 동의어 그룹(_resolve_statistics_type_group) 전체를
+    # 제외 대상으로 확장해 필터링한다.
+    excluded_stat_types = (
+        _excluded_statistics_types(question) or _excluded_statistics_types(analysis.standalone_question)
+    )
+    excluded_stat_group: set[str] = set()
+    for _v in excluded_stat_types:
+        excluded_stat_group.update(_resolve_statistics_type_group(_v))
+    if excluded_stat_group and analysis.filters.통계종류 in excluded_stat_group:
+        analysis.filters = analysis.filters.model_copy(update={"통계종류": None})
+
     _pre_force_narrowing = bool(
         excluded_org
         or _excluded_role_values(question)
@@ -2828,6 +2872,7 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         or _excluded_years(analysis.standalone_question)
         or excluded_rounds
         or excluded_results
+        or excluded_stat_group
     )
     results, possibly_truncated, data_type_relaxed = _search(
         analysis, carried_over, allowed_data_types, force_narrowing=_pre_force_narrowing
@@ -2964,6 +3009,11 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         _result_excluded_filtered = [r for r in results if r.get("심의결과") not in excluded_results]
         if len(_result_excluded_filtered) < len(results):
             results = _result_excluded_filtered
+
+    if excluded_stat_group:
+        _stat_excluded_filtered = [r for r in results if r.get("통계종류") not in excluded_stat_group]
+        if len(_stat_excluded_filtered) < len(results):
+            results = _stat_excluded_filtered
 
     # 날짜 필터링이 첨부 청크의 부모 레코드를 조회할 때 쓰는 캐시 — 아래 _attachment_
     # metadata_header도 같은 (base_type, source_id)→parent 캐시 구조라 그대로 공유해
@@ -3263,6 +3313,12 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
                 "코드가 직접 확인했다. 이 제외 조건을 이미 만족하는 것으로 신뢰하고, 본문에 "
                 "그 사실이 적혀있는지 스스로 재확인하려 하지 마라.] " + text
             )
+        if excluded_stat_types:
+            text = (
+                f"[이 자료의 통계종류는 {'/'.join(excluded_stat_types)} 중 어느 것도 아닌 것으로 "
+                "코드가 직접 확인했다. 이 제외 조건을 이미 만족하는 것으로 신뢰하고, 본문에 "
+                "그 사실이 적혀있는지 스스로 재확인하려 하지 마라.] " + text
+            )
         if context_blocks and context_chars + len(text) > _CONTEXT_CHAR_BUDGET:
             context_truncated = True
             break
@@ -3405,6 +3461,9 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 심의결과 제외도 연도·차수와 동일한 재작성 왜곡을 겪을 수 있어 같은 방어를 적용한다
     # (2026-10-22 발견, "N차 빼고"와 같은 날).
     if excluded_results and not all(v in _answer_question_text for v in excluded_results):
+        _answer_question_text = question
+    # 통계종류 제외도 동일한 재작성 왜곡 방어가 필요하다(2026-10-22, 같은 날 발견).
+    if excluded_stat_types and not all(v in _answer_question_text for v in excluded_stat_types):
         _answer_question_text = question
     messages.append(
         {
