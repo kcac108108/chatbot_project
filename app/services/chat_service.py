@@ -715,6 +715,28 @@ def _excluded_statistics_types(text: str) -> list[str]:
     return excluded
 
 
+def _excluded_trade_types(text: str) -> list[str]:
+    """"수출 아닌거 있어?" — 수출입구분도 통계종류와 완전히 동일한 "유효한 값이라 방어를
+    피해가는" 문제를 겪는다(2026-10-22, 같은 날 발견). "수출"이 "수출입"의 부분문자열이라
+    긴 값부터 매칭해 겹침을 피한다(`_NON_NAME_DOMAIN_WORDS`가 이미 정의해둔 값 집합 재사용
+    — 2026-10-22 ⑩ "도메인 명사가 이름으로 오매칭" 수정에서 쓰던 그 상수)."""
+    if not text:
+        return []
+    excluded: list[str] = []
+    matched_spans: list[tuple[int, int]] = []
+    for value in sorted(_NON_NAME_DOMAIN_WORDS, key=len, reverse=True):
+        idx = text.find(value)
+        if idx == -1:
+            continue
+        if any(start <= idx < end for start, end in matched_spans):
+            continue
+        tail = text[idx + len(value) : idx + len(value) + 8]
+        if _RESULT_EXCLUSION_TAIL_RE.match(tail):
+            excluded.append(value)
+            matched_spans.append((idx, idx + len(value)))
+    return excluded
+
+
 # 2026-10-20 추가 — "2024-01-01 이후에 등록된 이력 있어?" 류 날짜 임계값 질문에서, 검색은
 # 항상 정답 레코드를 정확히 찾아내는데도 답변 생성 LLM이 "이 날짜가 기준 이후인가"를
 # 판단하는 단계에서 불안정함이 반복 측정으로 확인됨(10회 중 2회만 성공, 특히 기준일에
@@ -2864,6 +2886,15 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     if excluded_stat_group and analysis.filters.통계종류 in excluded_stat_group:
         analysis.filters = analysis.filters.model_copy(update={"통계종류": None})
 
+    # "수출 아닌거 있어?" — 수출입구분도 통계종류와 완전히 같은 "유효한 값이라 방어를
+    # 피해가는" 문제(2026-10-22, 같은 날 발견). "수출"이 "수출입"의 유효한 값이라 그대로
+    # 포함 필터로 쓰여 정반대 결과를 낸다.
+    excluded_trade_types = (
+        _excluded_trade_types(question) or _excluded_trade_types(analysis.standalone_question)
+    )
+    if excluded_trade_types and analysis.filters.수출입구분 in excluded_trade_types:
+        analysis.filters = analysis.filters.model_copy(update={"수출입구분": None})
+
     _pre_force_narrowing = bool(
         excluded_org
         or _excluded_role_values(question)
@@ -2873,6 +2904,7 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         or excluded_rounds
         or excluded_results
         or excluded_stat_group
+        or excluded_trade_types
     )
     results, possibly_truncated, data_type_relaxed = _search(
         analysis, carried_over, allowed_data_types, force_narrowing=_pre_force_narrowing
@@ -3014,6 +3046,11 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         _stat_excluded_filtered = [r for r in results if r.get("통계종류") not in excluded_stat_group]
         if len(_stat_excluded_filtered) < len(results):
             results = _stat_excluded_filtered
+
+    if excluded_trade_types:
+        _trade_excluded_filtered = [r for r in results if r.get("수출입구분") not in excluded_trade_types]
+        if len(_trade_excluded_filtered) < len(results):
+            results = _trade_excluded_filtered
 
     # 날짜 필터링이 첨부 청크의 부모 레코드를 조회할 때 쓰는 캐시 — 아래 _attachment_
     # metadata_header도 같은 (base_type, source_id)→parent 캐시 구조라 그대로 공유해
@@ -3319,6 +3356,12 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
                 "코드가 직접 확인했다. 이 제외 조건을 이미 만족하는 것으로 신뢰하고, 본문에 "
                 "그 사실이 적혀있는지 스스로 재확인하려 하지 마라.] " + text
             )
+        if excluded_trade_types:
+            text = (
+                f"[이 자료의 수출입구분은 {'/'.join(excluded_trade_types)} 중 어느 것도 아닌 것으로 "
+                "코드가 직접 확인했다. 이 제외 조건을 이미 만족하는 것으로 신뢰하고, 본문에 "
+                "그 사실이 적혀있는지 스스로 재확인하려 하지 마라.] " + text
+            )
         if context_blocks and context_chars + len(text) > _CONTEXT_CHAR_BUDGET:
             context_truncated = True
             break
@@ -3464,6 +3507,9 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         _answer_question_text = question
     # 통계종류 제외도 동일한 재작성 왜곡 방어가 필요하다(2026-10-22, 같은 날 발견).
     if excluded_stat_types and not all(v in _answer_question_text for v in excluded_stat_types):
+        _answer_question_text = question
+    # 수출입구분 제외도 동일한 재작성 왜곡 방어가 필요하다(2026-10-22, 같은 날 발견).
+    if excluded_trade_types and not all(v in _answer_question_text for v in excluded_trade_types):
         _answer_question_text = question
     messages.append(
         {
