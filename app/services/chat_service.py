@@ -3144,55 +3144,76 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # results(top-K)에서 LLM이 비교하는 기존 동작으로 폴백한다(완전성은 보장 못 해도 최소한
     # 틀린 기관을 정답으로 내세우진 않음 — "여러 기관에 걸친 최댓값"은 원래도 해결 범위 밖).
     _fee_org = analysis.filters.기관명
-    _fee_extreme_payload = None
-    _fee_extreme_value = None
-    _fee_total_checked = 0
+    # "수수료 제일 비싼 거랑 제일 싼 거 둘 다 알려줘"처럼 최댓값·최솟값을 동시에 물으면,
+    # 기존엔 if/elif로 하나만 골라버려서(먼저 매칭되는 "비싼" 쪽만) 최솟값 계산 자체가
+    # 전혀 안 되고, 그 질문의 최솟값 부분은 코드 검증 없이 LLM이 context 전체를 훑어
+    # 스스로 추측하게 돼 틀린 값을 확신에 차서 답하는 게 실측 확인됨(2026-10-26 —
+    # "무역관련지식재산권보호협회...최댓값/최솟값 둘 다" 질문에서 최솟값을 1,071,900원
+    # 이라고 답했으나 ground truth는 0원). "가장 최근/가장 오래된"(`_recency_max`/
+    # `_recency_min`) 기능은 이미 독립된 두 불리언으로 감지하고 있어 그 패턴을 따라
+    # 둘 다 검출될 수 있게 하고, 각각에 대해 별도로 극값을 계산해 둘 다 [자료] 맨 앞에
+    # 포함시킨다.
+    _fee_kinds: list[str] = []
     if _fee_org and "수수료" in analysis.standalone_question and re.search(
         r"(제일|가장)", analysis.standalone_question
     ):
-        _fee_kind = None
         if re.search(r"비싼|높은|많은", analysis.standalone_question):
-            _fee_kind = "max"
-        elif re.search(r"저렴한|싼|낮은|적은", analysis.standalone_question):
-            _fee_kind = "min"
-        if _fee_kind:
-            _all_history = find_by_type_and_field("신청이력", "기관명", _fee_org, limit=200)
-            _fee_candidates = []
-            for p in _all_history:
-                for item in p.get("세부항목") or []:
-                    if item.get("label") == "수수료":
-                        # ⚠️ 대부분의 실데이터 수수료 값이 "270,000,000(부가세포함)"처럼
-                        # 괄호 설명이 붙어있어서, 단순 int(value.replace(",","")) 시도는
-                        # ValueError로 break해 이런 레코드를 전부 건너뛴다(2026-10-20 실측
-                        # — 83건 중 순수 숫자만 있는 극소수만 후보로 잡혀 진짜 최댓값
-                        # 300,000,000 대신 329,270을 "최댓값"으로 잘못 계산함, 그 틀린 값을
-                        # 기준으로 비교하니 LLM도 매번 다른 레코드를 답하는 것처럼 보였을
-                        # 뿐 — 사실은 ground truth 계산 자체가 틀렸던 것). 맨 앞의 숫자+콤마
-                        # 구간만 정규식으로 뽑아 뒤의 설명은 무시한다.
-                        _m = re.match(r"\d[\d,]*", str(item["value"]).strip())
-                        if not _m:
-                            break
-                        _val = int(_m.group(0).replace(",", ""))
-                        _fee_candidates.append((_val, p))
+            _fee_kinds.append("max")
+        if re.search(r"저렴한|싼|낮은|적은", analysis.standalone_question):
+            _fee_kinds.append("min")
+    _fee_extremes: dict[str, tuple[int, dict]] = {}
+    _fee_total_checked = 0
+    if _fee_kinds:
+        _all_history = find_by_type_and_field("신청이력", "기관명", _fee_org, limit=200)
+        _fee_candidates = []
+        for p in _all_history:
+            for item in p.get("세부항목") or []:
+                if item.get("label") == "수수료":
+                    # ⚠️ 대부분의 실데이터 수수료 값이 "270,000,000(부가세포함)"처럼
+                    # 괄호 설명이 붙어있어서, 단순 int(value.replace(",","")) 시도는
+                    # ValueError로 break해 이런 레코드를 전부 건너뛴다(2026-10-20 실측
+                    # — 83건 중 순수 숫자만 있는 극소수만 후보로 잡혀 진짜 최댓값
+                    # 300,000,000 대신 329,270을 "최댓값"으로 잘못 계산함, 그 틀린 값을
+                    # 기준으로 비교하니 LLM도 매번 다른 레코드를 답하는 것처럼 보였을
+                    # 뿐 — 사실은 ground truth 계산 자체가 틀렸던 것). 맨 앞의 숫자+콤마
+                    # 구간만 정규식으로 뽑아 뒤의 설명은 무시한다.
+                    # ⚠️ `re.match`(문자열 맨 앞에서만 매칭)는 "총 79,692,000원"처럼
+                    # 숫자 앞에 한글 접두어가 붙은 값을 전부 놓쳐 ground truth 자체가
+                    # 또 틀어지는 걸 재확인(2026-10-26, 같은 조직의 132건 중 최댓값이
+                    # 27,671,077원이 아니라 79,692,000원이었음) — 문자열 어디서든 숫자
+                    # 구간을 찾는 `re.search`로 교체.
+                    _m = re.search(r"\d[\d,]*", str(item["value"]).strip())
+                    if not _m:
                         break
-            _fee_total_checked = len(_fee_candidates)
-            if _fee_candidates:
-                _fee_extreme_value, _fee_extreme_payload = (
+                    _val = int(_m.group(0).replace(",", ""))
+                    _fee_candidates.append((_val, p))
+                    break
+        _fee_total_checked = len(_fee_candidates)
+        if _fee_candidates:
+            for _kind in _fee_kinds:
+                _fee_extremes[_kind] = (
                     max(_fee_candidates, key=lambda x: x[0])
-                    if _fee_kind == "max"
+                    if _kind == "max"
                     else min(_fee_candidates, key=lambda x: x[0])
                 )
-                _fee_key = (_fee_extreme_payload.get("데이터유형"), _fee_extreme_payload.get("원본ID"))
-                # ⚠️ "존재하면 건너뛰기"로는 부족했다(2026-10-20 실측) — 이 레코드가 narrowing
-                # 검색 결과에 이미 섞여 있으면(이번 사례처럼 21건 중 20번째 자리) 그대로 둬서,
-                # 답변 생성 LLM이 뒤쪽에 묻힌 안내를 놓치고 앞쪽의 무관한 레코드를 고르는
-                # 문제가 재현됨(날짜 최상급 수정 때는 극값 레코드가 벡터 유사도로도 이미
-                # 상위권이라 우연히 문제가 안 드러났을 뿐). 이미 있든 없든 항상 맨 앞으로
-                # 옮겨 [자료 1]이 되도록 보장한다.
-                results = [_fee_extreme_payload] + [
-                    r for r in results
-                    if (r.get("데이터유형"), r.get("원본ID")) != _fee_key
-                ]
+            # ⚠️ "존재하면 건너뛰기"로는 부족했다(2026-10-20 실측) — 이 레코드가 narrowing
+            # 검색 결과에 이미 섞여 있으면(이번 사례처럼 21건 중 20번째 자리) 그대로 둬서,
+            # 답변 생성 LLM이 뒤쪽에 묻힌 안내를 놓치고 앞쪽의 무관한 레코드를 고르는
+            # 문제가 재현됨(날짜 최상급 수정 때는 극값 레코드가 벡터 유사도로도 이미
+            # 상위권이라 우연히 문제가 안 드러났을 뿐). 이미 있든 없든 항상 맨 앞으로
+            # 옮겨 [자료 1](+[자료 2])가 되도록 보장한다. 최댓값=최솟값인 레코드 1건뿐인
+            # 경우(dict라 자동 중복 제거) 1건만 앞으로 옮김.
+            _fee_keys_seen = set()
+            _fee_front = []
+            for _val, _payload in _fee_extremes.values():
+                _k = (_payload.get("데이터유형"), _payload.get("원본ID"))
+                if _k not in _fee_keys_seen:
+                    _fee_keys_seen.add(_k)
+                    _fee_front.append(_payload)
+            results = _fee_front + [
+                r for r in results
+                if (r.get("데이터유형"), r.get("원본ID")) not in _fee_keys_seen
+            ]
 
     # 역할필드 제외 필터(및 아래 5개 제외 필터)가 첨부 청크의 부모 레코드를 조회할 때
     # 쓰는 캐시 — _attachment_metadata_header도 같은 (base_type, source_id)→parent
@@ -3526,15 +3547,22 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
                     f"{_kind} 것이 아닌 것으로 코드가 직접 비교해 확인했다 — {_kind} 것을 "
                     "묻는 질문의 답으로 이 자료를 고르지 마라.] " + text
                 )
-        if (
-            _fee_extreme_payload is not None
-            and payload.get("데이터유형") == _fee_extreme_payload.get("데이터유형")
-            and payload.get("원본ID") == _fee_extreme_payload.get("원본ID")
-        ):
+        _fee_matched_kinds = [
+            _kind for _kind, (_val, _p) in _fee_extremes.items()
+            if payload.get("데이터유형") == _p.get("데이터유형") and payload.get("원본ID") == _p.get("원본ID")
+        ]
+        if _fee_matched_kinds:
+            _fee_labels = "/".join(
+                "최댓값" if k == "max" else "최솟값" for k in _fee_matched_kinds
+            )
+            _fee_value_str = ", ".join(
+                f"{_fee_extremes[k][0]:,}원({'최댓값' if k == 'max' else '최솟값'})"
+                for k in _fee_matched_kinds
+            )
             text = (
-                f"[이 자료의 수수료는 {_fee_extreme_value:,}원으로, 이 기관의 수수료가 확인된 "
+                f"[이 자료의 수수료는 {_fee_value_str}로, 이 기관의 수수료가 확인된 "
                 f"신청이력 {_fee_total_checked}건 전체를 코드가 직접 비교해 확인한 "
-                "최댓값/최솟값이다. 본문 속 다른 수수료 값과 혼동해서 스스로 재비교하지 말고, "
+                f"{_fee_labels}이다. 본문 속 다른 수수료 값과 혼동해서 스스로 재비교하지 말고, "
                 "이 자료를 답으로 삼아라.] " + text
             )
         if excluded_org:
