@@ -1008,6 +1008,33 @@ def _resolve_statistics_type_group(value: str) -> list[str]:
     return [value]
 
 
+# 심의결과도 통계종류와 같은 자유텍스트 표기 분산 문제를 겪는다 — 지금까지는 "정확매칭 0건
+# → 심의결과 필터를 통째로 지우고 재검색"(_search()의 관련 완화 단계)하는 방식뿐이었는데,
+# 이게 동의어 매칭이 아니라 "필터 완전 제거"라서 전혀 다른(심지어 정반대인) 결과까지
+# 섞여 들어올 수 있었다. 실제로 "2024년 1차 위원회 안건 중 요청안대로제공된 거"를 물으면,
+# 그 연도·차수엔 "요청안대로제공" 레코드가 없고 둘 다 "원안수용"인데도 필터가 통째로
+# 풀려 그 2건이 그대로 나오고, 답변 생성 LLM이 질문 속 표현("요청안대로 제공된 건")을
+# 그대로 베껴 써서 실제 값과 다른 라벨로 확신에 차게 서술하는 버그가 실측 확인됨
+# (2026-10-26). DB 실측(심의위원회 56건 전수 스캔)으로 "원안수용(17)/원안대로제공(1)/
+# 요청안대로제공(1)/원안대로승인(1)"은 전부 "요청대로 승인·제공됨"이라는 같은 실제
+# 의미의 표기 변형임을 확인(이 모듈 상단 `_KNOWN_COMMITTEE_RESULTS` 주석에서도 이미
+# "사실상 같은 뜻"이라고 적어뒀던 바로 그 값들), "일부제공(13)/일부통계제공(1)"도 같은
+# 관계. "제공불가(16)"/"항목조정후제공(6)"/"결정유보(1)"/"감면대상및감면율조정(1)"은
+# 서로 명백히 다른 결정이라 묶지 않는다 — 통계종류와 동일하게 그룹 안 값이면 OR로 같이
+# 찾아서, "필터 완전 제거"까지 떨어지기 전에 정확히 같은 뜻의 레코드만 먼저 찾는다.
+_COMMITTEE_RESULT_SYNONYMS = [
+    {"원안수용", "원안대로제공", "요청안대로제공", "원안대로승인"},
+    {"일부제공", "일부통계제공"},
+]
+
+
+def _resolve_committee_result_group(value: str) -> list[str]:
+    for group in _COMMITTEE_RESULT_SYNONYMS:
+        if value in group:
+            return sorted(group)
+    return [value]
+
+
 # 실제 DB에 존재하는 통계종류 값 전체(직접 스캔 확인, 2026-10-19). "한국환경공단 신청이력
 # 중에 2024년 수수료 관련 알려줘"에서 LLM이 "수수료 관련"처럼 전혀 존재하지 않는 값을
 # 통계종류 필드에 지어내 채워 넣는 바람에, 그 값과 정확히 일치하는 레코드가 DB에 없어
@@ -1270,6 +1297,13 @@ def _build_filter(
     for field, value in values.items():
         if field == "통계종류":
             group = _resolve_statistics_type_group(value)
+            cond = (
+                qmodels.FieldCondition(key=field, match=qmodels.MatchValue(value=group[0]))
+                if len(group) == 1
+                else qmodels.FieldCondition(key=field, match=qmodels.MatchAny(any=group))
+            )
+        elif field == "심의결과":
+            group = _resolve_committee_result_group(value)
             cond = (
                 qmodels.FieldCondition(key=field, match=qmodels.MatchValue(value=group[0]))
                 if len(group) == 1
