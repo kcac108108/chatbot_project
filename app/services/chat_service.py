@@ -1804,7 +1804,29 @@ def _search(
     # (2026-10-22). 호출부가 제외 조건 존재 여부를 미리 판단해 넘겨주면 top-20으로 넓힌다.
     search_limit = FILTERED_SEARCH_LIMIT if (_has_narrowing_filter(analysis.filters) or force_narrowing) else CHAT_TOP_K
 
-    results = vector_search(vector, query_filter, search_limit)
+    # 질문 분석이 구조화 필터를 하나도 못 뽑으면(query_filter=None) 완전히 무제한 벡터
+    # 검색이 되는데, 대화가 분명 특정 기관을 다루고 있는데도(직전 턴에 인용된 근거가 전부
+    # 같은 기관) LLM이 드물게 기관명·데이터유형을 둘 다 못 뽑는 경우(예: "1차 위원회꺼는
+    # 결과가 어떻게 나왔어"처럼 같은 "1차"가 서로 다른 연도 레코드 두 개를 가리켜 모호한
+    # 후속질문) 전혀 무관한 다른 기관의 레코드까지 유사도만으로 "확인된 자료"인 양 섞여
+    # 들어오는 게 실측 확인됨(2026-10-26, 직접 구성한 입력으로 메커니즘 재현 — 완전
+    # 무관한 기관·메뉴 레코드가 포함됨). carried_over가 전부 같은 기관 하나를 가리키면,
+    # 추측이 아니라 사용자가 방금 전 대화에서 실제로 다룬 기관이니 그걸로 먼저 좁혀
+    # 재검색한다 — 그 기관에 매칭되는 게 없으면(0건) 원래대로 무제한 검색에 안전하게 폴백.
+    results = None
+    if query_filter is None and carried_over:
+        carried_orgs = {p.get("기관명") for p in carried_over if p.get("기관명")}
+        if len(carried_orgs) == 1:
+            inferred = analysis.filters.model_copy(update={"기관명": next(iter(carried_orgs))})
+            inferred_filter = _build_filter(inferred, allowed_data_types, analysis.standalone_question)
+            if inferred_filter is not None:
+                inferred_limit = FILTERED_SEARCH_LIMIT if _has_narrowing_filter(inferred) else CHAT_TOP_K
+                probe = vector_search(vector, inferred_filter, inferred_limit)
+                if probe:
+                    query_filter, search_limit, results = inferred_filter, inferred_limit, probe
+
+    if results is None:
+        results = vector_search(vector, query_filter, search_limit)
     limit_used = search_limit
 
     # 데이터유형은 LLM이 "이력 알려줘" 같은 표현만 보고 과도하게 단정하는 경우가 많다
