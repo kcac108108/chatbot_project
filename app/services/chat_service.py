@@ -2506,6 +2506,33 @@ _ATTRIBUTE_VALUE_CONDITION_RE = re.compile(
     r"[가-힣]{2,10}\s*(?:이|가)\s*[가-힣A-Za-z0-9][가-힣A-Za-z0-9\s]{0,19}?\s*인\s*(?:것|거|건)"
 )
 
+# 위 _ATTRIBUTE_VALUE_CONDITION_RE는 "83건 반복" 오답만 막아줄 뿐 실제 값 필터링은
+# 못 한다고 알려져 있었는데(2026-10-22), "전송방식"/"제공주기"는 통계종류·수출입구분과
+# 똑같이 값 종류가 제한적인 필드라 실제 검색을 지원할 가치가 있다고 판단해(2026-10-27,
+# 사용자 요청) 이 둘만 범위를 좁혀 실제 필터링까지 구현한다. 요청구분(701종)·제공항목
+# (285종) 등 사실상 자유서술인 필드는 제외 — 그건 기존 키워드 검색이 이미 담당한다.
+# 라벨을 이 2개로 한정해 임의의 "N이/가 M인" 패턴을 전부 필드 조건으로 오인하는 위험을
+# 피한다(일반적인 generic 2-10자 캡처보다 훨씬 안전).
+# "전송방식이 FTP인"(라벨 먼저, 조사 있음/없음 둘 다) / "전송방식 FTP인거"(조사 생략) /
+# "FTP전송방식으로"(값이 라벨 앞, "~으로" 구조 — 실사용 예시로 직접 확인된 흔한 어순)
+# 세 어순을 모두 지원한다.
+_DETAIL_FIELD_CONDITION_RE = re.compile(
+    r"(전송방식|제공주기)\s*(?:이|가)?\s*([가-힣A-Za-z0-9][가-힣A-Za-z0-9\s]{0,19}?)\s*(?:로\s*(?:돼|되어)\s*있는|인|로\s*된)\s*(?:것|거|건)?"
+)
+_DETAIL_FIELD_CONDITION_REVERSED_RE = re.compile(
+    r"([가-힣A-Za-z0-9][가-힣A-Za-z0-9]{0,19}?)(전송방식|제공주기)\s*으?로"
+)
+
+
+def _find_detail_field_condition(text: str) -> tuple[str, str] | None:
+    m = _DETAIL_FIELD_CONDITION_RE.search(text)
+    if m:
+        return m.group(1), m.group(2).strip()
+    m = _DETAIL_FIELD_CONDITION_REVERSED_RE.search(text)
+    if m:
+        return m.group(2), m.group(1).strip()
+    return None
+
 
 def _looks_like_recent_ingestion_question(question: str) -> bool:
     if _YEAR_MENTION_RE.search(question):
@@ -3296,6 +3323,42 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
                     _seen_keys.add(_key)
                     results.append(_p)
 
+    # "전송방식이 FTP로 돼 있는 자료들 알려줘"처럼 전송방식·제공주기 조건이 있는 질문은
+    # (2026-10-27, 내용·첨부파일 검색 집중 테스트 중 사용자 요청으로 범위 확장) 실제
+    # 값으로 직접 스캔해 결과를 보강한다. 통계종류·수출입구분과 달리 FilterExtraction에
+    # 전용 필드가 없어 LLM 추출에 기댈 수 없으므로, 질문 원문에서 직접 정규식으로
+    # (라벨, 값)을 뽑는다 — standalone_question 재작성이 구조를 바꿀 수 있어 원문도
+    # 함께 확인한다(오늘 다른 제외 탐지에서 반복 확인된 패턴과 동일).
+    _detail_match = _find_detail_field_condition(analysis.standalone_question) or _find_detail_field_condition(question)
+    _detail_label = _detail_value = None
+    if _detail_match:
+        _detail_label, _detail_value = _detail_match
+        _detail_matches = scan_field_contains(_detail_label, _detail_value, KEYWORD_SCAN_LIMIT, data_type="신청이력")
+        # 기관명이 명시돼 있으면 그 기관으로만 좁힌다(흔한 교차오염 방지 패턴 재사용).
+        if analysis.filters.기관명:
+            _detail_matches = [p for p in _detail_matches if p.get("기관명") == analysis.filters.기관명]
+        if _detail_matches:
+            # ⚠️ 끝에 붙이면(append) 안 된다 — "FTP전송방식으로 제공하는 이력"처럼 라벨
+            # 단어("전송방식")가 독립적으로도 "키워드"로 같이 뽑히는 경우(2026-10-27 실측),
+            # scan_text_contains(키워드)가 본문 어딘가에 "FTP"가 그냥 언급되기만 해도
+            # (예: "제공방법: FTP를 통해 제공" 같은 전혀 무관한 계약서 보일러플레이트)
+            # 걸리는 노이즈를 results 앞쪽에 먼저 채워버려서, 정작 구조화 필드로 정확히
+            # 확인한 이 매치들이 _CONTEXT_CHAR_BUDGET에 밀려 답변 LLM에 아예 전달되지
+            # 않는 문제가 재현됨 — 코드가 이미 정확히 확인한 매치는 항상 맨 앞으로 둔다.
+            _seen_keys = {(r.get("데이터유형"), r.get("원본ID")) for r in results}
+            _detail_front = []
+            for _p in _detail_matches:
+                _key = (_p.get("데이터유형"), _p.get("원본ID"))
+                if _key not in _seen_keys:
+                    _seen_keys.add(_key)
+                    _detail_front.append(_p)
+            results = _detail_front + [
+                r for r in results
+                if (r.get("데이터유형"), r.get("원본ID")) not in {
+                    (p.get("데이터유형"), p.get("원본ID")) for p in _detail_front
+                }
+            ]
+
     if excluded_org:
         # 첨부 청크는 기관명 필드 자체가 없어(None) 이 비교를 그냥 통과하는데, 화면에
         # 보여줄 때는 _resolve_source가 부모 레코드로 승격시키면서 실제 기관명(하필 제외
@@ -3812,6 +3875,12 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
                 "코드가 직접 확인했다. 이 제외 조건을 이미 만족하는 것으로 신뢰하고, 본문에 "
                 "그 사실이 적혀있는지 스스로 재확인하려 하지 마라.] " + text
             )
+        if _detail_match and payload.get(_detail_label) and keyword_matches(_detail_value, payload[_detail_label]):
+            text = (
+                f"[이 자료의 {_detail_label}은(는) '{payload[_detail_label]}'로, '{_detail_value}' 조건을 "
+                "코드가 직접 확인했다. 이 조건을 이미 만족하는 것으로 신뢰하고, 본문에 그 사실이 "
+                "적혀있는지 스스로 재확인하려 하지 마라.] " + text
+            )
         if context_blocks and context_chars + len(text) > _CONTEXT_CHAR_BUDGET:
             context_truncated = True
             break
@@ -3853,11 +3922,18 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
                 "정확한 일치)을 완벽히 만족하지 않아도 관련 있는 것으로 간주하고 반드시 no_result=false로, "
                 "groups에 포함해서 답하라. 이 안내를 무시하고 no_result=true로 답하지 마라."
             )
-        else:
+        elif not (_detail_match and _detail_matches):
             # matched가 비어있다는 건 아래 [자료] 어디에도 키워드가 문자 그대로 없다는 뜻이다.
             # 이 안내 없이는 LLM이 막연히 주제가 비슷해 보인다는 이유로 "포함되어 있다"고
             # 근거 없이 단정하는 사례가 실측 확인됨(2026-10-13, "프로토콜" 질문 — 본문에
             # 그 단어가 전혀 없는데도 4/4 재현으로 "포함되어 있습니다"라고 답함).
+            # ⚠️ "FTP전송방식으로 제공하는 이력이 있어?"에서 LLM이 키워드를 "FTP 전송 방식"
+            # (3단어 통째로, 공백까지 들어간 복합구)으로 과하게 넓게 뽑아버리면, 그 키워드
+            # 자체는 본문에 글자 그대로 없어서(2026-10-27 발견) 이 "아예 없다"는 부정 안내가
+            # 발동해 바로 위 _DETAIL_FIELD_CONDITION_RE가 이미 "전송방식=FTP"로 정확히
+            # 확인해둔 레코드들까지 전부 no_result로 뒤집어버림(검증된 긍정 안내와 정반대
+            # 지시가 동시에 들어가 모순). 전송방식·제공주기 구조화 매치가 이미 있으면(코드가
+            # 더 신뢰할 수 있는 확인을 이미 했으므로) 이 부정 안내 자체를 내지 않는다.
             keyword_note = (
                 f"\n\n[안내] 질문의 '{keyword}'라는 단어는 아래 [자료] 어디에도 본문 그대로 등장하지 "
                 "않는다. 주제가 막연히 비슷해 보인다는 이유로 관련 있다고 추측해서 답하지 말고, "
