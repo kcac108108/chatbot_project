@@ -2747,7 +2747,7 @@ def _looks_like_full_org_history_question(text: str, filters: FilterExtraction) 
     return not has_other_filter
 
 
-def _full_org_history_answer(org_name: str) -> tuple[str, list[SourceItem], list[dict]]:
+def _full_org_history_answer(org_name: str) -> tuple[str, list[SourceItem], list[dict]] | None:
     """get_organization_history()와 동일한 데이터 소스 — "이력 보기" 버튼을 자연어
     질문으로도 쓸 수 있게 한다. 같은 기관명이 여러 원본ID로 중복 등록돼 있을 수 있어
     (예: 대한무역투자진흥공사 4건) 전부 찾아 이력을 합친다.
@@ -2775,7 +2775,13 @@ def _full_org_history_answer(org_name: str) -> tuple[str, list[SourceItem], list
             if len(matched_names) == 1:
                 org_name = matched_names.pop()
         if not org_payloads:
-            return f"'{org_name}' 기관 정보를 찾지 못했습니다.", [], []
+            # ⚠️ "관세청 이력 알려줘"처럼, 기관정보/신청이력(메뉴1)엔 전혀 존재하지 않고
+            # 외부요청·심의위원회에만 데이터가 있는 기관도 실제로 있다(2026-10-27 발견 —
+            # "관세청 관련해서 뭐 있어?"로 물으면 외부요청 8건이 정상 검색되는데, "관세청
+            # 이력 알려줘"는 이 전체이력 전용경로가 기관정보 부재만 보고 바로 실패해버려
+            # 데이터가 분명히 있는데도 "기관 정보를 찾지 못했습니다"라는 오해 소지가 큰
+            # 답을 함). None을 반환해 호출부가 일반 검색 경로로 안전하게 넘어가게 한다.
+            return None
 
     sources = [_build_source_item(p) for p in org_payloads]
 
@@ -2960,10 +2966,14 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 집계 거절보다 우선해서 정확한 전체 이력을 코드로 직접 가져와 보여준다.
     if _looks_like_full_org_history_question(analysis.standalone_question, analysis.filters):
         if allowed_data_types is None or "신청이력" in allowed_data_types:
-            answer_text, sources, org_payloads = _full_org_history_answer(analysis.filters.기관명)
-            session_store.append_turn(session_id, question, answer_text)
-            session_store.set_last_sources(session_id, org_payloads)
-            return ChatResponse(session_id=session_id, answer=answer_text, sources=sources)
+            _full_history_result = _full_org_history_answer(analysis.filters.기관명)
+            if _full_history_result is not None:
+                answer_text, sources, org_payloads = _full_history_result
+                session_store.append_turn(session_id, question, answer_text)
+                session_store.set_last_sources(session_id, org_payloads)
+                return ChatResponse(session_id=session_id, answer=answer_text, sources=sources)
+            # 기관정보 자체가 없는 기관(관세청 등, 위 _full_org_history_answer 주석 참고)이면
+            # 이 전용경로를 포기하고 아래 일반 검색으로 자연스럽게 넘어간다.
         # 스코프가 신청이력을 배제하는 경우(예: 심의위원회 스코프 고정) 전체이력 자체는
         # 줄 수 없지만(스코프 위반), 기관명이라는 명확한 조건이 있는 질문을 "전체"라는
         # 단어 하나 때문에 집계 거절로 떨어뜨리면 안 된다(2026-10-16 발견 — 심의위원회
