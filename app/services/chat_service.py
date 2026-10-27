@@ -3351,10 +3351,19 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     _detail_label = _detail_value = None
     if _detail_match:
         _detail_label, _detail_value = _detail_match
-        _detail_matches = scan_field_contains(_detail_label, _detail_value, KEYWORD_SCAN_LIMIT, data_type="신청이력")
+        # ⚠️ "2024년에 전송방식이 FTP인 자료"처럼 연도 등 다른 조건과 결합되면, scan을
+        # KEYWORD_SCAN_LIMIT(30)로만 가져온 뒤 연도로 걸러내면 그 30건 안에 2024년 것이
+        # 거의 없어 완전성이 깨진다(2026-10-27 실측 — ground truth 10건인데 2건만 나옴).
+        # 다른 필터가 같이 있으면 전체(최대 900, "아닌" 케이스와 동일 상한)를 가져와
+        # 거른 뒤에야 표시 상한을 적용한다.
+        _detail_scan_limit = 900 if analysis.filters.연도 else KEYWORD_SCAN_LIMIT
+        _detail_matches = scan_field_contains(_detail_label, _detail_value, _detail_scan_limit, data_type="신청이력")
         # 기관명이 명시돼 있으면 그 기관으로만 좁힌다(흔한 교차오염 방지 패턴 재사용).
         if analysis.filters.기관명:
             _detail_matches = [p for p in _detail_matches if p.get("기관명") == analysis.filters.기관명]
+        if analysis.filters.연도:
+            _detail_matches = [p for p in _detail_matches if p.get("연도") == analysis.filters.연도]
+        _detail_matches = _detail_matches[:KEYWORD_SCAN_LIMIT]
         if _detail_matches:
             # ⚠️ 끝에 붙이는 것도, 기존 results를 뒤에 남겨두는 것도 안 된다 — 처음엔
             # "맨 앞에 추가"만 했는데, 뒤에 남은 기존(벡터검색) results가 전혀 무관한
@@ -3385,6 +3394,8 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         _detail_excl_matches = [p for p in _detail_all if p.get("원본ID") not in _detail_matching]
         if analysis.filters.기관명:
             _detail_excl_matches = [p for p in _detail_excl_matches if p.get("기관명") == analysis.filters.기관명]
+        if analysis.filters.연도:
+            _detail_excl_matches = [p for p in _detail_excl_matches if p.get("연도") == analysis.filters.연도]
         _detail_excl_matches = _detail_excl_matches[:KEYWORD_SCAN_LIMIT]
         if _detail_excl_matches:
             # ⚠️ 긍정 매칭(위 _detail_match)과 달리 여기서는 기존 results를 뒤에 덧붙이지
