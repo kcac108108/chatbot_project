@@ -2863,6 +2863,17 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         if trimmed != analysis.filters.키워드:
             analysis.filters = analysis.filters.model_copy(update={"키워드": trimmed})
 
+    # "요청 사유에 통계청이 언급된 자료 있어?"처럼, 질문에 등장하는 기관스러운 명사를
+    # LLM이 "본문에서 언급됐는지 찾아달라"는 의도가 아니라 "기관명 필터"로 잘못 뽑는
+    # 버그가 실측 확인됨(2026-10-27 — "통계청"은 실제 그럴듯한 기관명처럼 보이지만 이
+    # 데이터에 등록된 기관이 아님, ground truth로는 본문에 26건 언급돼 있는데도 키워드가
+    # 전혀 안 뽑혀 거의 못 찾음). `_build_filter`가 존재하지 않는 기관명은 이미 걸러내
+    # 필터 자체는 안전하지만, 그 값이 "키워드"로 전환되지 않으면 전수 스캔 기회 자체가
+    # 없다 — 기관명이 DB에 실존하지 않고 키워드가 비어있으면, 사용자가 본문에서 그 이름을
+    # 찾으려는 의도일 가능성이 높으므로 키워드로 옮긴다.
+    if analysis.filters.기관명 and not analysis.filters.키워드 and not field_value_exists("기관명", analysis.filters.기관명):
+        analysis.filters = analysis.filters.model_copy(update={"키워드": analysis.filters.기관명})
+
     # "내부자료에서 댓글 달린 글 알려줘"/"~있는거 알려줘"처럼 "~달린/있는" 서술형 수식이
     # 붙으면 필터 추출이 "댓글"을 키워드로 안 뽑는 경우가 재현됨(2026-10-19 즉흥 테스트
     # 발견) — "댓글 관련 내부자료 알려줘"처럼 명사형으로 물으면 바로 추출되는 걸 보면
