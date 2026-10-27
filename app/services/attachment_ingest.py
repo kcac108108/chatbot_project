@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from qdrant_client.http import models as qmodels
 
 from app.core.config import ATTACHMENT_BASE_DIR
+from app.core.config import DB_TABLE_SUFFIX as _SFX
 from app.core.db import fetch_all
 from app.core.openai_client import chat_parse, embed_texts
 from app.core.vectordb import ensure_collection, find_by_type_and_source, upsert_points
@@ -78,9 +79,9 @@ def _valid_attachments(docucd: str, since=None) -> list[dict]:
     return fetch_all(
         f"""
         SELECT A.ATTFILE_ID, A.ATTFILE_NUM, A.ATTFILE_NM, A.FILE_PATH, A.CR_DTM, A.IN_DTM
-        FROM TM_ATTFILE A
+        FROM TM_ATTFILE{_SFX} A
         WHERE A.DOCUCD = :docucd
-          AND EXISTS (SELECT 1 FROM {table} T WHERE T.{col} = A.ATTFILE_ID)
+          AND EXISTS (SELECT 1 FROM {table}{_SFX} T WHERE T.{col} = A.ATTFILE_ID)
           {since_clause}
         ORDER BY A.ATTFILE_ID, A.ATTFILE_NUM
         """,

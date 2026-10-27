@@ -14,3 +14,6 @@ monitorapp_root*.pem
 browser_test/node_modules/
 browser_test/*.png
 browser_test/package-lock.json
+
+# Qdrant 운영 이관용 스냅샷 파일(수백MB, git에 올릴 필요 없음 — 소스코드와 별도 전달)
+qdrant_snapshot/

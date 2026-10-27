@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import httpx
 
+from app.core.config import DB_TABLE_SUFFIX as _SFX
 from app.core.db import fetch_all
 
 BASE_URL = "http://127.0.0.1:8000"
@@ -36,34 +37,34 @@ print("검색 시나리오 (정의서 7장 5번)")
 print("=" * 60)
 
 org = fetch_all(
-    "SELECT CRP_NAME FROM HISTORY_ORGANIZATION_INFO WHERE CRP_NAME IS NOT NULL FETCH FIRST 1 ROWS ONLY"
+    f"SELECT CRP_NAME FROM HISTORY_ORGANIZATION_INFO{_SFX} WHERE CRP_NAME IS NOT NULL FETCH FIRST 1 ROWS ONLY"
 )[0]["CRP_NAME"]
 r = ask(f"{org} 관련 이력 알려줘")
 check(f"기관명 검색 — '{org}'", org in r["answer"] and any(s["기관명"] == org for s in r["sources"]),
       f"answer={r['answer'][:60]}...")
 
 year_row = fetch_all(
-    "SELECT SUBSTR(REQ_DTM,1,4) AS YR FROM HISTORY_ORGANIZATION_DETAIL WHERE REQ_DTM IS NOT NULL FETCH FIRST 1 ROWS ONLY"
+    f"SELECT SUBSTR(REQ_DTM,1,4) AS YR FROM HISTORY_ORGANIZATION_DETAIL{_SFX} WHERE REQ_DTM IS NOT NULL FETCH FIRST 1 ROWS ONLY"
 )[0]
 year = year_row["YR"]
 r = ask(f"{year}년에 신청된 이력 알려줘")
 check(f"연도 필터 검색 — {year}년", len(r["sources"]) > 0, f"sources={r['sources']}")
 
 result_row = fetch_all(
-    "SELECT DISCUSSION_RESULT FROM HISTORY_DISCUSSION_COMMITTEE WHERE DISCUSSION_RESULT IS NOT NULL FETCH FIRST 1 ROWS ONLY"
+    f"SELECT DISCUSSION_RESULT FROM HISTORY_DISCUSSION_COMMITTEE{_SFX} WHERE DISCUSSION_RESULT IS NOT NULL FETCH FIRST 1 ROWS ONLY"
 )[0]
 result_val = "".join(result_row["DISCUSSION_RESULT"].split())
 r = ask(f"심의결과가 {result_val}인 안건 알려줘")
 check(f"심의결과 필터 검색 — {result_val}", len(r["sources"]) > 0, f"sources={r['sources']}")
 
-person = fetch_all("SELECT USERNM FROM HISTORY_INTERNAL_INFO WHERE USERNM IS NOT NULL FETCH FIRST 1 ROWS ONLY")[0][
+person = fetch_all(f"SELECT USERNM FROM HISTORY_INTERNAL_INFO{_SFX} WHERE USERNM IS NOT NULL FETCH FIRST 1 ROWS ONLY")[0][
     "USERNM"
 ]
 r = ask(f"{person}이 담당한 자료 알려줘")
 check(f"담당자 검색 — '{person}'", person in r["answer"], f"answer={r['answer'][:60]}...")
 
 requester = fetch_all(
-    "SELECT REQ_PERSON_NAME FROM HISTORY_EXTERNAL_REQUEST WHERE REQ_PERSON_NAME IS NOT NULL FETCH FIRST 1 ROWS ONLY"
+    f"SELECT REQ_PERSON_NAME FROM HISTORY_EXTERNAL_REQUEST{_SFX} WHERE REQ_PERSON_NAME IS NOT NULL FETCH FIRST 1 ROWS ONLY"
 )[0]["REQ_PERSON_NAME"]
 r = ask(f"{requester}이 요청한 외부요청 알려줘")
 check(f"요청자 검색 — '{requester}'", requester in r["answer"], f"answer={r['answer'][:60]}...")

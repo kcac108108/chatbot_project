@@ -19,6 +19,16 @@ ORACLE_USER = os.getenv("ORACLE_USER")
 ORACLE_PASSWORD = os.getenv("ORACLE_PASSWORD")
 ORACLE_DSN = os.getenv("ORACLE_DSN")
 
+# 정의서 1.2절: 운영 DB는 이력관리시스템 원본 테이블(HISTORY_*, TM_ATTFILE)을 DB링크
+# (@STATWEB) 경유로 조회하고, 개발 로컬 DB는 링크 없이 동일 테이블명으로 구성된다
+# (ddl/의 DDL도 "@STATWEB 링크 제거판"). 운영 배포 시 .env에 DB_TABLE_SUFFIX=@STATWEB로
+# 설정해야 queries.py 등의 쿼리가 실제 운영 테이블을 찾는다 — 비워두면(로컬 기본값)
+# 테이블명 그대로 쓴다. CHATBOT_INGEST_LOG 등 챗봇 자체 테이블(이력관리시스템 원본이
+# 아니라 이 프로젝트에서 새로 만든 것)은 이 서픽스를 붙이지 않는다.
+DB_TABLE_SUFFIX = os.getenv("DB_TABLE_SUFFIX", "")
+
+# 로컬 dev는 앱이 컨테이너 밖(venv)에서 돌아 localhost로 Qdrant 컨테이너에 접근하지만,
+# 운영은 앱도 docker-compose 컨테이너라 서비스명(QDRANT_HOST=qdrant)으로 찾아야 한다.
 QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "history_chatbot")
