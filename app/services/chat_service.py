@@ -3111,11 +3111,25 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 이미 알려지지 않은 심의결과 값은 걸러내지만(위 `_KNOWN_COMMITTEE_RESULTS` 체크),
     # LLM이 하필 제외 대상 그 값 자체를 유효한 값으로 채우면(예: "원안수용") 정반대로
     # 좁혀버리는 사고를 막기 위해 명시적으로도 지운다.
-    excluded_results = (
+    _excluded_results_literal = (
         _excluded_committee_results(_carried_text)
         or _excluded_committee_results(analysis.standalone_question)
         or _excluded_committee_results(question)
     )
+    # ⚠️ "일부제공도 아닌" 질문에서 실제 레코드 값이 그 동의어("일부통계제공",
+    # `_COMMITTEE_RESULT_SYNONYMS`)로 저장돼 있으면 리터럴 비교로는 안 걸러져서 그대로
+    # [자료]에 남는다 — 안내문("일부제공 중 어느 것도 아닌 것으로 확인됨")과 레코드 본문
+    # ("심의결과: 일부통계제공")이 서로 모순돼 보여, 답변생성 LLM이 혼란스러워하며 그
+    # 레코드뿐 아니라 함께 전달된 진짜 정답 레코드까지 전부 no_result로 포기하는 사례가
+    # 실측 확인됨(2026-10-27 — 삼중부정 "원안수용/제공불가/일부제공 아닌" 질문에서 10/10
+    # 결정론적 재현, 2026-10-26에 "범위 밖"으로 남겨뒀던 바로 그 한계). 동의어 그룹
+    # 전체로 확장해 필터링·안내문 둘 다에 쓴다(2026-10-26에 포함 매칭에 이미 쓰던
+    # _resolve_committee_result_group 재사용).
+    excluded_results: list[str] = []
+    for _v in _excluded_results_literal:
+        for _syn in _resolve_committee_result_group(_v):
+            if _syn not in excluded_results:
+                excluded_results.append(_syn)
     if excluded_results and analysis.filters.심의결과 in excluded_results:
         analysis.filters = analysis.filters.model_copy(update={"심의결과": None})
 
@@ -3890,7 +3904,10 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         _answer_question_text = question
     # 심의결과 제외도 연도·차수와 동일한 재작성 왜곡을 겪을 수 있어 같은 방어를 적용한다
     # (2026-10-22 발견, "N차 빼고"와 같은 날).
-    if excluded_results and not all(v in _answer_question_text for v in excluded_results):
+    # 동의어 확장 전(_excluded_results_literal)으로 체크한다 — 확장된 excluded_results로
+    # 체크하면 질문에 실제로 안 쓰인 동의어 표현("일부통계제공" 등)이 항상 포함돼
+    # 이 가드가 매번 불필요하게 발동해버린다(2026-10-27 발견).
+    if _excluded_results_literal and not all(v in _answer_question_text for v in _excluded_results_literal):
         _answer_question_text = question
     # 통계종류 제외도 동일한 재작성 왜곡 방어가 필요하다(2026-10-22, 같은 날 발견).
     if excluded_stat_types and not all(v in _answer_question_text for v in excluded_stat_types):
