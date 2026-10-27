@@ -3356,26 +3356,14 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         if analysis.filters.기관명:
             _detail_matches = [p for p in _detail_matches if p.get("기관명") == analysis.filters.기관명]
         if _detail_matches:
-            # ⚠️ 끝에 붙이면(append) 안 된다 — "FTP전송방식으로 제공하는 이력"처럼 라벨
-            # 단어("전송방식")가 독립적으로도 "키워드"로 같이 뽑히는 경우(2026-10-27 실측),
-            # scan_text_contains(키워드)가 본문 어딘가에 "FTP"가 그냥 언급되기만 해도
-            # (예: "제공방법: FTP를 통해 제공" 같은 전혀 무관한 계약서 보일러플레이트)
-            # 걸리는 노이즈를 results 앞쪽에 먼저 채워버려서, 정작 구조화 필드로 정확히
-            # 확인한 이 매치들이 _CONTEXT_CHAR_BUDGET에 밀려 답변 LLM에 아예 전달되지
-            # 않는 문제가 재현됨 — 코드가 이미 정확히 확인한 매치는 항상 맨 앞으로 둔다.
-            _seen_keys = {(r.get("데이터유형"), r.get("원본ID")) for r in results}
-            _detail_front = []
-            for _p in _detail_matches:
-                _key = (_p.get("데이터유형"), _p.get("원본ID"))
-                if _key not in _seen_keys:
-                    _seen_keys.add(_key)
-                    _detail_front.append(_p)
-            results = _detail_front + [
-                r for r in results
-                if (r.get("데이터유형"), r.get("원본ID")) not in {
-                    (p.get("데이터유형"), p.get("원본ID")) for p in _detail_front
-                }
-            ]
+            # ⚠️ 끝에 붙이는 것도, 기존 results를 뒤에 남겨두는 것도 안 된다 — 처음엔
+            # "맨 앞에 추가"만 했는데, 뒤에 남은 기존(벡터검색) results가 전혀 무관한
+            # 레코드(예: 제공주기='-'인 것)를 섞여 들여보내서, "매월인 자료"라는 답변에
+            # 제공주기가 '-'인 레코드까지 "건별 상세"로 나열되는 문제가 실측 확인됨
+            # (2026-10-27, 브라우저 테스트 — 35건 중 31~35번째가 전부 무관). 제외("아닌")
+            # 케이스에서 이미 확인한 것과 같은 결론 — 코드로 이미 완전하게 확인한 이
+            # 집합 자체가 신뢰할 수 있는 전부이므로, 검증 안 된 기존 results는 버린다.
+            results = _detail_matches
         # 이 필드는 이제 코드가 정확히 처리하므로, 같은 라벨/값을 LLM이 또 "키워드"로
         # 뽑아 일반 키워드 스캔(본문에 그 단어가 아무 데나 있어도 걸리는 느슨한 매칭)이
         # 중복으로 끼어들지 않게 한다 — 안 지우면 정확한 매치 위에 노이즈가 섞인다.
