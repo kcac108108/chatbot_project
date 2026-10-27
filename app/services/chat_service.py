@@ -597,7 +597,14 @@ _EXCLUSION_NAME_RE = re.compile(
     # 매칭 안 됨). "도 아니고"를 "이랑/랑/와/과/," 와 같은 자리의 연결어로 취급하면,
     # 이름1 뒤에 이 연결어가 오고 이름2 뒤에 최종 트리거가 오는 구조로 그대로 매칭된다.
     rf"(?:\s*(?:이랑|랑|와|과|,|도\s*아니고|도\s*아니며|도\s*아니라)\s*([가-힣]{{2,4}}?{_TITLE_SUFFIX}))?"
-    r"\s*(?:도\s*)?(?:아니고|아니며|아니라|아닌|말고|빼고|제외하고|외에|외\s)"
+    # ⚠️ "한국환경공단 이력 중 통관기초통계가 아닌 것은..."처럼 사람 제외와 전혀 무관한
+    # 일반 부정 의문문("~가/이 아닌 것은?")에서 "통계가"가 사람 이름으로 오매칭돼
+    # analysis.filters.기관명이 엉뚱하게 지워지는 회귀가 실측 확인됨(2026-10-27 — "아닌"을
+    # 단순 트리거로 추가했더니, particle 제약이 "도"만 선택적으로 허용해 "가/이" 뒤에도
+    # 거의 뭐든 걸렸음). "아니고/아니며/아니라/아닌"은 반드시 "도"가 직접 앞에 와야만
+    # (즉 "전봉석도 아니고"처럼 명시적 다중 제외 나열 구조일 때만) 트리거로 인정하고,
+    # 원래부터 지원하던 "말고/빼고/제외하고/외에/외"는 그대로 particle 없이 둔다.
+    r"\s*(?:도\s*(?:아니고|아니며|아니라|아닌)|말고|빼고|제외하고|외에|외\s)"
 )
 
 
@@ -3188,6 +3195,43 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     results, possibly_truncated, data_type_relaxed = _search(
         analysis, carried_over, allowed_data_types, force_narrowing=_pre_force_narrowing
     )
+
+    # "한국환경공단 이력 중에 통관기초통계 아닌거 있어?"처럼 기관명+제외 조건이 있을 때,
+    # 벡터 top-20(narrowing 상한)이 하필 제외 대상 범주로 쏠려있으면(이 질문 자체가
+    # "통관기초통계"를 언급하니 그 범주 레코드와 벡터 유사도가 더 높게 나오기 쉽다)
+    # 제외 필터링 후 진짜로 남은 레코드(예: 83건 중 41건)가 있는데도 0건이 되는 버그가
+    # 실측 확인됨(2026-10-27). 기관명이 있으면 top-K에 의존하지 않고 그 기관의 전체
+    # 이력을 가져와(이미 수수료·날짜 최상급에서 검증된 find_by_type_and_field 패턴)
+    # 제외 필터링이 완전한 데이터 위에서 동작하도록 보강한다.
+    _exclusion_active = bool(
+        _excluded_years_precheck
+        or excluded_rounds
+        or excluded_results
+        or excluded_stat_group
+        or excluded_trade_types
+        or _excluded_role_precheck
+    )
+    # ⚠️ `analysis.filters.데이터유형`을 그대로 믿으면 안 된다 — "~이력 중에 통관기초통계
+    # 아닌거"처럼 통계종류·수출입구분(신청이력 전용 필드, `_MENU1_ONLY_FIELDS`)을 언급하는
+    # 질문에서도 LLM이 데이터유형을 "기관정보"로 잘못 뽑는 비결정성이 실측 확인됨(2026-10-27,
+    # 애초에 이 필드 자체가 기관정보엔 존재하지 않으므로 그 메뉴로 조회하면 당연히 0건) —
+    # 그 필드를 가진 메뉴가 신청이력뿐이므로 그 경우엔 신청이력으로 강제한다.
+    _exclusion_base_type = (
+        "신청이력"
+        if (excluded_stat_group or excluded_trade_types)
+        else (_infer_recency_base_type(results) or analysis.filters.데이터유형)
+    )
+    if _exclusion_active and analysis.filters.기관명 and _exclusion_base_type:
+        _full_org_pool = find_by_type_and_field(
+            _exclusion_base_type, "기관명", analysis.filters.기관명, limit=300
+        )
+        if _full_org_pool:
+            _seen_keys = {(r.get("데이터유형"), r.get("원본ID")) for r in results}
+            for _p in _full_org_pool:
+                _key = (_p.get("데이터유형"), _p.get("원본ID"))
+                if _key not in _seen_keys:
+                    _seen_keys.add(_key)
+                    results.append(_p)
 
     if excluded_org:
         # 첨부 청크는 기관명 필드 자체가 없어(None) 이 비교를 그냥 통과하는데, 화면에
