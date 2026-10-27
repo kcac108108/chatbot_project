@@ -618,9 +618,14 @@ _NON_NAME_DOMAIN_WORDS = {"수입", "수출", "수출입"}
 
 
 def _is_non_name_token(name: str) -> bool:
+    """⚠️ "원안수용 빼고 제공불가도 빼고"에서 "원안수용"이 사람 이름으로 오매칭돼,
+    요청자/제공자/담당자/결재자 개념 자체가 없는 심의위원회 레코드 전부가 "역할필드
+    검증 불가"로 통째로 걸러지는 버그가 실측 확인됨(2026-10-27 — 검색은 14건을 정확히
+    찾아내는데도 이 오매칭 때문에 0건으로 사라짐). 통계종류와 같은 계열 — 심의결과도
+    이 자료 안에서 실제로 쓰이는 알려진 도메인 값이라 사람 이름일 수 없다."""
     if _PRONOUN_WITH_PARTICLE_RE.match(name):
         return True
-    if name in _NON_NAME_DOMAIN_WORDS or name in _KNOWN_STATISTICS_TYPES:
+    if name in _NON_NAME_DOMAIN_WORDS or name in _KNOWN_STATISTICS_TYPES or name in _KNOWN_COMMITTEE_RESULTS:
         return True
     return False
 
@@ -666,19 +671,37 @@ def _has_genuine_exclusion_phrase(text: str) -> bool:
 # 답변생성 LLM이 "질문(아닌거)과 안 맞는다"며 스스로 거절해버려(운 좋게 틀린 방향으로 답하진
 # 않음) "찾지 못함"으로 묻혀버림 — 실제로는 43건(심의위원회 3차 제외)이 있는데도. "아닌"을
 # 트리거에 추가해 해결.
-_EXCLUSION_TRIGGER_RE = re.compile(r"빼고|제외|말고|아닌")
 _YEAR_TOKEN_RE = re.compile(r"(\d{4})\s*년")
 _ROUND_TOKEN_RE = re.compile(r"(\d+)\s*차")
+
+# ⚠️ 위 두 함수가 "제외어 앞 20자 윈도" 방식이었는데, "2008년 3차 위원회 안건 중에
+# 원안수용 빼고 제공불가도 빼고"처럼 제외와 무관한 선행 문맥(검색 범위를 좁히는 연도·
+# 차수)이 하필 그 20자 윈도 안에 들어오면 전혀 무관한데도 "제외 대상"으로 오탐하는
+# 버그가 실측 확인됨(2026-10-27 — "3차"가 검색 scope로 쓰인 건데 `excluded_rounds=[3]`
+# 로 지어내져, 검색된 2008년 3차 레코드 14건이 결과 필터링 단계에서 전부 걸러져 0건이
+# 됨). "2020년이랑 2021년은 빼고"(값 여러 개 + 공용 트리거)를 지원해야 해서 단순히
+# 심의결과·통계종류·수출입구분처럼 토큰 바로 뒤 트리거만 보는 식(전방 타이트 커플링)으로
+# 바꾸면 그 멀티값 케이스가 깨진다 — 대신 "토큰(+연결 조사)이 연속으로 반복되다가 곧장
+# 제외 트리거로 이어지는" 구간 전체가 끊김 없이 이어져야만 매치되도록 정규식 자체로
+# 강제한다. 중간에 "위원회 안건 중에"처럼 토큰·연결조사가 아닌 다른 말이 끼면 체인이
+# 끊겨 매치가 아예 안 되므로(무관한 선행 문맥과 섞일 수 없음), false positive가 구조적으로
+# 불가능해진다.
+_EXCLUSION_CONNECTOR = r"(?:,|이랑|랑|와|과|은|는|도)?"
+_YEAR_EXCLUSION_LIST_RE = re.compile(
+    r"((?:\d{4}\s*년\s*" + _EXCLUSION_CONNECTOR + r"\s*)+)(?:아니고|아니며|아니라|아닌|빼고|제외|말고)"
+)
+_ROUND_EXCLUSION_LIST_RE = re.compile(
+    r"((?:\d+\s*차\s*" + _EXCLUSION_CONNECTOR + r"\s*)+)(?:아니고|아니며|아니라|아닌|빼고|제외|말고)"
+)
 
 
 def _excluded_years(text: str) -> list[str]:
     if not text:
         return []
-    m = _EXCLUSION_TRIGGER_RE.search(text)
+    m = _YEAR_EXCLUSION_LIST_RE.search(text)
     if not m:
         return []
-    window = text[max(0, m.start() - 20) : m.start()]
-    return _YEAR_TOKEN_RE.findall(window)
+    return _YEAR_TOKEN_RE.findall(m.group(1))
 
 
 def _excluded_rounds(text: str) -> list[int]:
@@ -690,11 +713,10 @@ def _excluded_rounds(text: str) -> list[int]:
     차수는 Qdrant payload·FilterExtraction 둘 다 int로 저장되므로 int로 변환해 반환."""
     if not text:
         return []
-    m = _EXCLUSION_TRIGGER_RE.search(text)
+    m = _ROUND_EXCLUSION_LIST_RE.search(text)
     if not m:
         return []
-    window = text[max(0, m.start() - 20) : m.start()]
-    return [int(v) for v in _ROUND_TOKEN_RE.findall(window)]
+    return [int(v) for v in _ROUND_TOKEN_RE.findall(m.group(1))]
 
 
 # "원안수용 아닌거 있어?" 같은 심의결과 제외 질문도 연도·차수와 같은 구조적 한계를 겪는다
@@ -3067,7 +3089,13 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # (2026-10-22 — "대한무역투자진흥공사(1차/3차만 존재) 안건 중에 1차 빼고"가
     # `차수=2`로 지어내져 AND 필터가 항상 0건). 제외 표현이 감지되면 LLM이 뽑은 값을
     # 아예 신뢰하지 않고 필터에서 제거, 검색 후 결과에서 제외 대상만 걸러낸다.
-    excluded_rounds = _excluded_rounds(_carried_text) or _excluded_rounds(analysis.standalone_question)
+    # ⚠️ standalone_question 재작성이 "A 빼고 B도 빼고"(값마다 개별 트리거)를 "A와 B를
+    # 제외한"(공용 트리거 하나로 합침)으로 바꿔버리면, 토큰 바로 뒤에 트리거가 와야 하는
+    # 이 함수들의 매칭 구조가 깨진다(2026-10-27 실측 확인) — 원문 question은 재작성을
+    # 안 거쳐 원래 구조가 보존되므로 셋째 폴백으로 추가한다.
+    excluded_rounds = (
+        _excluded_rounds(_carried_text) or _excluded_rounds(analysis.standalone_question) or _excluded_rounds(question)
+    )
     if excluded_rounds and analysis.filters.차수 is not None:
         analysis.filters = analysis.filters.model_copy(update={"차수": None})
 
@@ -3076,7 +3104,9 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # LLM이 하필 제외 대상 그 값 자체를 유효한 값으로 채우면(예: "원안수용") 정반대로
     # 좁혀버리는 사고를 막기 위해 명시적으로도 지운다.
     excluded_results = (
-        _excluded_committee_results(_carried_text) or _excluded_committee_results(analysis.standalone_question)
+        _excluded_committee_results(_carried_text)
+        or _excluded_committee_results(analysis.standalone_question)
+        or _excluded_committee_results(question)
     )
     if excluded_results and analysis.filters.심의결과 in excluded_results:
         analysis.filters = analysis.filters.model_copy(update={"심의결과": None})
@@ -3088,7 +3118,9 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # "아닌" 나머지 41건과는 정반대). 동의어 그룹(_resolve_statistics_type_group) 전체를
     # 제외 대상으로 확장해 필터링한다.
     excluded_stat_types = (
-        _excluded_statistics_types(_carried_text) or _excluded_statistics_types(analysis.standalone_question)
+        _excluded_statistics_types(_carried_text)
+        or _excluded_statistics_types(analysis.standalone_question)
+        or _excluded_statistics_types(question)
     )
     excluded_stat_group: set[str] = set()
     for _v in excluded_stat_types:
@@ -3100,7 +3132,9 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 피해가는" 문제(2026-10-22, 같은 날 발견). "수출"이 "수출입"의 유효한 값이라 그대로
     # 포함 필터로 쓰여 정반대 결과를 낸다.
     excluded_trade_types = (
-        _excluded_trade_types(_carried_text) or _excluded_trade_types(analysis.standalone_question)
+        _excluded_trade_types(_carried_text)
+        or _excluded_trade_types(analysis.standalone_question)
+        or _excluded_trade_types(question)
     )
     if excluded_trade_types and analysis.filters.수출입구분 in excluded_trade_types:
         analysis.filters = analysis.filters.model_copy(update={"수출입구분": None})
@@ -3115,7 +3149,9 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 실은 검색 전에 filters.연도를 지워야 하는 차수와 동일한 선행 조건이었음을 놓쳤던 것).
     # 여기서 미리 계산해두고(아래 line ~3126의 `excluded_years`와 동일한 값, 중복 계산이지만
     # 그쪽은 검색 후 결과 필터링용이라 그대로 유지) 차수와 동일하게 clear한다.
-    _excluded_years_precheck = _excluded_years(_carried_text) or _excluded_years(analysis.standalone_question)
+    _excluded_years_precheck = (
+        _excluded_years(_carried_text) or _excluded_years(analysis.standalone_question) or _excluded_years(question)
+    )
     if _excluded_years_precheck and analysis.filters.연도 in _excluded_years_precheck:
         analysis.filters = analysis.filters.model_copy(update={"연도": None})
 
@@ -3123,6 +3159,7 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         excluded_org
         or _excluded_role_values(_carried_text)
         or _excluded_role_values(analysis.standalone_question)
+        or _excluded_role_values(question)
         or _excluded_years_precheck
         or excluded_rounds
         or excluded_results
@@ -3248,7 +3285,11 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 캐시 구조라 그대로 공유해 중복 조회를 피한다(선언을 여기로 앞당김).
     _metadata_header_cache: dict = {}
 
-    excluded_names = _excluded_role_values(_carried_text) or _excluded_role_values(analysis.standalone_question)
+    excluded_names = (
+        _excluded_role_values(_carried_text)
+        or _excluded_role_values(analysis.standalone_question)
+        or _excluded_role_values(question)
+    )
     # "한국환경공단 말고 다른 기관..."처럼 기관명 제외 질문에서, _EXCLUSION_NAME_RE가
     # "말고" 바로 앞의 2~4글자("공단")를 사람 이름으로 오매칭하는 버그가 실측 확인됨
     # (2026-10-22 — 역할필드가 전부 None인 첨부 청크만 있을 때 아래 _excluded_filtered가
@@ -3285,7 +3326,9 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
             results = _excluded_filtered
 
     # (아래 5개 제외 필터도 _metadata_header_cache를 그대로 공유 — 위에서 이미 선언됨)
-    excluded_years = _excluded_years(_carried_text) or _excluded_years(analysis.standalone_question)
+    excluded_years = (
+        _excluded_years(_carried_text) or _excluded_years(analysis.standalone_question) or _excluded_years(question)
+    )
     if excluded_years:
         # 2026-10-22 발견: 첨부 청크는 "연도" 등 메타데이터 필드가 전부 None이라
         # (2026-10-13 확정 — 메타데이터는 부모 레코드에만 있음) r.get()으로 직접 보면
