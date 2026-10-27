@@ -2872,9 +2872,16 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 무관한 기관이 섞이는 완전성 문제로 이어짐. 길이가 긴 값부터 확인해 부분 포함
     # 오매칭을 피한다("통관기초"가 "통관기초통계"의 부분문자열이라 짧은 것부터 보면
     # 더 구체적인 값을 놓칠 수 있음).
+    # ⚠️ "수출입은행"처럼 기관명 자체에 도메인 단어가 우연히 포함돼 있으면, 아래 두
+    # 블록이 "질문에 그 단어가 있다"는 이유만으로 값을 주입해버려 전혀 무관한 필드가
+    # 생겨버린다(2026-10-27 발견 — 심의위원회에만 존재하는 기관인데 수출입구분이
+    # 메뉴1 전용이라 AND 조합이 항상 0건, 완화 캐스케이드 끝까지 가야 겨우 벡터유사도로
+    # 찾아져 들쭉날쭉함). 기관명 안에 그대로 포함된 매치는 주제어가 아니라 기관명 자체의
+    # 일부일 가능성이 높으므로 건너뛴다.
+    _org_name = analysis.filters.기관명 or ""
     if not analysis.filters.통계종류:
         for _stat_value in sorted(_KNOWN_STATISTICS_TYPES, key=len, reverse=True):
-            if len(_stat_value) >= 2 and _stat_value in question:
+            if len(_stat_value) >= 2 and _stat_value in question and _stat_value not in _org_name:
                 analysis.filters = analysis.filters.model_copy(update={"통계종류": _stat_value})
                 break
 
@@ -2885,7 +2892,7 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # "수출입"이라는 질문을 "수출"로 더 좁게 오매칭하지 않는다.
     if not analysis.filters.수출입구분:
         for _ei_value in ("수출입", "수출", "수입"):
-            if _ei_value in question:
+            if _ei_value in question and _ei_value not in _org_name:
                 analysis.filters = analysis.filters.model_copy(update={"수출입구분": _ei_value})
                 break
 
