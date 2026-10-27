@@ -591,12 +591,13 @@ _EXCLUSION_NAME_RE = re.compile(
     # 발견 — 탐욕적이면 2~4글자 범위에서 가능한 한 많이 먹으려 해 "전봉석이"(4글자)까지
     # 가져가고 "랑"만 연결자로 남아 두 번째 이름 캡처가 깨짐).
     rf"([가-힣]{{2,4}}?{_TITLE_SUFFIX})"
-    # "전봉석이랑 차영경 말고"처럼 제외 대상이 2명일 때, 연결어("이랑/랑/와/과/,")로 이어진
-    # 두 번째 이름도 선택적으로 캡처한다 — 첫 이름만 잡히면 두 번째 사람의 레코드가 그대로
-    # 컨텍스트에 남아, "둘 다 빼달라"는 질문과 안 맞아 LLM이 혼란스러워하며 전부 no_result로
-    # 답해버림(실측 재현). 1명만 제외해도 매칭은 안전하게 동작해야 하므로 선택적 그룹.
-    rf"(?:\s*(?:이랑|랑|와|과|,)\s*([가-힣]{{2,4}}?{_TITLE_SUFFIX}))?"
-    r"\s*(?:말고|빼고|제외하고|외에|외\s)"
+    # "전봉석이랑 차영경 말고"(공용 트리거 1개)뿐 아니라 "전봉석도 아니고 차영경도 아닌"
+    # (이름마다 개별 트리거)도 지원해야 한다(2026-10-27 — 심의결과 이중부정 수정을 다른
+    # 필드로 교차검증하다 발견, "아니고/아닌" 트리거 자체가 이 regex에 아예 없어 전혀
+    # 매칭 안 됨). "도 아니고"를 "이랑/랑/와/과/," 와 같은 자리의 연결어로 취급하면,
+    # 이름1 뒤에 이 연결어가 오고 이름2 뒤에 최종 트리거가 오는 구조로 그대로 매칭된다.
+    rf"(?:\s*(?:이랑|랑|와|과|,|도\s*아니고|도\s*아니며|도\s*아니라)\s*([가-힣]{{2,4}}?{_TITLE_SUFFIX}))?"
+    r"\s*(?:도\s*)?(?:아니고|아니며|아니라|아닌|말고|빼고|제외하고|외에|외\s)"
 )
 
 
@@ -3155,11 +3156,29 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     if _excluded_years_precheck and analysis.filters.연도 in _excluded_years_precheck:
         analysis.filters = analysis.filters.model_copy(update={"연도": None})
 
+    # "전봉석도 아니고 차영경도 아닌 사람이 담당한거 있어?"처럼 역할필드 제외도 연도·차수·
+    # 심의결과와 동일한 구조적 한계를 겪는다(2026-10-27 발견) — `filters.담당자`는 포함할
+    # 값만 담을 수 있는데, LLM이 비결정적으로(5회 중 2회) 제외 대상 그 이름을 그대로
+    # 포함 필터로 채워버림. 그러면 "데이터유형=내부자료 AND 담당자=전봉석"처럼 극도로
+    # 좁은 필터가 돼 narrowing 캐스케이드가 데이터유형까지 완전히 풀어버리고, 그 결과
+    # 완전히 무관한 다른 메뉴(외부요청 등) 레코드가 벡터 유사도로 섞여 들어와 "전봉석/
+    # 차영경 아닌 사람" 질문에 엉뚱한 외부요청 기록을 답하는 사례가 실측 확인됨(5회 중
+    # 2회, 8건→2건으로 급감). 다른 필드들과 동일하게 _search() 호출 전에 미리 지운다.
+    _excluded_role_precheck = (
+        _excluded_role_values(_carried_text) or _excluded_role_values(analysis.standalone_question) or _excluded_role_values(question)
+    )
+    if _excluded_role_precheck:
+        _role_updates = {
+            f: None
+            for f in _PERSON_ROLE_FIELDS
+            if getattr(analysis.filters, f, None) in _excluded_role_precheck
+        }
+        if _role_updates:
+            analysis.filters = analysis.filters.model_copy(update=_role_updates)
+
     _pre_force_narrowing = bool(
         excluded_org
-        or _excluded_role_values(_carried_text)
-        or _excluded_role_values(analysis.standalone_question)
-        or _excluded_role_values(question)
+        or _excluded_role_precheck
         or _excluded_years_precheck
         or excluded_rounds
         or excluded_results
