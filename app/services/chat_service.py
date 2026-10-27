@@ -2534,6 +2534,24 @@ def _find_detail_field_condition(text: str) -> tuple[str, str] | None:
     return None
 
 
+# "전송방식이 FTP 아닌 자료 있어?"처럼 부정형도 있다(2026-10-27, 긍정 매칭 기능을 만든
+# 직후 교차검증하다 발견) — 긍정 regex가 "아닌"을 안 잡아 이 경우는 아예 안 걸리는데,
+# 그러면 LLM이 "FTP"를 일반 키워드로 뽑아 기존 scan_text_contains(본문에 "FTP"가
+# 그냥 언급되기만 해도 걸림, 긍정 매칭)가 작동해버려서, 정확히 그 반대인 "전송방식=FTP"
+# 레코드가 "FTP 아닌 자료"라는 답변에 확신에 차서 섞여 나오는 심각한 버그를 발견함
+# (30건 중 7건이 실제로는 전송방식=FTP). 전용 부정 regex로 감지해 제대로 처리한다.
+_DETAIL_FIELD_EXCLUSION_RE = re.compile(
+    r"(전송방식|제공주기)\s*(?:이|가)?\s*([가-힣A-Za-z0-9][가-힣A-Za-z0-9\s]{0,19}?)\s*(?:이|가)?\s*아닌"
+)
+
+
+def _find_detail_field_exclusion(text: str) -> tuple[str, str] | None:
+    m = _DETAIL_FIELD_EXCLUSION_RE.search(text)
+    if m:
+        return m.group(1), m.group(2).strip()
+    return None
+
+
 def _looks_like_recent_ingestion_question(question: str) -> bool:
     if _YEAR_MENTION_RE.search(question):
         return False
@@ -3358,6 +3376,37 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
                     (p.get("데이터유형"), p.get("원본ID")) for p in _detail_front
                 }
             ]
+        # 이 필드는 이제 코드가 정확히 처리하므로, 같은 라벨/값을 LLM이 또 "키워드"로
+        # 뽑아 일반 키워드 스캔(본문에 그 단어가 아무 데나 있어도 걸리는 느슨한 매칭)이
+        # 중복으로 끼어들지 않게 한다 — 안 지우면 정확한 매치 위에 노이즈가 섞인다.
+        analysis.filters = analysis.filters.model_copy(update={"키워드": None})
+
+    _detail_excl_match = _find_detail_field_exclusion(analysis.standalone_question) or _find_detail_field_exclusion(question)
+    _detail_excl_label = _detail_excl_value = None
+    if _detail_excl_match and not _detail_match:
+        _detail_excl_label, _detail_excl_value = _detail_excl_match
+        # "아닌" 자료는 "전체 중 그 값을 가진 걸 뺀 나머지"라서, 일부만 긁어오는 scan으로는
+        # 완전성을 보장 못 한다 — scan_field_contains(label, "", ...)가 빈 문자열은 모든
+        # 값의 부분문자열이라는 성질을 이용해 "전체"를 먼저 가져온 뒤, 매치되는 것만
+        # 빼는 방식으로 정확하게 구한다(둘 다 같은 scan_field_contains 재사용, 새 함수 불필요).
+        _detail_all = scan_field_contains(_detail_excl_label, "", 900, data_type="신청이력")
+        _detail_matching = {
+            p.get("원본ID")
+            for p in scan_field_contains(_detail_excl_label, _detail_excl_value, 900, data_type="신청이력")
+        }
+        _detail_excl_matches = [p for p in _detail_all if p.get("원본ID") not in _detail_matching]
+        if analysis.filters.기관명:
+            _detail_excl_matches = [p for p in _detail_excl_matches if p.get("기관명") == analysis.filters.기관명]
+        _detail_excl_matches = _detail_excl_matches[:KEYWORD_SCAN_LIMIT]
+        if _detail_excl_matches:
+            # ⚠️ 긍정 매칭(위 _detail_match)과 달리 여기서는 기존 results를 뒤에 덧붙이지
+            # 않고 통째로 교체한다 — "~아닌"은 하드 제약이라 단 1건이라도 위반하면 안 되는데,
+            # (실측) 기존 벡터검색 results를 그대로 남겨두면 그 안에 섞여있던 값=FTP인
+            # 레코드가 뒤쪽에 남아 있다가 답변 LLM이 그걸 골라버리는 사례가 재현됨
+            # (10회 중 4회, 1건씩 누출). 이 교체 집합 자체가 이미 전체(all-matching)를
+            # 코드로 정확히 계산한 완전한 결과라 기존 results를 보존할 이유도 없다.
+            results = _detail_excl_matches
+        analysis.filters = analysis.filters.model_copy(update={"키워드": None})
 
     if excluded_org:
         # 첨부 청크는 기관명 필드 자체가 없어(None) 이 비교를 그냥 통과하는데, 화면에
@@ -3880,6 +3929,12 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
                 f"[이 자료의 {_detail_label}은(는) '{payload[_detail_label]}'로, '{_detail_value}' 조건을 "
                 "코드가 직접 확인했다. 이 조건을 이미 만족하는 것으로 신뢰하고, 본문에 그 사실이 "
                 "적혀있는지 스스로 재확인하려 하지 마라.] " + text
+            )
+        if _detail_excl_match:
+            text = (
+                f"[이 자료의 {_detail_excl_label}은(는) '{_detail_excl_value}'가 아닌 것으로 코드가 직접 "
+                "확인했다. 이 제외 조건을 이미 만족하는 것으로 신뢰하고, 본문에 그 사실이 적혀있는지 "
+                "스스로 재확인하려 하지 마라.] " + text
             )
         if context_blocks and context_chars + len(text) > _CONTEXT_CHAR_BUDGET:
             context_truncated = True
