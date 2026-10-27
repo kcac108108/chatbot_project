@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from qdrant_client.http import models as qmodels
 
 from app.core.config import CHAT_TOP_K
+from app.core.config import DB_TABLE_SUFFIX as _SFX
 from app.core.db import fetch_all
 from app.core.openai_client import chat_parse, embed_texts
 from app.core.vectordb import (
@@ -704,7 +705,13 @@ def _excluded_rounds(text: str) -> list[int]:
 # ground truth 7건인데 0건 응답). 연도/차수와 달리 값 자체가 숫자 토큰이 아니라 다글자
 # 문자열이라 토큰 정규식 대신 알려진 값(_KNOWN_COMMITTEE_RESULTS) 각각이 본문에 등장하는지
 # 직접 찾고, 그 바로 뒤에 제외 신호("아닌"/빼고/제외/말고)가 있는지 확인한다.
-_RESULT_EXCLUSION_TAIL_RE = re.compile(r"^\s*(?:이|가)?\s*(?:아닌|빼고|제외|말고)")
+# "원안수용도 아니고 제공불가도 아닌거" 같은 이중 부정(A도 아니고 B도 아닌)에서
+# "도"(보조사) + "아니고"(연결형)를 놓쳐 둘 다 전혀 안 걸리던 버그 실측 확인(2026-10-27,
+# 두 값 모두 있는데도 "찾지 못함" — 조사 "이/가"만 지원하고 "도"는 빠져있었고, 형태도
+# 명사수식형 "아닌"만 지원하고 연결형 "아니고"는 빠져있었음). 한글 "아니다" 활용형은
+# "아니"+받침이 결합해(예: 아니+ㄴ→닌) 어간이 리터럴 부분문자열로 안 남으므로 각 활용형을
+# 명시적으로 나열해야 한다.
+_RESULT_EXCLUSION_TAIL_RE = re.compile(r"^\s*(?:이|가|도)?\s*(?:아니고|아니며|아니라|아닌|빼고|제외|말고)")
 
 
 def _excluded_committee_results(text: str) -> list[str]:
@@ -2538,7 +2545,7 @@ def _list_field_answer(field: str, menu: str | None, exclude: str | None = None)
     table, column = table_map[chosen_menu]
     # DISTINCT — 같은 값(예: 업체명)이 여러 건에 걸쳐 반복되면(관세청 8건 등) 그 개수만큼
     # 똑같은 이름이 나열되는 문제 방지. "업체명 목록"이 원하는 건 건수가 아니라 고유한 이름들.
-    rows = fetch_all(f"SELECT DISTINCT {column} FROM {table} WHERE {column} IS NOT NULL ORDER BY {column}")
+    rows = fetch_all(f"SELECT DISTINCT {column} FROM {table}{_SFX} WHERE {column} IS NOT NULL ORDER BY {column}")
     values = [r[column] for r in rows]
     # "목록에서 OO 빼고 알려줘" — direct SQL 조회라 제외 하나쯤은 완전하고 정확하게 처리
     # 가능(2026-10-22). 부분 문자열 포함으로 비교해 "한국환경공단"뿐 아니라 그 값이 포함된
@@ -2996,6 +3003,27 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
             return ChatResponse(session_id=session_id, answer=answer_text, sources=[])
         # field를 끝내 못 정했으면(요청자/제공자처럼 전체목록조회 자체를 지원 안 하는 항목)
         # 엉뚱한 필드로 답하는 대신 목록조회 처리를 포기하고 아래 일반 검색으로 넘어간다.
+
+    # "원안수용도 아니고 제공불가도 아닌거 있어?" 같은 다중 값 제외 질문을, 집계질문
+    # 분류기가 "아니다"를 반복하는 복잡한 불리언 구조만 보고 가끔(2026-10-27 실측 4회
+    # 중 2회) 통계·집계 질문으로 잘못 분류하는 비결정성이 확인됨 — 실제로는 조건에 맞는
+    # 레코드를 찾는 평범한 필터링 검색(위 각종 _excluded_* 제외 탐지 함수가 처리)인데,
+    # is_aggregation_question이 true면 검색을 아예 안 해보고 바로 거절해버려 ground truth
+    # 9건이 있어도 못 찾는다. 질문 원문에 실제 제외 대상 값이 하나라도 뽑히면 "집계가
+    # 아니라 조건부 필터링 검색"이라는 강한 신호이므로 집계 판단을 되돌린다.
+    if analysis.is_aggregation_question and (
+        _excluded_committee_results(question)
+        or _excluded_committee_results(analysis.standalone_question)
+        or _excluded_statistics_types(question)
+        or _excluded_statistics_types(analysis.standalone_question)
+        or _excluded_trade_types(question)
+        or _excluded_trade_types(analysis.standalone_question)
+        or _excluded_years(question)
+        or _excluded_years(analysis.standalone_question)
+        or _excluded_rounds(question)
+        or _excluded_rounds(analysis.standalone_question)
+    ):
+        analysis.is_aggregation_question = False
 
     if analysis.is_aggregation_question:
         session_store.append_turn(session_id, question, AGGREGATION_REFUSAL)
