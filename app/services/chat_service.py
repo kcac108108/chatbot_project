@@ -638,6 +638,22 @@ def _is_non_name_token(name: str) -> bool:
     return False
 
 
+# "홈페이지 보안 점검 내용이 있는 자료 알려줘"에서 질문분석 LLM이 키워드를 핵심 주제어
+# ("홈페이지 보안")가 아니라 수식어까지 통째로("홈페이지 보안 점검 내용") 뽑아버리는
+# 버그가 실측 확인됨(2026-10-27 — ground truth 15건이 실제로 있는데도 scan_text_contains가
+# 그 긴 구절 그대로는 본문 어디에도 안 걸려 0건). "내용"/"관련" 등은 거의 항상 질문의
+# 문법적 수식어일 뿐 실제 본문에 그대로 안 붙어 있을 가능성이 높으므로, 뒤쪽부터
+# 제거해본다(앞쪽 핵심어는 보존).
+_KEYWORD_FILLER_WORDS = {"내용", "관련", "자료", "있는", "있어", "것", "건", "거"}
+
+
+def _strip_keyword_filler(keyword: str) -> str:
+    tokens = keyword.split()
+    while len(tokens) > 1 and tokens[-1] in _KEYWORD_FILLER_WORDS:
+        tokens.pop()
+    return " ".join(tokens)
+
+
 def _excluded_role_values(text: str) -> list[str]:
     m = _EXCLUSION_NAME_RE.search(text or "")
     if not m:
@@ -2841,6 +2857,11 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         _resolve_relative_month_words(_resolve_relative_year_words(question)), history
     )
     allowed_data_types = _MENU_SCOPE_DATA_TYPES.get(menu_scope)
+
+    if analysis.filters.키워드:
+        trimmed = _strip_keyword_filler(analysis.filters.키워드)
+        if trimmed != analysis.filters.키워드:
+            analysis.filters = analysis.filters.model_copy(update={"키워드": trimmed})
 
     # "내부자료에서 댓글 달린 글 알려줘"/"~있는거 알려줘"처럼 "~달린/있는" 서술형 수식이
     # 붙으면 필터 추출이 "댓글"을 키워드로 안 뽑는 경우가 재현됨(2026-10-19 즉흥 테스트
