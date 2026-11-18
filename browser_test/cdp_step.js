@@ -24,7 +24,10 @@ const { chromium } = require('playwright');
   }
 
   if (question) {
-    const input = page.locator('textarea, input[type="text"]').first();
+    // #question로 명시 지정(2026-11-12) — 사이드바에 "빠른 검색" input[type="text"]가
+    // 새로 생겨 DOM 순서상 더 앞에 와서, 예전 범용 셀렉터(textarea, input[type="text"])의
+    // .first()가 그 입력창을 집을 수 있음.
+    const input = page.locator('#question');
     const sendBtn = page.locator('#send');
     await input.fill(question);
     await input.press('Enter');

@@ -249,11 +249,15 @@ def extract_for_review(docucd: str, out_dir: Path) -> list[dict]:
 
 
 def _build_entries_for_text(
-    parent_id: str, att_num, filename: str, text: str, data_type: str
+    parent_id: str, att_num, filename: str, text: str, data_type: str, file_path: str | None = None
 ) -> list[tuple[str, dict]]:
     """추출된 원문 텍스트 하나를 (쪽번호 제거→요약→토큰 기준 분할→payload 조립)까지
     처리해 Qdrant에 넣을 (source_id, payload) 목록으로 만든다. 수동 파이프라인
-    (ingest_attachments)과 신규 이력 자동처리 파이프라인이 공용으로 쓴다."""
+    (ingest_attachments)과 신규 이력 자동처리 파이프라인이 공용으로 쓴다.
+
+    file_path(TM_ATTFILE.FILE_PATH)를 payload에 같이 저장해두면, 경로전용(SQL/카탈로그성)
+    첨부뿐 아니라 내용이 있는 일반 첨부도 원본 파일을 다운로드할 수 있게 된다
+    (2026-11-05 — 그 전까지는 경로전용 첨부에만 파일경로가 저장돼 있었음)."""
     text = _strip_page_numbers(text)
     parent_context = _attachment_parent_context(data_type, parent_id)
     summary = _summarize_attachment(text, filename, parent_context)
@@ -270,6 +274,8 @@ def _build_entries_for_text(
             "첨부파일명": filename,
             "요약": summary,
         }
+        if file_path:
+            payload["파일경로"] = file_path
         entries.append((source_id, payload))
     return entries
 
@@ -336,6 +342,8 @@ def ingest_attachments(docucd: str, review_dir: Path | None = None) -> int:
                 continue
             print(f"[attachment_ingest:{docucd}] 추출완료({len(text)}자): {filename}")
 
-        entries += _build_entries_for_text(parent_id, att["ATTFILE_NUM"], filename, text, data_type)
+        entries += _build_entries_for_text(
+            parent_id, att["ATTFILE_NUM"], filename, text, data_type, file_path=att["FILE_PATH"]
+        )
 
     return _upsert_entries(data_type, entries, f"attachment_ingest:{docucd}")

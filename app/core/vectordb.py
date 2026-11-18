@@ -8,20 +8,59 @@ from app.core.config import QDRANT_COLLECTION, QDRANT_HOST, QDRANT_PORT
 EMBEDDING_DIM = 3072  # text-embedding-3-large 기본 차원
 
 
+# 키워드를 "영문·숫자 연속 구간은 하나로 묶고, 한글은 음절 하나하나를, 그 외 문자(기호
+# 등)는 한 글자씩" 단위로 쪼갠다 — 공백 자체는 세 패턴 어디에도 안 걸려 findall이 자동으로
+# 건너뛴다. 이 단위들 사이에만 선택적 공백(\s*)을 허용하고 단위 "안"은 절대 안 쪼갠다.
+# 그래서 "SSL" 같은 영문 약어는 항상 원자적으로 유지돼(2026-10-16에 막은 "KORS"+"SLUT"→
+# "SSL" 우연한 교차매칭 위험이 재발하지 않음) 안전하고, 한글 복합명사는 음절 사이
+# 공백을 자유롭게 허용해 "국가항목"↔"국가 항목" 표기 차이를 흡수한다(2026-11-05 사용자
+# 제보: "국가항목을 요청한 이력"은 못 찾는데 "국가 항목을"은 찾아짐 — 순수 한글만
+# 대상으로 1차 수정했다가, "SSL인증서"처럼 영문+한글이 섞인 복합어는 여전히 못 찾는
+# 걸 재발견해 이 방식으로 일반화함). 기존에 키워드 자체에 이미 공백이 있던 경우
+# ("국가 항목"으로 직접 입력)도 같은 토큰화를 거치므로 동일한 패턴으로 수렴한다.
+# `\S`(공백 아닌 모든 문자) 폴백을 넣어 기호가 섞인 키워드("A/S" 등)에서도 그 기호가
+# 토큰에서 통째로 누락돼 패턴이 아예 안 맞는 일이 없게 한다(1차 구현에서 발견해 수정).
+_KEYWORD_TOKEN_RE = re.compile(r"[A-Za-z0-9]+|[가-힣]|\S")
+
+
 def keyword_matches(keyword: str, *texts: str) -> bool:
     """키워드가 텍스트 안에 (띄어쓰기 차이는 무시하고) 실제로 포함되는지 확인한다.
-    키워드 자신의 공백 위치에만 선택적 공백(\\s*)을 허용하고 나머지는 원문 그대로
-    검색한다 — 예전엔 haystack 전체의 공백을 전부 지우고 비교했는데, 그러면 전혀
-    무관한 단어들이 우연히 이어 붙어 키워드를 만들어내는 거짓 매칭이 생긴다
-    (2026-10-16 실측 확인: "MICHAEL KORS"+"SLUT" 브랜드 나열이 공백 제거 시
-    "...KORSSLUT..."가 되어 'SSL'을 우연히 포함, 완전히 무관한 문서가 "SSL 관련
-    자료"로 지어내짐 — 짧은 키워드일수록 이 우연한 교차 매칭 위험이 큼). 키워드
-    내부에 공백이 없으면(예: "SSL") 이 함수는 사실상 평범한 리터럴 부분 문자열
-    검색과 같아져 원문의 단어 경계를 그대로 존중한다."""
-    parts = keyword.split()
-    if not parts:
+    예전엔 haystack 전체의 공백을 전부 지우고 비교했는데, 그러면 전혀 무관한 단어들이
+    우연히 이어 붙어 키워드를 만들어내는 거짓 매칭이 생긴다(2026-10-16 실측 확인:
+    "MICHAEL KORS"+"SLUT" 브랜드 나열이 공백 제거 시 "...KORSSLUT..."가 되어 'SSL'을
+    우연히 포함, 완전히 무관한 문서가 "SSL 관련 자료"로 지어내짐). 대신 키워드 자신을
+    "영문·숫자 연속 구간"과 "한글 음절" 단위로 쪼개 그 사이에만 선택적 공백을 허용한다
+    — 영문 약어("SSL")는 내부가 절대 안 쪼개지므로 단어 경계를 넘나드는 우연한 매칭
+    위험이 없고, 한글은 음절 단위라 "국가항목"/"국가 항목" 표기 차이를 모두 흡수한다."""
+    tokens = _KEYWORD_TOKEN_RE.findall(keyword)
+    if not tokens:
         return False
-    pattern = re.compile(r"\s*".join(re.escape(p) for p in parts))
+    # 토큰 사이 공백 허용을 "같은 줄(스페이스/탭)"로만 한정 — 줄바꿈(\n)까지 허용하면
+    # 완전히 다른 줄(다른 필드·다른 문장)의 끝 음절과 다음 줄의 시작 음절이 우연히
+    # 이어져 거짓 매칭이 생긴다(2026-11-10 실측 확인: "0원\n유예기간"의 "원"+줄바꿈+
+    # "유"가 "원유" 키워드와 매칭됨 — 완전히 무관한 "원"(통화단위)과 "유"(유예)가
+    # 전혀 다른 두 단어의 일부인데도 합쳐짐). 2글자 한글 단어일수록 음절 각각이
+    # 흔해서 문서 전체에서 이런 우연한 인접이 생길 확률이 높다. "자료 제공"/
+    # "자료제공"처럼 같은 줄 안에서 띄어쓰기만 다른 경우는 그대로 허용된다.
+    pattern_str = r"[ \t]*".join(re.escape(t) for t in tokens)
+    # 영문·숫자 약어("DDP", "CVD" 등)는 완전히 무관한 더 긴 영숫자 토큰 안에 그냥
+    # 부분문자열로 끼어있을 수 있다(2026-11-11 실측 확인: "DDP"가 국채 등기사항증명서의
+    # 발급확인번호 "OAVX-MDDP-ZYW2"에 우연히 포함돼, 실제로는 무역조건(DDP, Delivered
+    # Duty Paid)과 전혀 무관한 문서를 답변 LLM이 "DDP 조건이 언급된다"고 확신에 차서
+    # 지어내는 걸로 이어짐). 한글은 Python의 \w 판정에 포함돼 일반적인 \b 경계를 못 쓰므로
+    # (그러면 "SSL인증서"처럼 영문 뒤에 한글이 바로 붙는 정상 케이스까지 막힘), 매칭의
+    # 시작/끝이 영문·숫자 토큰일 때만 "그 앞/뒤에 영문·숫자가 더 이어지지 않는지"를
+    # 직접 확인하는 lookaround를 건다 — 한글·공백·기호가 앞뒤에 오는 건 전혀 안 막는다.
+    if tokens[0].isascii() and tokens[0].isalnum():
+        pattern_str = r"(?<![A-Za-z0-9])" + pattern_str
+    if tokens[-1].isascii() and tokens[-1].isalnum():
+        pattern_str = pattern_str + r"(?![A-Za-z0-9])"
+    # 영문 키워드는 대소문자를 구분하면 안 된다 — "SSL"로 쓰면 찾아지는데 "ssl"/"Ssl"로
+    # 쓰면 0~1건만 찾아지는 버그가 실측 확인됨(2026-11-12, "빠른 검색" 2라운드 테스트 —
+    # 대문자 SSL=4건, 소문자 ssl=1건, 혼합 Ssl=0건으로 전부 다르게 나옴). 문서 작성자마다
+    # 대소문자 표기가 제각각일 수 있어(SSL/ssl/Ssl 전부 실제로 등장) 사용자가 어떤
+    # 대소문자로 입력하든 전부 찾아야 한다. 한글(대소문자 구분 없음)·숫자엔 영향 없음.
+    pattern = re.compile(pattern_str, re.IGNORECASE)
     return any(pattern.search(t) for t in texts if t)
 
 _client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
@@ -204,3 +243,80 @@ def scan_field_contains(field: str, value: str, limit: int, data_type: str | Non
         if offset is None:
             break
     return matches
+
+
+def scan_detail_field_contains(
+    labels: tuple[str, ...], value: str, limit: int, data_types: set[str] | None = None
+) -> list[dict]:
+    """메타데이터 최상위가 아니라 `세부항목`(라벨별 원본 컬럼값 리스트) 안의 특정 라벨
+    값에 부분 문자열로 포함됐는지 본다. "제공항목"/"요청항목"처럼 콤마로 구분된 여러
+    항목명이 한 값에 같이 들어있는 필드(예: "HS코드, 지역, 세관, 국가, ...")에서, 그중
+    하나("지역")가 실제로 제공/요청되는 자료를 찾기 위한 것 — scan_text_contains(본문
+    전체 전수 스캔)로는 그 단어가 요청목적·주요내용 같은 서술문 안에 그냥 언급만 돼도
+    걸려서, 진짜 대상(필드값 자체에 그 항목이 열거된 레코드)이 노이즈에 묻힌다(2026-11-18,
+    차영경 "지역 항목이 제공되는 업체" 제보 — 전체 '지역' 전수스캔은 728건이나 걸리고
+    그중 다수가 '지역 수출기업 모니터링'처럼 완전히 무관한 서술문 매칭, 진짜 대상(제공항목에
+    '지역'을 실제로 열거한 33건)은 전혀 못 찾음). scan_field_contains와 달리 세부항목은
+    레코드마다 라벨 종류가 다를 수 있어(labels 튜플로 여러 라벨 허용 — 예: 신청이력의
+    "제공항목", 심의위원회의 "요청항목"/"제공항목"), 라벨이 일치하는 항목 중 하나라도
+    값이 매칭되면 그 레코드를 채택한다."""
+    normalized_value = "".join(value.split())
+    matches: list[dict] = []
+    offset = None
+    while True:
+        points, offset = _client.scroll(
+            collection_name=QDRANT_COLLECTION,
+            limit=200,
+            offset=offset,
+            with_payload=True,
+            with_vectors=False,
+        )
+        for p in points:
+            if data_types is not None and p.payload.get("데이터유형") not in data_types:
+                continue
+            for item in p.payload.get("세부항목") or []:
+                if item.get("label") not in labels:
+                    continue
+                field_value = item.get("value") or ""
+                if normalized_value in "".join(field_value.split()):
+                    matches.append(p.payload)
+                    if len(matches) >= limit:
+                        return matches
+                    break
+        if offset is None:
+            break
+    return matches
+
+
+def find_sources_with_multiple_attachments(
+    attachment_data_type: str, min_count: int = 2, limit: int = 20
+) -> list[str]:
+    """"첨부파일 여러 개 달린 OO 있어?" 같은 수량 질문용(2026-11-10) — 큰 첨부가 여러
+    조각(청크)으로 쪼개져 있을 수 있어 단순 청크 개수로는 "첨부 몇 개"를 못 세므로,
+    원본ID별로 서로 다른 첨부파일명(첨부파일명 필드)이 몇 종류인지 센다. 전수 스캔(최대
+    900건 가정)이라 비용이 있지만, 질문 자체가 코퍼스 전체에 대한 존재 질문이라 narrowing
+    없이는 피할 수 없다 — 벡터 top-K로 응답하면 6개 임의 표본만 보고 "없다"고 확신에 차서
+    틀리게 답하는 버그가 재현됐다(ground truth 69건인데 top-6 중엔 하나도 없어 전부
+    없다고 답함)."""
+    counts: dict[str, set[str]] = {}
+    offset = None
+    while True:
+        points, offset = _client.scroll(
+            collection_name=QDRANT_COLLECTION,
+            limit=200,
+            offset=offset,
+            with_payload=True,
+            with_vectors=False,
+        )
+        for p in points:
+            if p.payload.get("데이터유형") != attachment_data_type:
+                continue
+            source_id = p.payload.get("원본ID")
+            filename = p.payload.get("첨부파일명")
+            if not source_id or not filename:
+                continue
+            counts.setdefault(source_id, set()).add(filename)
+        if offset is None:
+            break
+    matched = [sid for sid, names in counts.items() if len(names) >= min_count]
+    return matched[:limit]

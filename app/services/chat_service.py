@@ -15,17 +15,21 @@ from app.core.vectordb import (
     find_by_type_and_field,
     find_by_type_and_fields,
     find_by_type_and_source,
+    find_sources_with_multiple_attachments,
     keyword_matches,
+    scan_detail_field_contains,
     scan_field_contains,
     scan_text_contains,
 )
 from app.core.vectordb import search as vector_search
 from app.models.schemas import (
     AnswerDetail,
+    AnswerGroup,
     ChatResponse,
     FilterExtraction,
     GroundedAnswer,
     HistoryItem,
+    KeywordSearchResponse,
     QueryAnalysis,
     RelatedAttachment,
     SourceItem,
@@ -337,13 +341,17 @@ def _find_related_attachments(
             # (파일경로 필드 자체는 다운로드 링크 생성에 필요해 그대로 둠).
             file_path = chunk.get("파일경로")
             preview = "내용은 제공하지 않는 자료입니다. 아래에서 파일을 다운로드할 수 있습니다."
-            item = RelatedAttachment(첨부파일명=filename, 미리보기=preview, 파일경로=file_path)
+            item = RelatedAttachment(첨부파일명=filename, 미리보기=preview, 파일경로=file_path, 경로전용=True)
         else:
             # 원문 전체를 그대로 보여주면 "번잡스럽고 정리 안 된" 느낌이라는 피드백에 따라,
             # 적재 시점에 미리 만들어둔 요약(요약)을 우선 사용 — 옛 데이터라 요약이 없으면
             # (재적재 전) 원문 미리보기로 폴백.
             preview = chunk.get("요약") or _preview(chunk.get("text"), attachment_type) or ""
-            item = RelatedAttachment(첨부파일명=filename, 미리보기=preview)
+            # 파일경로는 2026-11-05부터 일반 첨부에도 저장됨(그 전 적재분은 backfill 전까지
+            # 없을 수 있어 None으로 폴백 — 그러면 화면엔 다운로드 링크 없이 요약/상세만 뜸).
+            item = RelatedAttachment(
+                첨부파일명=filename, 미리보기=preview, 파일경로=chunk.get("파일경로")
+            )
         related.append(item)
         if keyword and filename in matched_filenames:
             matched.append(item)
@@ -470,14 +478,53 @@ def _build_source_item(payload: dict, keyword: str | None = None) -> SourceItem:
     data_type = payload["데이터유형"]
     source_id = payload["원본ID"]
     preview = payload.get("요약") or _preview(payload.get("text"), data_type)
+    related = _find_related_attachments(data_type, source_id, keyword)
+    # 부모 레코드가 없어(2026-09-17에 이미 확인된 "DB에서만 삭제되고 파일은 남는" 패턴 등)
+    # 첨부 자신이 그대로 최상위 출처가 되는 경우, data_type 자체가 첨부 타입이라 위
+    # _find_related_attachments가 관련첨부를 못 찾는다(그 함수는 base type만 받는다) —
+    # SourceItem엔 파일경로/경로전용 필드 자체가 없어 다운로드 기능이 조용히 사라지는
+    # 문제가 실측 확인됨(2026-11-12, "빠른 검색"으로 고아 레코드인 경로전용 첨부가 직접
+    # 매칭된 경우 — "효성계열사 전송 오류..."). 첨부 자신을 관련첨부 목록에 하나 넣어
+    # 기존 RelatedAttachment 렌더링(다운로드 버튼·요약/상세 토글)을 그대로 재사용한다.
+    if not related and data_type in _BASE_TYPE_OF and payload.get("첨부파일명"):
+        if payload.get("경로전용"):
+            self_preview = "내용은 제공하지 않는 자료입니다. 아래에서 파일을 다운로드할 수 있습니다."
+        else:
+            self_preview = preview or ""
+        related = [
+            RelatedAttachment(
+                첨부파일명=payload["첨부파일명"],
+                미리보기=self_preview,
+                파일경로=payload.get("파일경로"),
+                경로전용=bool(payload.get("경로전용", False)),
+            )
+        ]
     return SourceItem(
         데이터유형=data_type,
         원본ID=source_id,
         기관명=payload.get("기관명"),
         미리보기=preview,
         세부항목=payload.get("세부항목") or [],
-        관련첨부=_find_related_attachments(data_type, source_id, keyword),
+        관련첨부=related,
     )
+
+
+def _resolve_source_for_payload(payload: dict, keyword: str | None = None) -> SourceItem:
+    """payload 하나를 화면에 보여줄 SourceItem으로 확정한다 — 첨부 청크가 검색의 직접
+    출처로 잡히면, 그 첨부 하나만 뚝 떼서 보여주지 않고 부모 이력(기관정보/신청이력/
+    외부요청/내부자료/심의위원회)의 표를 메인으로 보여주고 실제 매칭된 첨부는 관련첨부로
+    묶는다 — 부모 이력엔 항상 정해진 컬럼(세부항목 표)이 있어 형태가 일관되고, 첨부만
+    단독으로 나올 때보다 깔끔하다는 사용자 확인(2026-09-21)에 따름. index 기반 조회
+    (`_resolve_source`)와 키워드 빠른 검색(`keyword_search`) 양쪽이 공유한다."""
+    data_type = payload["데이터유형"]
+    source_id = payload["원본ID"]
+    base_type = _BASE_TYPE_OF.get(data_type)
+    if base_type:
+        parents = find_by_type_and_source(base_type, source_id, limit=1)
+        if parents:
+            return _build_source_item(parents[0], keyword)
+        # 부모 레코드를 못 찾으면(데이터 정합성 예외 상황) 기존처럼 첨부 자체를 보여준다.
+    return _build_source_item(payload, keyword)
 
 
 def _resolve_source(idx: int, results: list[dict], keyword: str | None = None) -> SourceItem | None:
@@ -489,22 +536,7 @@ def _resolve_source(idx: int, results: list[dict], keyword: str | None = None) -
         idx = 1
     if not (1 <= idx <= len(results)):
         return None
-    payload = results[idx - 1]
-    data_type = payload["데이터유형"]
-    source_id = payload["원본ID"]
-
-    # 첨부 청크가 검색의 직접 출처로 잡히면, 그 첨부 하나만 뚝 떼서 보여주지 않고 부모
-    # 이력(기관정보/신청이력/외부요청/내부자료/심의위원회)의 표를 메인으로 보여주고 실제
-    # 매칭된 첨부는 관련첨부로 묶는다 — 부모 이력엔 항상 정해진 컬럼(세부항목 표)이 있어
-    # 형태가 일관되고, 첨부만 단독으로 나올 때보다 깔끔하다는 사용자 확인(2026-09-21)에 따름.
-    base_type = _BASE_TYPE_OF.get(data_type)
-    if base_type:
-        parents = find_by_type_and_source(base_type, source_id, limit=1)
-        if parents:
-            return _build_source_item(parents[0], keyword)
-        # 부모 레코드를 못 찾으면(데이터 정합성 예외 상황) 기존처럼 첨부 자체를 보여준다.
-
-    return _build_source_item(payload, keyword)
+    return _resolve_source_for_payload(results[idx - 1], keyword)
 
 
 def _build_details(grounded: GroundedAnswer, results: list[dict], keyword: str | None = None) -> list[AnswerDetail]:
@@ -526,6 +558,39 @@ def _build_details(grounded: GroundedAnswer, results: list[dict], keyword: str |
                 continue
             seen.add(key)
         resolved.append((group, source))
+
+    # "건별 상세"가 여러 개일 때, 순서가 LLM이 groups를 만든(사실상 임의의) 순서를
+    # 그대로 따르다 보니 "1번째가 2024년, 2번째가 2025년, 3번째가 2023년" 처럼 연도가
+    # 뒤죽박죽으로 보인다는 사용자 지적(2026-11-16) — 신청일/요청일/등록일(세부항목,
+    # 신청이력·외부요청·내부자료) 또는 그게 없으면 연도(심의위원회)로 최신순(내림차순)
+    # 정렬한다. 이 방향은 이 프로젝트 기존 SQL 쿼리(MENU1_QUERY/MENU4_QUERY)가 전부
+    # `ORDER BY ... DESC`를 쓰는 것과 일관된 선택. 날짜/연도 둘 다 확인 안 되는 건(극히
+    # 드묾)은 방향과 무관하게 항상 맨 뒤로 보낸다 — 순서를 못 매기는 걸 임의 위치에
+    # 끼워 넣지 않기 위함. 여러 건 중 하나만 있을 때(아래 len==1 분기)는 정렬해도 영향
+    # 없으므로 그 분기 전에 적용해도 안전하다.
+    if len(resolved) > 1:
+        _sort_cache: dict = {}
+
+        def _detail_sort_key(entry) -> str | None:
+            group, source = entry
+            if source is None:
+                return None
+            idx = 1 if len(results) == 1 else group.source_index
+            if not (1 <= idx <= len(results)):
+                return None
+            raw_payload = results[idx - 1]
+            date = _extract_application_date(raw_payload, _sort_cache)
+            if date:
+                return date
+            year = _extract_year(raw_payload, _sort_cache)
+            if year is not None:
+                return f"{year:04d}"
+            return None
+
+        _keyed = [(_detail_sort_key(e), e) for e in resolved]
+        _dated = sorted((t for t in _keyed if t[0] is not None), key=lambda t: t[0], reverse=True)
+        _undated = [e for k, e in _keyed if k is None]
+        resolved = [e for _, e in _dated] + _undated
 
     if len(resolved) == 1:
         # 그룹이 하나뿐일 때 "1번째 건"으로 라벨링하면, 사용자가 "두번째" 등 특정 건을
@@ -568,6 +633,59 @@ def _preview(text: str | None, data_type: str | None = None) -> str | None:
     return text if len(text) <= limit else text[:limit] + "…"
 
 
+# B-73(2026-11-16) 완전성 보강이 LLM 그룹화에서 빠진 자료를 메울 때, 아무 내용 없는
+# "이 자료의 세부 내용은 아래 근거자료 카드에서 확인할 수 있습니다."만 넣고 있었는데,
+# 사용자가 "제목이나 요청내용으로 보여주기로 하지 않았냐"고 정확히 지적(2026-11-18,
+# 운영 화면 스크린샷 — 8건 중 3건이 이 무의미한 placeholder였음). `chunk_builder.py`의
+# 5개 메뉴 전부 세부항목 리스트의 맨 첫 항목이 제목/사업명(사람이 한눈에 알아볼 수 있는
+# 식별 정보)이 되도록 이미 설계돼 있음을 확인(`build_menu1~4_chunks`) — 그 첫 항목을
+# 그대로 보여주면 클릭 없이도 스캔 가능해진다. 첨부 청크는 세부항목 자체가 없으므로
+# (2026-10-13 확정) 사전 생성 요약 또는 파일명으로 대체한다.
+_FALLBACK_NARRATIVE_LEN = 100
+
+
+def _keyword_centered_snippet(text: str, keyword: str | None, limit: int) -> str:
+    """키워드가 본문 앞부분이 아니라 뒤쪽에 있으면, 무조건 앞에서부터 자르는 방식으론
+    그 키워드가 들어간 핵심 구절 자체가 잘려나가 "왜 이게 매칭됐는지" 전혀 안 보이는
+    문제가 실측 확인됨(2026-11-18 — "수수료" 키워드로 좁힌 질문의 첨부 요약 fallback이
+    매번 앞쪽 배경 설명만 보여주고 정작 "교부 수수료는 건당 400원..." 부분은 100자
+    제한에 잘려나가, 사용자가 "내용도 수수료와 관련된게 없는거 같다"고 정확히 지적).
+    키워드 위치를 찾아 그 주변으로 윈도우를 옮긴다 — 못 찾으면(키워드 없음 등) 기존처럼
+    앞에서부터 자른다. `keyword_matches`(app/core/vectordb.py)만큼 엄밀할 필요는 없는
+    순수 표시용 스니펫이라, 띄어쓰기 차이만 느슨하게 흡수하는 가벼운 탐색으로 충분하다."""
+    if len(text) <= limit:
+        return text
+    idx = text.find(keyword) if keyword else -1
+    if idx == -1 and keyword:
+        m = re.search(r"[ \t]*".join(re.escape(c) for c in keyword), text)
+        idx = m.start() if m else -1
+    if idx == -1:
+        return text[:limit] + "…"
+    half = limit // 2
+    end = min(len(text), max(idx + half, limit))
+    start = max(0, end - limit)
+    prefix = "…" if start > 0 else ""
+    suffix = "…" if end < len(text) else ""
+    return prefix + text[start:end] + suffix
+
+
+def _fallback_narrative_for_payload(payload: dict, keyword: str | None = None) -> str:
+    detail_items = payload.get("세부항목") or []
+    if detail_items:
+        label = detail_items[0].get("label")
+        value = _keyword_centered_snippet(str(detail_items[0].get("value") or ""), keyword, _FALLBACK_NARRATIVE_LEN)
+        if label and value:
+            return f"{label}: {value}"
+    filename = payload.get("첨부파일명")
+    summary = payload.get("요약")
+    if filename and summary:
+        short_summary = _keyword_centered_snippet(summary, keyword, _FALLBACK_NARRATIVE_LEN)
+        return f"{filename} — {short_summary}"
+    if filename:
+        return f"첨부파일: {filename}"
+    return "이 자료의 세부 내용은 아래 근거자료 카드에서 확인할 수 있습니다."
+
+
 _PERSON_ROLE_FIELDS = {"요청자", "제공자", "담당자", "결재자"}
 
 # "박상용 계장 말고 다른 사람이 요청한 외부요청은 없어?" 같은 제외(negation) 후속질문이,
@@ -604,8 +722,49 @@ _EXCLUSION_NAME_RE = re.compile(
     # 거의 뭐든 걸렸음). "아니고/아니며/아니라/아닌"은 반드시 "도"가 직접 앞에 와야만
     # (즉 "전봉석도 아니고"처럼 명시적 다중 제외 나열 구조일 때만) 트리거로 인정하고,
     # 원래부터 지원하던 "말고/빼고/제외하고/외에/외"는 그대로 particle 없이 둔다.
-    r"\s*(?:도\s*(?:아니고|아니며|아니라|아닌)|말고|빼고|제외하고|외에|외\s)"
+    # "박민우랑 전봉석 둘 다 아닌"(공용 트리거에 "둘 다"가 끼는 구조)도 같은 계열 —
+    # "A이랑 B 말고"와 문법 구조는 같은데 트리거만 "둘 다 아닌"이라 전혀 매칭 안 되던
+    # 것이 2026-11-04 즉흥 테스트로 발견됨(9건이 정답인데 "찾지 못함").
+    # "이외"(의)도 같은 뜻인데 트리거 목록에 없었음 — standalone_question 재작성이 "말고"를
+    # "이외의"로 바꾸는 경우가 흔한데("한국환경공단 말고"→"한국환경공단 이외의"), "외에"/
+    # "외\s"로는 "이외의"(외 바로 뒤에 공백 없이 "의"가 옴)를 못 잡아 제외 감지가 재현율
+    # 1/6~2/6로 들쭉날쭉한 게 실측 확인됨(2026-11-10).
+    r"\s*(?:도\s*(?:아니고|아니며|아니라|아닌)|둘\s*다\s*(?:아니고|아니며|아니라|아닌)|말고|빼고|제외하고|외에|외\s|이외)"
 )
+
+# "박민우가 아닌 사람이 담당한 자료"처럼 1명만 "도" 없이 "가/이 아닌"으로 제외하는 가장
+# 자연스러운 표현은 위 _EXCLUSION_NAME_RE가 원래 지원 못 한다 — "도"를 필수로 둔 이유가
+# 바로 이 "가/이 아닌" 단순 트리거였기 때문(2026-10-27, "통계가 아닌 것은" 같은 무관한
+# 일반 부정문에서 "통계가"가 이름으로 오매칭되는 회귀를 막으려고 일부러 제거함). 그 결과
+# _EXCLUSION_NAME_RE가 아예 매칭 안 돼 excluded_names=[]가 되고, 제외 필터링이 전혀
+# 적용 안 된 채로 LLM이 "~가 아닌 자료가 있습니다"라고 거짓으로 서술하는 훨씬 심각한
+# 버그가 실측 확인됨(2026-11-04 — 박민우가 담당자인 레코드가 "박민우가 아닌" 답변에
+# 그대로 노출됨, 필터링 자체가 통째로 빠진 것). "아닌" 바로 뒤에 역할을 가리키는 명사
+# (사람/분/요청자/제공자/담당자/결재자)가 곧바로 오는 경우만 안전하게 허용 — "통계가
+# 아닌 것은"처럼 "것/거/건" 등으로 이어지는 일반 부정문은 이 명사 목록에 없어 여전히
+# 걸러지지 않는다(2026-10-27 회귀와 같은 사고가 재발하지 않도록 범위를 좁게 유지).
+# ⚠️ 이름 캡처 상한을 `_EXCLUSION_NAME_RE`와 똑같이 {2,4}?로 뒀다가, "통계서비스팀이
+# 아닌 사람이 결재한"(담당자/결재자엔 사람 이름뿐 아니라 "통계서비스팀"(6자) 같은 팀명도
+# 들어있음, 2026-08-01부터 알려진 사실)에서 "서비스팀"(뒤 4자)만 잘려 캡처되는 버그가
+# 실측 확인됨(2026-11-04) — `_EXCLUSION_NAME_RE`는 "전봉석이랑"처럼 두 번째 이름+연결어가
+# 뒤에 붙을 수 있어 탐욕적 매칭이 조사까지 삼키는 걸 막으려고 상한이 필요했지만, 이 regex는
+# 그런 연결어 구조가 없어(바로 뒤에 "아닌"+역할명사만 옴) 상한을 좁게 둘 이유가 애초에 없다.
+# 잘린 캡처("서비스팀")는 필터 사전제거 단계의 정확매칭("통계서비스팀" in ["서비스팀"])을
+# 통과 못 해 긍정 필터가 그대로 남고, 사후 제외 필터는 부분문자열 비교라 오히려 전부
+# 걸려(통계서비스팀 레코드 전부가 "서비스팀 포함"으로 제외) 0건이 되는 이중 사고로 이어짐.
+_SINGLE_EXCLUSION_ROLE_RE = re.compile(
+    r"(?<![0-9])"
+    rf"([가-힣]{{2,10}}?{_TITLE_SUFFIX})"
+    r"\s*(?:가|이)?\s*아닌\s*(?:사람|분|요청자|제공자|담당자|결재자)"
+)
+
+
+def _single_excluded_role_value(text: str) -> str | None:
+    m = _SINGLE_EXCLUSION_ROLE_RE.search(text or "")
+    if not m:
+        return None
+    name = m.group(1).strip()
+    return None if _is_non_name_token(name) else name
 
 
 # "2024년 거만 빼고 알려줘"("것만"의 구어체 축약)에서 "거만"이 통째로 이름으로 오매칭돼,
@@ -614,7 +773,20 @@ _EXCLUSION_NAME_RE = re.compile(
 # 중 우연히 발견, 5/5 결정론적 재현). "거/것(+이/그/저)+만"은 사람 이름일 수 없는 지시대명사+
 # 보조사 조합이므로, 캡처된 이름이 이 패턴과 정확히 일치하면 무효로 친다("홍길동만 빼고"처럼
 # 진짜 이름 뒤에 "만"이 붙는 경우는 캡처가 "홍길동만"이라 이 패턴과 다르므로 영향 없음).
-_PRONOUN_WITH_PARTICLE_RE = re.compile(r"^(?:이|그|저)?(?:것|거)만$")
+#
+# "만" 없이 지시대명사만 단독으로 쓰이는 경우("그거 말고 다른 건은?")도 똑같이 사람 이름일
+# 수 없는데 "만"이 필수였던 원래 패턴은 안 잡는다(2026-11-09 발견 — 멀티턴 후속질문에서
+# "그거"가 요청자/제공자/담당자/결재자 제외 대상 "이름"으로 오매칭돼, 신청이력처럼 그
+# 역할필드 개념 자체가 없는 메뉴의 결과 21건이 "역할필드 검증 불가"로 전부 걸러져 0건이
+# 되는 버그 재현 — 통계종류·심의결과·수출입구분과 같은 계열). "만"을 선택적으로 바꿔
+# 이거/그거/저거/이것/그것/저것(단독)과 그 뒤에 "만"이 붙는 기존 경우를 모두 포괄한다.
+# "여기/거기/저기"(장소 지시대명사)도 같은 함정이 있다(2026-11-10 발견 — "거기 말고
+# 다른 기관 중에..."에서 "거기"가 이름으로 오매칭, 역할필드 개념이 없는 신청이력
+# 레코드 30건이 통째로 걸러짐). 단, 이쪽은 "이것/그것/저것"처럼 (이|그|저)+공통어간으로
+# 규칙적으로 조합되지 않는 불규칙 어휘라(그기/저기만 떼면 안 됨 — "거기"가 "이+기"
+# 조합이 아님) 셋을 그대로 나열한다.
+_PRONOUN_WITH_PARTICLE_RE = re.compile(r"^(?:(?:이|그|저)?(?:것|거)|여기|거기|저기)(?:만)?$")
+_LOCATION_PRONOUNS = {"여기", "거기", "저기"}
 
 # "수입 말고 수출 관련된거 있어?"에서 "수입"이 사람 이름으로 오매칭돼, 신청이력처럼
 # 요청자/제공자/담당자/결재자 개념 자체가 없는 메뉴의 결과를 전부 걸러내 0건으로 만드는
@@ -644,7 +816,18 @@ def _is_non_name_token(name: str) -> bool:
 # 그 긴 구절 그대로는 본문 어디에도 안 걸려 0건). "내용"/"관련" 등은 거의 항상 질문의
 # 문법적 수식어일 뿐 실제 본문에 그대로 안 붙어 있을 가능성이 높으므로, 뒤쪽부터
 # 제거해본다(앞쪽 핵심어는 보존).
-_KEYWORD_FILLER_WORDS = {"내용", "관련", "자료", "있는", "있어", "것", "건", "거"}
+# "API 연동 방식으로 자료를 제공받은 사례 있어?"가 키워드="API 연동 방식"(끝 단어 "방식"이
+# 기존 filler 목록에 없어 안 잘림)으로 뽑혀, 실제론 "API"만으로 62개 청크(20+ 레코드)가
+# 리터럴로 매칭되는데도 "API 연동 방식"이라는 문구 자체는 어디에도 없어 "찾지 못함"으로
+# 실패하는 버그가 실측 확인됨(2026-11-04, 사용자 지적으로 이름/담당자보다 내용 기반 검색
+# 품질을 우선 점검하다 발견). "방식"/"방법"/"사례"/"경우"는 "~방식"/"~사례"처럼 거의 항상
+# 앞의 구체적 명사를 수식하는 일반적인 포장 명사일 뿐 그 자체가 독립적인 검색 주제가 되는
+# 경우는 사실상 없어(전송방식/제공주기처럼 진짜 의미 있는 경우는 2026-10-27에 이미 별도
+# 구조화 필드로 분리돼 이 필러 목록과 무관하게 처리됨), 기존 "내용/관련/자료" 등과 같은
+# 원리로 안전하게 추가한다.
+_KEYWORD_FILLER_WORDS = {
+    "내용", "관련", "자료", "있는", "있어", "것", "건", "거", "방식", "방법", "사례", "경우",
+}
 
 
 def _strip_keyword_filler(keyword: str) -> str:
@@ -654,22 +837,442 @@ def _strip_keyword_filler(keyword: str) -> str:
     return " ".join(tokens)
 
 
+# "X 관련(된) 내용/자료가 있어?"는 이 세션 내내 쓴 가장 표준적인 질문 템플릿인데, 기관명과
+# 연도가 둘 다 질문에 있으면 LLM이 키워드를 아예 통째로 버리는(기관명/통계종류처럼 "엉뚱한
+# 필드로 잘못 라우팅"되는 게 아니라 어느 필드에도 안 남고 완전히 사라짐) 버그가 실측
+# 확인됨(2026-11-11 — "한국철강협회 2008년 안건에 반덤핑이나 상계조치 관련된 내용이
+# 있어?"/"한국환경공단 2024년 자료 중에 폐기물 관련된 내용이 있어?" 등 다수 재현, "FTA"
+# 같은 영문 약어는 영향 없고 "폐기물"/"반덤핑"/"상계조치" 같은 순수 한글 명사만 재현됨).
+# 같은 내용을 "관련 자료 있어?"(연도·기관명 없이)로 물으면 정상 추출되는 걸 보면 추출
+# 능력 자체는 있고, 이 특정 조합(기관명+연도+한글 키워드)에서만 불안정함 — 프롬프트로
+# 고치는 대신(이 프로젝트에서 반복 확인된 "효과 없음" 패턴), "~ 관련(된) 내용/자료가
+# 있어?" 구절 자체를 정규식으로 다시 캡처해 이미 뽑힌 기관명·연도를 떼어내고 남는
+# 구절을 키워드로 복구한다.
+# "~ 관련(된) 내용이 있어?"(존재 질문) 뒤에 어떤 말이 이어지는지는 표준화돼 있지 않다 —
+# "~내용이 있나요"/"~내용을 자세히 알려주세요"/"~내용에 대해 알려주세요"/"~내용은
+# 무엇인가요" 등 standalone_question 재작성이 매번 다른 어미를 고르는 게 실측 확인됨
+# (2026-11-11, 같은 입력 3회 재작성 결과가 3번 다 다름 — LLM 재작성 자체의 비결정성).
+# 뒤쪽 어미를 전부 나열해서 맞추는 건 끝이 없으므로, "관련(된)?" 바로 앞의 구절만 잡고
+# 뒤쪽은 아예 안 본다 — 이 시스템에서 "관련"이 쓰이는 문맥은 거의 항상 "그 앞의 구절이
+# 검색 주제"라는 뜻이라 안전하다.
+_CONTENT_RELATED_CLAUSE_RE = re.compile(
+    r"([가-힣A-Za-z0-9/·()\s]{2,40}?)\s*관련(?:된|되는|해서)?\b"
+)
+# "~에 대한"/"~에 관한"도 "관련"과 똑같이 주제를 소개하는 연결어인데, 별도 처리가 없으면
+# 뒤쪽의 "~내용은 무엇인가요?" 어미만 보는 `_CONTENT_DIRECT_CLAUSE_RE`가 lazy 매칭의
+# "가장 왼쪽에서 처음 성공하는 지점"부터 캡처해버려, 진짜 주제("심의결과")는 건너뛰고
+# 그 뒤에 붙은 연결어·일반명사("에 대한 내용")만 키워드로 잘못 복구하는 버그가 실측
+# 확인됨(2026-11-18 — "건강보험심사평가원의... 심의결과에 대한 내용은 무엇인가요?"가
+# "에 대한"만 복구해, 그 가짜 키워드 때문에 데이터유형='심의위원회' 단정까지 같이
+# 풀려버려 신청이력이 뒤섞임). "관련"과 동일한 우선순위로 먼저 시도한다.
+_CONTENT_ABOUT_CLAUSE_RE = re.compile(
+    r"([가-힣A-Za-z0-9/·()\s]{2,40}?)\s*에\s*(?:대한|관한)\b"
+)
+# "관련"이 아예 없는 직접 질의형("~ 청구내역 알려줘", standalone_question 재작성이면
+# "~ 청구내역은 무엇인가요?")도 같은 문제를 겪는다(2026-11-12, 사용자 지적 — "대한무역
+# 투자진흥공사 2026 글로벌공급망팀 청구내역 알려줘"류 "기관+연도+세부항목명+알려줘"
+# 질문에서 세부항목명이 키워드로 안 뽑히고 통째로 버려짐). "관련" 패턴과 동일하게
+# 문장 끝의 어미(알려줘/보여줘/무엇인가요 등)만 앵커로 삼고 그 앞 구절을 복구한다.
+_CONTENT_DIRECT_CLAUSE_RE = re.compile(
+    r"([가-힣A-Za-z0-9/·()\s]{2,40}?)\s*(?:은|는|이|가)?\s*"
+    r"(?:무엇인가요|무엇입니까|뭐예요|뭔가요|뭐야|"
+    r"알려\s*(?:줘|주세요|줄래요?|주실래요?)|보여\s*(?:줘|주세요))\s*[?!.]*$"
+)
+# "그거 말고 2018년 거는 두 개던데 둘 다 보여줘"처럼 직전 턴에 보여준 특정 레코드를
+# 가리키며 "그거 말고 다른 걸 보여줘" 식으로 이어가는 순수 지시대명사+제외+분류사 질문은,
+# 실제 검색 주제가 전혀 없는데도(연도만 구조화 필터로 정확히 뽑히고 나머지는 전부 문법
+# 조각) 이 함수가 "그거 말고 거는 두 개던데 둘 다"를 통째로 "복구된 키워드"로 돌려주는
+# 버그가 실측 확인됨(2026-11-16 — 기존 `_CLAUSE_JUNK_TOKENS` 멤버십 검사가 정확한 리터럴
+# 일치만 보다 보니, "거는"처럼 분류사 "거"에 조사("는")가 붙은 변형은 못 거름). 그 결과
+# 이 전혀 무관한 조각 키워드가 본문 어디에도 리터럴로 없어 B-54("키워드가 매칭 하나도
+# 없으면 결과를 비운다")가 발동, 정상적으로 찾은 레코드가 전부 사라지고 "찾지 못했습니다"로
+# 100% 결정론적으로 실패했음. 지시대명사·분류사("거"/"것", 이/그/저+것/거 조합)에 흔한
+# 조사가 붙은 전체 패턴을 한 토큰 단위로 매칭해 걸러낸다 — `_PRONOUN_WITH_PARTICLE_RE`는
+# "만"만 지원해 "거는"을 못 잡으므로, 이 목적에 맞게 조사 범위를 넓힌 별도 regex를 쓴다.
+_BARE_REFERENT_TOKEN_RE = re.compile(r"^(?:이|그|저)?(?:것|거)(?:은|는|이|가|을|를|도|만)?$")
+_CLAUSE_JUNK_TOKENS = _KEYWORD_FILLER_WORDS | {
+    "중에", "안건에", "안건", "안건을", "안건이", "안건은", "안건의", "에서", "에는", "의", "중",
+    # "그거 말고"의 "말고"(="~이 아니라")는 순수 배제 연결어일 뿐 그 자체가 검색 주제일 수
+    # 없다 — "빼고"/"제외"/"제외하고"도 같은 성격(이미 excluded_* 류 전용 로직이 실제 제외
+    # 대상 추출은 별도로 담당하므로, 여기서는 그냥 걸러내도 안전).
+    "말고", "빼고", "제외", "제외하고",
+    # "제공불가인"처럼 구조화 필드 값에 붙던 연결어미가, 그 값 자체를 떼어낸 뒤 혼자
+    # 남는 경우(2026-11-12) — "인"/"로"/"으로" 단독은 문법적으로 불완전해 그 자체로
+    # 진짜 검색어가 될 수 없으므로 안전하게 필러 취급한다.
+    "인", "로", "으로",
+    # 같은 원리로 "된"도 필요하다 — "심의위원회 거부된거 리스트좀 줄래"(장명근 피드백
+    # #5, 2026-11-18)에서 심의결과 파라프레이즈 별칭 "거부"(`_COMMITTEE_RESULT_PARAPHRASE_
+    # ALIASES` 참고)를 값으로 떼어내면 "거부된"의 수동태 어미 "된"만 혼자 남는데, 이게
+    # 위 "인"류와 달리 denylist에 없어서 안 걸러짐 → 남은 "리스트를"과 합쳐 "된 리스트를"
+    # 이라는 존재하지 않는 가짜 키워드가 복구돼, 구조화 필터는 16건을 정확히 찾는데도
+    # 답변 생성 LLM이 "이 키워드는 본문에 없다"며 전부 no_result로 거절하는 버그로
+    # 실측 확인됨(구조화 필터 자체는 100% 정확했음 — `_search()` 직접 호출로 16건 확인).
+    "된",
+    # 역할필드(요청자/제공자/담당자/결재자) 값을 떼어내고 나면 그 값에 붙어있던 조사·
+    # 역할동사가 토큰으로 남는다(예: "박상용이 요청한 폐기물"에서 "박상용" 제거 후
+    # "이"/"요청한"이 남음, 2026-11-11 실측 확인 — "한국환경공단 2024년 자료 중에
+    # 박상용이 요청한거 중 폐기물 관련된 내용 있어?"가 진짜 키워드 "폐기물" 대신
+    # "박상용이 요청한 폐기물"이 복구돼 narrow로도 못 풀려 엉뚱하게 넓은 폴백으로 샘).
+    "이", "가", "요청한", "요청하는", "제공한", "제공하는", "담당한", "담당하는",
+    "결재한", "결재하는",
+    # "2019년에 신청된 이력을 알려주세요"처럼 "관련" 없는 어미 전용 패턴에서, 레코드의
+    # 일반 상태를 서술하는 수동형 동사가 토큰으로 남는 경우(2026-11-12 회귀 발견 —
+    # 아래 "이력 알려줘"류 generic-noise 가드가 "이력"만 보고 "신청된 이력을"은 못
+    # 걸러내 엉뚱한 키워드로 검색이 통째로 깨짐). 역할동사와 달리 특정 사람을 가리키는
+    # 게 아니라 레코드 자체의 생애주기 상태를 가리키는 일반 수식어라 전부 필러로 간주.
+    "신청된", "등록된", "접수된", "처리된", "완료된", "작성된", "제출된",
+    # 위와 같은 생애주기 동사의 능동형("신청한"/"등록한" 등)도 같은 이유로 필러다.
+    # "2026년에 계약한 기관 리스트를 알려주세요"가 "계약한 기관 리스트를"을 통째로
+    # 가짜 키워드로 복구해 검색이 0건으로 깨지는 버그로 발견됨(2026-11-13) — "계약한"이
+    # 이 목록에 없어 안 걸러지고, 남은 "기관"/"리스트를"도 단일 단어 전수일치만 보는
+    # 아래 _GENERIC_NONCONTENT_CANDIDATES 검사로는 다중 토큰 조합을 못 잡았음.
+    "계약한", "계약하는", "신청한", "등록한", "접수한", "처리한", "완료한", "작성한", "제출한",
+}
+# "관련" 없이 어미만 보고 복구할 때는 "한국환경공단 이력 알려줘"처럼 기관명을 뗀 뒤
+# 남는 게 이 시스템의 일반 메뉴/화면 용어뿐인 경우가 있다 — 이런 건 진짜 검색 키워드가
+# 아니라 "그 기관의 평범한 이력 조회"일 뿐이라, 그대로 키워드로 쓰면 오히려 narrow
+# 매칭을 방해한다(2026-11-12 실측 확인). "관련" 트리거 패턴은 이 위험이 적어(사용자가
+# "관련"을 썼다는 것 자체가 구체적 주제를 가리킨다는 신호) 그대로 두고, 어미 전용
+# 패턴에서 후보가 정확히 이 목록 중 하나뿐이면 복구하지 않는다.
+_GENERIC_NONCONTENT_CANDIDATES = {
+    "이력", "신청이력", "내역", "상세", "정보", "사항", "현황", "목록", "리스트", "문서",
+    # "전체"도 그 자체로는 검색 주제가 아니라 "~의 전체 이력중에"처럼 범위를 가리키는
+    # 일반 수식어다(2026-11-18, "~에 대한" 패턴 검증 중 "전체 이력중에"가 가짜 키워드로
+    # 복구되는 걸 발견).
+    "전체",
+    # "기관"/"업체"/"회사"는 _LIST_FIELD_KEYWORDS["업체명"]이 이미 "업체명 목록 요청"
+    # 신호로 쓰는 바로 그 단어들이다 — "~기관 리스트를 알려주세요"처럼 단독으로 남으면
+    # 실제 검색 주제가 아니라 "그 조건에 맞는 업체 목록 보여줘"라는 질문 형태일 뿐이라
+    # 같은 deny-list에 포함한다(2026-11-13).
+    "기관", "업체", "회사",
+    # "대한무역투자진흥공사 2026년 계약 목록 알려줘"가 기관명·연도를 다 뗀 뒤 남는
+    # "계약 목록을"을 가짜 키워드로 복구하는 바로 다음 사례로 발견됨(2026-11-13,
+    # 사용자가 직접 브라우저로 재현) — "계약"/"사업"도 실제 검색 주제가 아니라 "그
+    # 기관·연도의 어떤 레코드를 보여줘"라는 질문 형태 자체를 가리키는 일반 명사라
+    # 같은 deny-list에 포함한다. `all()` 기반 판정이라(아래) "환경보호 사업 관련
+    # 자료"처럼 진짜 주제어와 같이 쓰이면 전혀 안 걸린다 — 이 단어들만 남았을 때만
+    # 작동.
+    "계약", "사업",
+}
+# 위 deny-list는 정확히 일치할 때만 걸리는데, 토큰에 조사가 그대로 붙어있으면
+# ("이력을"/"이력이") 비교 자체가 실패해 못 거른다(2026-11-12 회귀 — "신청된 이력을
+# 알려주세요"가 "이력을"로 남아 deny-list를 피해감). 실제 반환값은 원형 그대로 두고,
+# 이 비교 전용으로만 흔한 조사 하나를 떼어서 검사한다 — 예를 들어 "국가"(나라)가
+# "국가"[:-1]="국"으로 잘려도 "국"은 deny-list에 없으니 안전하게 통과, 떼어낸 결과는
+# 비교에만 쓰고 실제로 돌려주는 값은 건드리지 않는다.
+_TRAILING_PARTICLES_FOR_GENERIC_CHECK = ("을", "를", "이", "가", "은", "는")
+
+# "한국환경공단 수수료 중에 가장 비싼건 어떤거야?"/"댓글이 가장 많은 자료가 뭐야?"처럼
+# "제일/가장 + 비교형용사" 구문이 들어간 질문에서, standalone_question이 "~무엇인가요?"
+# 류로 재작성되면 이 함수가 "수수료 가장 비싼"/"댓글이 가장 많은" 같은 비교 구절 전체를
+# 그대로 "복구된 키워드"로 돌려주는 버그가 실측 확인됨(2026-11-13). 이런 비교 질문은
+# 전부 각자 전용 코드 경로(수수료=`_fee_kinds`, 댓글/첨부파일 개수=`_comment_superlative_*`/
+# `_attachment_superlative_*`, 날짜=`_recency_max`/`_min`)가 `analysis.standalone_question`
+# 원문을 직접 보고 이미 정확한 값을 코드로 계산해두는데, 그 비교 구절이 키워드로도
+# 복구되면 뒤이은 "키워드가 본문에 리터럴로 없으면 결과를 비운다"(2026-10-13/2026-11-11)
+# 로직이 전용 경로가 이미 정확히 채워둔 결과를 다시 지워버려 "찾지 못했습니다"로 실패함.
+# "제일"/"가장" 단독으로는 회사명 접두어("제일기획" 등)와 겹칠 위험이 있어, 반드시 바로
+# 근처에 비교형용사가 같이 있을 때만(기존 `_fee_kinds`/`_recency_max` 등이 쓰는 비교
+# 형용사 어휘와 동일) 비교 구문으로 보고 복구 자체를 포기한다(None 반환) — 그 비교 질문은
+# 전용 경로가 담당하므로 일반 키워드 복구가 끼어들 필요도, 끼어들면 위험도 있다.
+# "1등"/"1위"/"1순위"도 "제일/가장"과 완전히 같은 뜻의 비교 표현인데(2026-11-16/17 실측
+# 확인 — "수수료 1등인거 알려줘"가 standalone_question 재작성에서 "가장"으로 안 바뀌는
+# 경우가 있어, 이 단어 자체를 빠뜨리면 가짜 키워드로 복구돼버림), "제일/가장"과 달리
+# 뒤에 비교형용사가 없어도("1등인거"처럼) 그 자체로 순위를 가리키므로 형용사 요구 없이
+# 단독 매치. "1등급"(품질등급 등 완전히 다른 뜻)과 겹치지 않도록 뒤에 "급"이 오면 제외.
+_SUPERLATIVE_PHRASE_RE = re.compile(
+    r"(제일|가장)\s*[가-힣]{0,6}?"
+    r"(비싼|비싸|싼|저렴한|저렴|많은|많이|적은|적게|높은|낮은|큰|작은|긴|짧은|"
+    r"최근|최신|오래된|오래)"
+    r"|1\s*(등|위|순위)(?!급)"
+)
+
+
+def _recover_dropped_content_keyword(
+    text: str, filters: FilterExtraction, raw_org_name: str | None = None
+) -> str | None:
+    """키워드가 완전히 빈 채로 버려졌을 때, "~ 관련(된) 내용/자료가 있어?" 또는 "~ 알려줘"/
+    "~은 무엇인가요?" 같은 직접 질의형 구절에서 이미 다른 필드(기관명/연도/차수/역할필드)로
+    뽑힌 값과 흔한 조사·필러를 떼어내고 남는 구절을 복구한다. "A나 B"처럼 콤마·조사로 묶인
+    복수 주제는 이 단순 토큰 필터링으로는 완전히 못 풀어내는 한계가 있음(키워드 필드 자체가
+    단일 문자열이라 애초에 더 근본적인 제약) — 그래도 가장 흔한 단일 주제어 패턴은 안전하게
+    복구한다.
+    raw_org_name: `filters.기관명`이 이미 fuzzy 정식명칭으로 치환된 경우(2026-11-13), 질문
+    원문엔 여전히 사용자가 쓴 줄임말이 남아있어 정식명칭만으로는 안 떼어진다 — 원래 줄임말도
+    같이 떼어내 "줄임말의"가 가짜 키워드로 복구되는 걸 막는다."""
+    m = _CONTENT_RELATED_CLAUSE_RE.search(text)
+    is_direct = False
+    if not m:
+        m = _CONTENT_ABOUT_CLAUSE_RE.search(text)
+        # "~에 대한/관한"은 "관련"과 달리 "~전체 이력중에 심의결과에 대한 내용"처럼 구조화
+        # 필드를 다 떼어내도 "전체 이력" 같은 일반 명사만 남는 경우가 실측 확인됨(2026-11-18)
+        # — "관련"만큼 안전하지 않아, 뒤쪽 `_CONTENT_DIRECT_CLAUSE_RE`와 동일하게
+        # 아래 "남은 토큰이 전부 generic이면 포기" 검사를 받도록 is_direct 취급한다.
+        is_direct = bool(m)
+    if not m:
+        m = _CONTENT_DIRECT_CLAUSE_RE.search(text)
+        is_direct = True
+    if not m:
+        return None
+    candidate = m.group(1).strip()
+    if filters.기관명:
+        candidate = candidate.replace(filters.기관명, " ")
+    if raw_org_name and raw_org_name != filters.기관명:
+        candidate = candidate.replace(raw_org_name, " ")
+    for role_field in _ROLE_FIELDS_FOR_SCAN:
+        value = getattr(filters, role_field, None)
+        if value:
+            candidate = candidate.replace(value, " ")
+    # "2010년 심의위원회 안건 기관 리스트 알려줘"처럼, 이미 filters.데이터유형으로 뽑힌
+    # 메뉴 이름 리터럴("심의위원회" 등)이 후보 텍스트에 그대로 남아 "심의위원회 기관
+    # 리스트를"을 가짜 키워드로 복구하는 문제가 실측 확인됨(2026-11-13) — 기관명/역할필드와
+    # 동일하게 메뉴 이름(과 자연스러운 동의어)도 먼저 떼어낸다.
+    for menu_kw in _MENU_KEYWORDS.get(filters.데이터유형, ()):
+        candidate = candidate.replace(menu_kw, " ")
+    # "심의결과가 제공불가인 안건을 알려주세요"처럼, 이미 구조화 필드(심의결과/통계종류/
+    # 수출입구분)로 완전히 커버되는 질문도 어미 전용 패턴에 걸려 그 필드명·값을 "새
+    # 키워드"로 잘못 복구하는 회귀가 실측 확인됨(2026-11-12 — `ask()`가 이 세 필드를
+    # 이미 구조화 필터로 쓰고 있는데도, 값 자체("제공불가")와 그 값에 붙은 연결어미
+    # ("~인")가 후보 텍스트에 그대로 남아있어서 벌어짐). 기관명/역할필드와 동일하게
+    # 값을 먼저 떼어내고, 필드 이름 자체(조사 붙은 꼴 포함)도 제거한다.
+    # 필드 이름을 "심의결과"처럼 붙여 쓰는 경우뿐 아니라 "심의 결과"처럼 띄어 쓰는 경우도
+    # 실측 확인됨(2026-11-18) — 리터럴 매칭이라 공백이 하나라도 다르면 못 떼어내고 그대로
+    # 가짜 키워드로 복구된다("최근 5개년 건강보험심사평가원 심의 결과 알려줘"가 "심의 결과"를
+    # 키워드로 복구해, 2026-08-11/2026-11-05에 "자료 제공"/"자료제공" 표기차로 이미 겪었던
+    # 것과 같은 계열의 공백 문제). 2음절+2(또는 3)음절로 나뉘는 지점에만 선택적 공백을 허용.
+    _free_field_spaced = {"심의결과": r"심의\s*결과", "통계종류": r"통계\s*종류", "수출입구분": r"수출입\s*구분"}
+    for free_field in ("심의결과", "통계종류", "수출입구분"):
+        value = getattr(filters, free_field, None)
+        if value:
+            candidate = candidate.replace(value, " ")
+        candidate = re.sub(rf"{_free_field_spaced[free_field]}(가|는|은|이|의)?", " ", candidate)
+    # "2026년" 형태는 먼저 정규식으로 통째로 떼어낸다(뒤의 "년"까지 같이 사라짐).
+    # "최근 5개년"이 "2022년부터 2026년까지"로 미리 치환된 뒤 들어오면(_resolve_relative_
+    # year_range_words), "년" 뒤에 "에" 말고도 "부터"/"까지"/"이후"/"이전"/"이상"/"이하"/
+    # "사이" 같은 범위 연결어가 바로 붙는다 — 이걸 같이 안 떼면 "부터"/"까지"만 토큰으로
+    # 남아 가짜 키워드로 복구되는 버그가 실측 확인됨(2026-11-18, "최근 5개년 건강보험
+    # 심사평가원 심의결과 알려줘"가 recovered="부터 까지"가 되어 키워드가 잘못 채워지고,
+    # 그 결과 "심의위원회" 데이터유형까지 같이 날아가 신청이력/기관정보가 뒤섞여 반환됨).
+    candidate = re.sub(r"\d{4}년\s*(?:에|이후|부터|이상|이전|까지|이하|사이)?", " ", candidate)
+    # "2026년"뿐 아니라 "년" 없이 그냥 "2026"이라고만 쓴 경우도 있다(2026-11-12 사용자
+    # 지적) — 위 정규식이 "년"까지 같이 못 지운 나머지(= "년" 자체가 없는 경우)만 이걸로
+    # 처리한다. 순서를 반대로 하면 "2024년"에서 "2024"만 먼저 빠져 "년"이 홀로 남는다.
+    for year_field in ("연도", "연도이후", "연도이전"):
+        year_value = getattr(filters, year_field, None)
+        if year_value:
+            candidate = candidate.replace(str(year_value), " ")
+    # "최근 5개년"처럼 질문분석에 넘기기 전 코드가 절대 연도범위로 미리 치환한 상대 기간
+    # 표현도, 이 함수의 두 번째 호출(raw question 기준)에서는 치환 전 원문이 그대로
+    # 남아있어 위 연도값 스트립을 피해 가짜 키워드로 복구되는 문제가 있었다(2026-11-13 —
+    # "최근 5개년 철강협회 심의결과 알려줘"에서 "최근 5개년"이 그대로 키워드가 돼버림).
+    candidate = _RELATIVE_YEAR_RANGE_RE.sub(" ", candidate)
+    candidate = re.sub(r"\d+차에?", " ", candidate)
+    # "두 개던데"/"세 건이던데"/"둘 다"처럼 직전 턴 목록 중 몇 개를 가리키는 수량 표현도
+    # 검색 주제가 아니라 순수 문법 조각이다(2026-11-16, "그거 말고 2018년 거는 두
+    # 개던데 둘 다 보여줘"에서 "두 개던데"/"둘 다"가 안 걸러져 그대로 키워드에 남던 것) —
+    # "숫자/한글 수사 + 개/건/명/곳"(+흔한 연결어미)와 "둘/셋/넷/모두/전부 + 다" 두 형태를
+    # 미리 지운다.
+    candidate = re.sub(
+        r"(?:\d+|한|두|세|네|다섯|여섯|일곱|여덟|아홉|열)\s*(?:개|건|명|곳)(?:던데|인데|라서|라고)?",
+        " ",
+        candidate,
+    )
+    candidate = re.sub(r"(?:둘|셋|넷|모두|전부)\s*다\b", " ", candidate)
+    # "이력중에"처럼 "중에"가 앞말에 띄어쓰기 없이 바로 붙으면(2026-11-18 실측), split()
+    # 기준 토큰 필터(아래 `_CLAUSE_JUNK_TOKENS`, "중에" 단독 항목은 있음)로는 못 거른다 —
+    # 접미사만 떼어내 앞말("이력")이 `_GENERIC_NONCONTENT_CANDIDATES` 검사를 받게 한다.
+    candidate = re.sub(r"중에\b", " ", candidate)
+    # "제일/가장 + 비교형용사" 구문은 그 자체로는 문서 주제가 아니라 비교 지시어다
+    # (_SUPERLATIVE_PHRASE_RE 정의부 참고) — 전용 코드 경로가 담당하므로 복구를 포기한다.
+    if _SUPERLATIVE_PHRASE_RE.search(candidate):
+        return None
+    tokens = [
+        t for t in candidate.split()
+        if t not in _CLAUSE_JUNK_TOKENS and not _BARE_REFERENT_TOKEN_RE.match(t)
+    ]
+    candidate = " ".join(tokens).strip()
+    def _strip_trailing_particle(tok: str) -> str:
+        for particle in _TRAILING_PARTICLES_FOR_GENERIC_CHECK:
+            if tok.endswith(particle) and len(tok) > len(particle):
+                return tok[: -len(particle)]
+        return tok
+
+    if is_direct:
+        # 예전엔 후보 문자열 "전체"가 generic 단어 하나와 정확히 일치할 때만 걸렀는데,
+        # "계약한 기관 리스트를"처럼 generic 단어가 여러 개 이어 붙으면 전체 일치 비교로는
+        # 못 잡는다(2026-11-13 발견). 남은 토큰 전부(조사 제거 후)가 deny-list에 속하면
+        # — 즉 실제 검색 주제가 단 하나도 안 남으면 — 복구를 포기한다.
+        remaining_tokens = [t for t in candidate.split() if t]
+        if remaining_tokens and all(
+            _strip_trailing_particle(t) in _GENERIC_NONCONTENT_CANDIDATES for t in remaining_tokens
+        ):
+            return None
+    return candidate if len(candidate) >= 2 else None
+
+
+# 고정 필러 단어 목록(`_KEYWORD_FILLER_WORDS`)으로도 못 거르는 경우가 여전히 있다 —
+# "API 연동 방식"에서 "방식"을 걷어내도 "API 연동"은 본문 어디에도 리터럴로 없고
+# "API" 단독으로만 60여 건이 매칭되는 사례가 실측 확인됨(2026-11-04, 사용자 지적으로
+# 이름·담당자보다 내용 기반 검색 품질을 우선 점검하다 발견) — "연동"은 "방식"과 달리
+# 다른 맥락("시스템 연동 자료")에서는 그 자체가 진짜 주제일 수 있어 전역 필러 목록에
+# 넣기엔 위험하다. 대신 "끝 단어를 하나씩 더 빼보면서 실제로 매칭되는 가장 긴 조합을
+# 찾는" 점진적 축소를 시도한다 — 2026-10-01에 "이력 보기" 검색창에서 시도했다가
+# 폐기한 방식과 겉보기엔 비슷하지만 위험 성격이 다르다: 그때는 결과를 코드가 바로
+# "확정된 정답"으로 사용자에게 보여주는 기능이었고, 여기는 어차피 `scan_text_contains`가
+# "리터럴로 실제 포함되는지"만 확인하고(의미 추론 없음) 그 결과도 답변 생성 LLM이 한 번 더
+# 거치는 구조라 완전히 틀린 답을 낼 위험이 훨씬 낮다. 최소 2글자 이상 남을 때까지만
+# 축소한다(1글자는 거의 항상 너무 범용적이라 노이즈 위험이 큼).
+# 축소된 후보가 "데이터"/"통계"처럼 이 도메인 전체에 걸쳐 거의 모든 문서에 등장하는
+# 극히 흔한 단어이면, narrow 자체가 사실상 의미를 잃는다("데이터 품질 검증 절차"→
+# "데이터"로 축소되면 900건+(스캔 상한 도달)까지 걸려 전혀 무관한 수십 개 기관이
+# "데이터 품질 검증 절차 관련 자료"로 둔갑, 2026-11-05 실측 확인 — B-13의 keyword_note
+# 캐비엇만으로는 이 정도로 흔한 단어는 못 걸러냄). 후보 하나의 히트수가 이 상한을
+# 넘으면 "너무 흔해서 의미 있는 축소가 아니다"로 보고 건너뛴다(다음 후보 — 더 짧은
+# n — 로 넘어가거나, 더 짧은 게 없으면 원래 키워드를 그대로 돌려줘 "정말 없다"는
+# 기존 동작 유지). "API"(60건)처럼 적당히 흔한 단어는 여전히 통과시켜 2026-11-04(B-9)
+# 검증된 동작을 그대로 보존한다.
+_NARROW_KEYWORD_MAX_HITS = 200
+
+# 접두사(원래 단어 순서를 그대로 유지하는) 축소는 사용자 표현에 가까운 신뢰도 높은
+# 후보라 200건까지 관대하게 받아들이지만, 접미사 폴백·복합명사 뒤쪽절삭은 둘 다 "핵심어가
+# 뒤쪽에 있을 수도 있다"는 구조적 추측일 뿐이라 신뢰도가 훨씬 낮다 — 실측 결과 "변동"
+# (172건, "국제유가 변동"에서 "국제유가"가 0건이라 접미사 폴백으로 넘어가 선택됨)처럼
+# 평범한 일상어가 통과해 전혀 무관한 27개 계약서가 "국제유가 변동 분석 자료"로 섞이는
+# 사례가 실측 확인됨(2026-11-05 — 사용자가 "다른 거 보다가 수정할 게 보인다"며 이력
+# 표 버그를 제보한 직후, 같은 날 narrow 접미사 폴백을 계속 테스트하다 발견). 검증된 좋은
+# 사례(자율발급=1건, 탄소국경=5건, 수출바우처=2건)는 전부 한 자릿수라, 훨씬 낮은 상한을
+# 둬도 전혀 영향 없다 — 접미사류 폴백 전용으로 더 엄격한 상한을 따로 둔다.
+_NARROW_SUFFIX_FALLBACK_MAX_HITS = 30
+
+
+def _narrow_keyword_to_match(keyword: str, data_types: set[str] | None = None) -> str:
+    """바깥 호출부가 `keyword`로 스캔해 0건임을 이미 확인했을 때만 불러라 — 끝 단어를
+    하나씩 빼며 실제로 매칭되는 가장 긴 조합을 찾는다(전수 스캔 1회씩, 매칭되는 순간
+    바로 반환). 아무 길이에서도 안 걸리면 원래 키워드를 그대로 돌려줘 호출부가 "정말
+    없다"는 기존 동작을 그대로 유지하게 한다."""
+    tokens = keyword.split()
+    if len(tokens) <= 1:
+        return keyword
+    for n in range(len(tokens) - 1, 0, -1):
+        candidate = " ".join(tokens[:n])
+        if len(candidate.replace(" ", "")) < 2:
+            break
+        hits = scan_text_contains(candidate, _NARROW_KEYWORD_MAX_HITS, data_types)
+        if hits and len(hits) < _NARROW_KEYWORD_MAX_HITS:
+            return candidate
+    # 접두사(앞쪽 유지) 방향으로는 상한 안에 드는 후보가 전혀 없었다 — "원산지 자율발급"
+    # 처럼 핵심어가 뒤쪽에 있는 경우("원산지"는 261건으로 상한 초과 거절, 뒤쪽 "자율발급"은
+    # 1건뿐이라 정확함)를 놓치지 않도록 마지막 단어만 따로 한 번 더 시도한다(2026-11-05,
+    # 사용자가 "탄소국경조정제도도 찾아야 하지 않냐"고 재확인 요청한 김에 같은 세션에서
+    # 함께 발견·수정). 방향을 알 수 없어 접두사/접미사 둘 다 시도하는 게 유일하게 안전한
+    # 절충 — "API 연동 방식"(접두사 "API"가 이미 상한 안에서 먼저 매칭돼 여기까지 안 옴)엔
+    # 영향 없음.
+    last_word = tokens[-1]
+    if len(last_word) >= 2:
+        hits = scan_text_contains(last_word, _NARROW_SUFFIX_FALLBACK_MAX_HITS, data_types)
+        if hits and len(hits) < _NARROW_SUFFIX_FALLBACK_MAX_HITS:
+            return last_word
+    return keyword
+
+
+# 위 narrow는 공백으로 나뉜 여러 단어에만 적용된다 — "탄소국경조정제도"처럼 공백이 전혀
+# 없는 단일 한글 복합명사는 쪼갤 토큰 자체가 없어 적용 기회가 없다(2026-11-05 실측 확인
+# — "탄소국경세"/"CBAM"으로 진짜 관련 자료가 있는데도 0건으로 완전히 못 찾음, 벡터
+# 검색도 임베딩 유사도만으로는 이 자료들을 top-300 안에도 못 찾을 만큼 멀어서 보완이
+# 안 됨). 한자어 기반 한글 복합명사는 보통 2음절 단위 형태소가 이어붙은 구조라("탄소+
+# 국경+조정+제도"), 형태소 분석 없이도 "끝에서 2글자씩 떼어본다"는 간단한 규칙이
+# 안전하게 잘 들어맞는다 — "조정제도"처럼 뒤쪽은 추상적인 제도/절차를 가리키는 접미
+# 성격 형태소이고 앞쪽("탄소국경")이 구체적인 주제어인 경우가 많아(head-initial), 뒤에서
+# 떼어내는 방향이 일반 단어 쪼개기(B-13, 방향을 알 수 없어 보류)와 달리 비교적 안전한
+# 기본값이다. 영문·숫자가 섞인 키워드("SSL" 등)는 이 2음절 단위 규칙이 안 맞으므로
+# 순수 한글로만 이뤄진 경우에만 적용한다.
+_PURE_HANGUL_RE = re.compile(r"^[가-힣]+$")
+
+
+def _narrow_compound_keyword_to_match(keyword: str, data_types: set[str] | None = None) -> str:
+    """바깥 호출부가 공백 없는 keyword로 스캔해 0건임을 이미 확인했을 때만 불러라 —
+    끝에서 2글자씩 떼며 실제로 매칭되는 가장 긴 조합을 찾는다. 순수 한글 4글자 이상에만
+    적용(최소 4글자 남을 때까지만 축소 — 2글자는 Korean에서 너무 범용적인 경우가 많아
+    노이즈 위험이 크다)."""
+    if not _PURE_HANGUL_RE.match(keyword) or len(keyword) < 6:
+        return keyword
+    length = len(keyword) - 2
+    while length >= 4:
+        candidate = keyword[:length]
+        hits = scan_text_contains(candidate, _NARROW_KEYWORD_MAX_HITS, data_types)
+        if hits and len(hits) < _NARROW_KEYWORD_MAX_HITS:
+            return candidate
+        length -= 2
+    return keyword
+
+
+# 질문분석 LLM이 가끔 키워드 필드에 "품목 분류 오류, 재심의"처럼 콤마로 여러 주제를
+# 한꺼번에 몰아 넣는 경우가 실측 확인됨(2026-11-05) — 콤마가 섞이면 공백 기반
+# narrow(`_narrow_keyword_to_match`)가 콤마를 그냥 한 글자로 취급해 "품목 분류"(첫 주제의
+# 일부)로만 좁혀지고, 콤마 뒤의 두 번째 주제("재심의", 실제로 사용자가 원한 "재심의 요청"
+# 문서와 정확히 일치하는 더 구체적인 단어)는 narrow 후보로 아예 고려되지 않아 완전히
+# 사라짐.
+# ⚠️ 처음엔 "narrow까지 거친 뒤 가장 적게(=가장 구체적으로) 매칭되는 주제를 고른다"는
+# 히트수 기준으로 시도했으나, 실측 결과 정반대로 역효과임을 확인 — "품목 분류"(심의위원회
+# 스코프 내 2건)가 "재심의"(33건)보다 히트수가 적어 오히려 "품목 분류"가 선택돼 버그가
+# 전혀 안 고쳐짐. "A로 인한 B"(원인으로 인한 B) 구조에서 사용자가 실제로 묻는 핵심은
+# 보통 뒤쪽 B(재심의)이고 앞쪽 A(품목 분류 오류)는 원인을 설명하는 수식절이라, 히트수와
+# 완전히 무관하게 B가 핵심일 수 있음 — API/연동과 마찬가지로 순수 통계로는 어느 쪽이
+# 핵심인지 못 가린다. 대신 콤마 목록의 **마지막 항목부터 역순으로** 매칭을 시도한다 —
+# 한국어는 수식어가 앞에, 핵심 명사가 뒤에 오는 head-final 경향이 있어(B-13 접미사
+# 폴백·B-14 복합명사 뒤쪽 절삭도 같은 전제를 썼고 둘 다 실측으로 검증됨), LLM이 콤마로
+# 나열한 순서도 원문 어순을 어느 정도 반영할 가능성이 높다고 보고 마지막 항목을 우선
+# 신뢰하는 쪽을 기본값으로 택함. 완벽한 해결은 아니지만(여전히 전제일 뿐), 적어도
+# "콤마 뒤 주제가 통째로 사라지는" 가장 나쁜 경우는 막는다.
+def _resolve_multi_topic_keyword(keyword: str, data_types: set[str] | None = None) -> str:
+    """콤마로 나뉜 키워드가 아니면 그대로 반환. 나뉘어 있으면 마지막 항목부터 역순으로
+    기존 필러제거+narrow 파이프라인을 거쳐 상한 안에서 실제로 매칭되는 첫 번째 주제를
+    돌려준다. 전부 매칭 안 되면 원본 그대로 돌려줘 호출부의 기존 처리(결국 "정말 없음")를
+    그대로 따르게 한다."""
+    parts = [p.strip() for p in keyword.split(",") if p.strip()]
+    if len(parts) <= 1:
+        return keyword
+    for part in reversed(parts):
+        candidate = _strip_keyword_filler(part)
+        if not scan_text_contains(candidate, 1, data_types):
+            if " " in candidate:
+                candidate = _narrow_keyword_to_match(candidate, data_types)
+            elif _PURE_HANGUL_RE.match(candidate):
+                candidate = _narrow_compound_keyword_to_match(candidate, data_types)
+        hits = scan_text_contains(candidate, _NARROW_KEYWORD_MAX_HITS, data_types)
+        if hits and len(hits) < _NARROW_KEYWORD_MAX_HITS:
+            return candidate
+    return keyword
+
+
 def _excluded_role_values(text: str) -> list[str]:
     m = _EXCLUSION_NAME_RE.search(text or "")
-    if not m:
-        return []
-    names = [m.group(1).strip()]
-    if m.group(2):
-        names.append(m.group(2).strip())
-    return [n for n in names if not _is_non_name_token(n)]
+    if m:
+        names = [m.group(1).strip()]
+        if m.group(2):
+            names.append(m.group(2).strip())
+        filtered = [n for n in names if not _is_non_name_token(n)]
+        if filtered:
+            return filtered
+    single = _single_excluded_role_value(text)
+    return [single] if single else []
 
 
 def _has_genuine_exclusion_phrase(text: str) -> bool:
+    # ⚠️ "거기 말고 다른 기관 중에..."처럼 장소 지시대명사("여기"/"거기"/"저기")로
+    # 제외 대상을 가리키는 경우, `_is_non_name_token`(역할필드 이름으로는 거짓이어야
+    # 맞음, 2026-11-10 B-35 영역 수정)이 True를 반환해 이 함수까지 통째로 False가 돼
+    # "제외 의도 자체가 없다"고 오판하는 회귀가 실측 확인됨 — 그러면 조직명 제외 추론
+    # (carried_over 기반, `ask()`의 `excluded_org` elif 분기)이 아예 발동을 못 해 제외가
+    # 조용히 무시됨. "역할필드 이름으로 유효한가"와 "애초에 제외 구문이 있는가"는 서로
+    # 다른 질문이다 — 장소 지시대명사는 전자는 거짓(이름일 수 없음)이지만 후자는 참(명백히
+    # 뭔가를 제외하려는 구문)이므로 여기서만 별도로 허용한다.
     m = _EXCLUSION_NAME_RE.search(text or "")
-    if not m:
-        return False
-    names = [m.group(1)] + ([m.group(2)] if m.group(2) else [])
-    return any(not _is_non_name_token(n) for n in names)
+    if m:
+        names = [m.group(1)] + ([m.group(2)] if m.group(2) else [])
+        if any((not _is_non_name_token(n)) or n in _LOCATION_PRONOUNS for n in names):
+            return True
+    return _single_excluded_role_value(text) is not None
 
 
 # "건강보험심사평가원 중에 2024년 거만 빼고 알려줘" 같은 연도 제외 질문이 5/5 결정론적으로
@@ -710,12 +1313,25 @@ _ROUND_TOKEN_RE = re.compile(r"(\d+)\s*차")
 # 강제한다. 중간에 "위원회 안건 중에"처럼 토큰·연결조사가 아닌 다른 말이 끼면 체인이
 # 끊겨 매치가 아예 안 되므로(무관한 선행 문맥과 섞일 수 없음), false positive가 구조적으로
 # 불가능해진다.
-_EXCLUSION_CONNECTOR = r"(?:,|이랑|랑|와|과|은|는|도)?"
+# "2024년이 아닌"처럼 주격조사 "이/가"가 "년" 바로 뒤에 붙는 가장 흔한 단일 연도 제외
+# 표현이 원래 연결자 목록에 없어서 전혀 매칭 안 되는 버그가 실측 확인됨(2026-11-04 —
+# "한국환경공단 말고 다른 기관 이력 중에 2024년이 아닌 자료" 질문에서 연도 제외 필터링이
+# 통째로 빠져 연도=2024인 레코드가 그대로 섞여 나옴). 이름(사람)과 달리 이 토큰은 항상
+# `\d{4}\s*년`에 직접 붙어있어야만 매치되므로(임의의 명사에 오매칭될 위험이 없음) "이"/"가"를
+# 안전하게 추가할 수 있다 — `_EXCLUSION_NAME_RE`에서 "도"만 필수로 뒀던 것과 달리 여기는
+# 애초에 숫자+년 토큰 앵커가 있어 "통계가 아닌 것은" 같은 2026-10-27 회귀 패턴이 발생할
+# 여지가 없다.
+# "2024년 이외의 연도에 처리된 안건"처럼 "이외"도 같은 뜻의 트리거인데 빠져있어서,
+# 심의위원회 58건 중 56건(2024년 아닌 전부)이 정답인데도 연도 제외 필터링 자체가
+# 통째로 안 걸려 "찾지 못함"으로 실패하는 버그가 실측 확인됨(2026-11-10 — `_EXCLUSION_
+# NAME_RE`에 "이외" 트리거를 추가했던 B-42와 같은 날, 다른 정규식에서 재발견된 동일
+# 패턴). 숫자+년/차 토큰에 직접 앵커돼 있어 오탐 위험이 없으므로 안전하게 추가.
+_EXCLUSION_CONNECTOR = r"(?:,|이랑|랑|와|과|은|는|도|이|가)?"
 _YEAR_EXCLUSION_LIST_RE = re.compile(
-    r"((?:\d{4}\s*년\s*" + _EXCLUSION_CONNECTOR + r"\s*)+)(?:아니고|아니며|아니라|아닌|빼고|제외|말고)"
+    r"((?:\d{4}\s*년\s*" + _EXCLUSION_CONNECTOR + r"\s*)+)(?:아니고|아니며|아니라|아닌|빼고|제외|말고|이외)"
 )
 _ROUND_EXCLUSION_LIST_RE = re.compile(
-    r"((?:\d+\s*차\s*" + _EXCLUSION_CONNECTOR + r"\s*)+)(?:아니고|아니며|아니라|아닌|빼고|제외|말고)"
+    r"((?:\d+\s*차\s*" + _EXCLUSION_CONNECTOR + r"\s*)+)(?:아니고|아니며|아니라|아닌|빼고|제외|말고|이외)"
 )
 
 
@@ -757,7 +1373,18 @@ def _excluded_rounds(text: str) -> list[int]:
 # 명사수식형 "아닌"만 지원하고 연결형 "아니고"는 빠져있었음). 한글 "아니다" 활용형은
 # "아니"+받침이 결합해(예: 아니+ㄴ→닌) 어간이 리터럴 부분문자열로 안 남으므로 각 활용형을
 # 명시적으로 나열해야 한다.
-_RESULT_EXCLUSION_TAIL_RE = re.compile(r"^\s*(?:이|가|도)?\s*(?:아니고|아니며|아니라|아닌|빼고|제외|말고)")
+# "일부제공으로 결정된 안건이 아닌 거"처럼 값과 부정어 사이에 "으로 결정된 안건이"
+# 같은 도메인 특유의 수식어가 끼는 경우도 있다(2026-11-09 발견 — 100% 결정론적으로
+# 0건 실패, 원래 44건 있어야 하는데 0건으로 답함). 전체 윈도우를 넓게 열면 문장 안의
+# 다른 심의결과 값까지 엉뚱하게 같이 걸릴 위험이 있어(예: "원안수용이고 일부제공이
+# 아닌 안건"에서 "원안수용"까지 잘못 제외 대상이 됨), 대신 이 특정 수식어 패턴만
+# 선택적 삽입구로 명시 허용 — 범위를 좁게 유지.
+# "이외"도 같은 뜻인데 빠져있어 B-42/B-43과 동일한 패턴으로 완전성이 깨질 수 있다
+# (2026-11-10, 같은 날 연도·차수 제외에서 먼저 발견돼 선제적으로 여기도 추가).
+_RESULT_EXCLUSION_TAIL_RE = re.compile(
+    r"^\s*(?:이|가|도)?\s*(?:으로\s*결정(?:된|되)\s*(?:안건|것|거|건)?\s*(?:이|은)?\s*)?"
+    r"(?:아니고|아니며|아니라|아닌|빼고|제외|말고|이외)"
+)
 
 
 def _excluded_committee_results(text: str) -> list[str]:
@@ -768,7 +1395,7 @@ def _excluded_committee_results(text: str) -> list[str]:
         idx = text.find(value)
         if idx == -1:
             continue
-        tail = text[idx + len(value) : idx + len(value) + 8]
+        tail = text[idx + len(value) : idx + len(value) + 20]
         if _RESULT_EXCLUSION_TAIL_RE.match(tail):
             excluded.append(value)
     return excluded
@@ -825,7 +1452,9 @@ def _excluded_trade_types(text: str) -> list[str]:
     return excluded
 
 
-_LIST_NARROWING_CONTINUATION_RE = re.compile(r"그\s*중에|그중에|이\s*중에|이중에|그\s*안에")
+_LIST_NARROWING_CONTINUATION_RE = re.compile(
+    r"(?:이|그|저)\s*(?:\d+\s*(?:개|건)\s*)?중에|(?:이|그|저)(?:중에|안에)|그\s*안에"
+)
 
 
 def _carried_exclusion_text(question: str, history: list[dict]) -> str:
@@ -1088,6 +1717,22 @@ def _resolve_committee_result_group(value: str) -> list[str]:
     return [value]
 
 
+# "통계 제공을 거부한 안건 있어?"처럼 DB 실제 값("제공불가")이 아닌 순수 의미적 동의어
+# (DB에 그 표기 자체가 존재하지 않음, _COMMITTEE_RESULT_SYNONYMS와는 다름 — 그건 DB에
+# 실제 존재하는 표기 변형끼리만 묶는 구조)로 패러프레이즈하면, 정확매칭 0건→필터 완전
+# 제거를 거쳐 "제공불가" 안건을 전혀 못 찾고 안전하게(그러나 완전성 없이) "찾지
+# 못했습니다"로만 답하는 공백이 실측 확인됨(2026-11-11 관찰, 2026-11-12 해결). 알려진
+# 값 체크(_KNOWN_COMMITTEE_RESULTS) 직전에 실제 값으로 치환해, 이후 모든 처리(동의어
+# OR 매칭 등)가 평범한 정식 표현 질문과 동일하게 흘러가도록 한다.
+_COMMITTEE_RESULT_PARAPHRASE_ALIASES = {
+    "거부": "제공불가",
+    "거절": "제공불가",
+    "반려": "제공불가",
+    "불가": "제공불가",  # "불가된거"/"불가한거"류 — 장명근 피드백(2026-11-18)으로 추가
+    "승인": "원안수용",
+}
+
+
 # 실제 DB에 존재하는 통계종류 값 전체(직접 스캔 확인, 2026-10-19). "한국환경공단 신청이력
 # 중에 2024년 수수료 관련 알려줘"에서 LLM이 "수수료 관련"처럼 전혀 존재하지 않는 값을
 # 통계종류 필드에 지어내 채워 넣는 바람에, 그 값과 정확히 일치하는 레코드가 DB에 없어
@@ -1102,8 +1747,11 @@ _KNOWN_STATISTICS_TYPES = {
 
 
 def _build_filter(
-    extracted: FilterExtraction, allowed_data_types: set[str] | None = None, question_text: str = ""
-) -> qmodels.Filter | None:
+    extracted: FilterExtraction,
+    allowed_data_types: set[str] | None = None,
+    question_text: str = "",
+    carried_over: list[dict] | None = None,
+) -> tuple[qmodels.Filter | None, tuple[frozenset, frozenset] | None, str | None, str | None]:
     values = {}
     for field, value in extracted.model_dump(exclude_none=True).items():
         if field == "키워드":
@@ -1150,13 +1798,58 @@ def _build_filter(
     # 방어한다(2026-10-19 발견, _KNOWN_STATISTICS_TYPES 정의부 참고) — 신뢰 못 할 값은
     # 제거만 하고(옮길 곳이 마땅치 않음), 기관명·연도 등 나머지 신뢰할 수 있는 필터는
     # 그대로 유지한 채 검색한다.
+    #
+    # 심의결과와 완전히 같은 2차 문제도 재현됨(2026-11-09, "통계종류가 수출통계인 신청이력
+    # 알려줘" — "수출통계"는 존재하지 않는 값인데 필터가 조용히 사라진 뒤, 실제로는
+    # 통계종류='통관기초'이거나 값 자체가 없는(".") 레코드 14건을 "수출통계와 관련된
+    # 자료"라고 확신에 차서 답함). 제외 표현이 아닌 순수 긍정 질문일 때만 다른 값을 그
+    # 이름으로 서술하지 못하게 answer-generation 단계에 넘긴다.
+    unknown_statistics_type = None
+    if (
+        values.get("통계종류")
+        and values["통계종류"] not in _KNOWN_STATISTICS_TYPES
+        and not _excluded_statistics_types(question_text)
+    ):
+        unknown_statistics_type = values["통계종류"]
     if values.get("통계종류") and values["통계종류"] not in _KNOWN_STATISTICS_TYPES:
         values.pop("통계종류", None)
+
+    # 통계종류와 완전히 같은 문제가 수출입구분에도 방어 없이 남아있었다(2026-11-11 발견 —
+    # "수수료 청구"처럼 DB에 없는 값이 그대로 Qdrant AND 조건에 들어가 100% 0건을 만듦).
+    # 단순히 0건으로 끝나는 게 아니라, `_search()`의 완화 캐스케이드 순서를 망가뜨리는 2차
+    # 피해가 있었음 — "무역관련지식재산권보호협회 자동차부품 수수료 청구 중에 2012년
+    # 3분기 자료 찾아줘"에서 이 잘못된 값이 수출입구분 완화 단계까지 0건을 강제해, 그 다음
+    # 단계(연도 완화)에 도달하기 전에 {기관명+연도} 조합만으로 이미(무관한) 결과가 나와버려
+    # 정작 필요했던 연도 완화 기회 자체가 사라짐. 통계종류와 동일하게 알려지지 않은 값은
+    # 조용히 제거만 한다(기관명·연도 등 신뢰할 수 있는 필터는 그대로 유지).
+    if values.get("수출입구분") and values["수출입구분"] not in _NON_NAME_DOMAIN_WORDS:
+        values.pop("수출입구분", None)
 
     # "원안수용 아닌거 있어?" 같은 심의결과 제외 질문에서 LLM이 부정 표현을 그대로
     # 심의결과 필드에 문자열로 채우는 경우(예: "원안수용 아닌")를 방어한다(2026-10-22
     # 발견) — 통계종류와 동일한 원리: 실제 DB에 없는 값이라 정확매칭이 항상 0건이 되고,
     # 제외 의도 자체는 아래 `_excluded_committee_results`(ask())가 별도로 처리한다.
+    #
+    # 제외 질문이 아닌 순수 긍정 질문("심의위원회에서 부결된 안건 있어?")에서도 LLM이
+    # 존재하지 않는 심의결과 값("부결")을 지어내는 경우가 있다(2026-11-09 발견) — 이때도
+    # 필터는 0건→단계적 완화로 조용히 사라지는데, 그렇게 남은(검증 안 된) 벡터 검색
+    # 결과를 답변 생성 LLM이 질문의 그 단어로 멋대로 재서술해버린다("제공불가" 레코드
+    # 3건을 "부결된 안건 3건"이라고 확신에 차서 답함). 제외 표현이 아닐 때만(제외는
+    # `_excluded_committee_results`가 이미 올바르게 처리하므로 건드리지 않음) 어떤 값이
+    # 지워졌는지 answer-generation 단계에 넘겨, 다른 값을 그 이름으로 서술하지 못하게
+    # 막는다.
+    # 알려진 값 체크 직전에 "거부/거절/반려/승인" 같은 순수 의미적 패러프레이즈를 실제
+    # DB 값으로 치환(2026-11-12, 위 _COMMITTEE_RESULT_PARAPHRASE_ALIASES 정의부 참고).
+    if values.get("심의결과") in _COMMITTEE_RESULT_PARAPHRASE_ALIASES:
+        values["심의결과"] = _COMMITTEE_RESULT_PARAPHRASE_ALIASES[values["심의결과"]]
+
+    unknown_committee_result = None
+    if (
+        values.get("심의결과")
+        and values["심의결과"] not in _KNOWN_COMMITTEE_RESULTS
+        and not _excluded_committee_results(question_text)
+    ):
+        unknown_committee_result = values["심의결과"]
     if values.get("심의결과") and values["심의결과"] not in _KNOWN_COMMITTEE_RESULTS:
         values.pop("심의결과", None)
 
@@ -1192,7 +1885,16 @@ def _build_filter(
     # 사용자가 실제로 그 메뉴 이름을 말한 경우는 아니었다 — `_MENU_KEYWORDS`로 추출된
     # 데이터유형의 리터럴 메뉴 이름이 질문 텍스트에 실제로 있으면 신뢰하고 유지한다.
     if extracted.키워드 and not _confirmed_menu_data_type(data_type_value, question_text):
-        data_type_value = None
+        # "그 중에 X만 알려줘"로 narrowing된 경우도 위 확인(리터럴 메뉴 이름)과 같은
+        # 수준으로 신뢰한다(2026-11-09) — carried_over(직전 턴 근거)가 전부 하나의
+        # 데이터유형으로 일치하고 그게 이 데이터유형과 같으면, 사용자가 메뉴 이름을 직접
+        # 말하지 않았어도 "방금 보여준 그 목록"이라는 맥락 자체가 충분히 신뢰할 근거다.
+        _carried_build_types = {p.get("데이터유형") for p in (carried_over or []) if p.get("데이터유형")}
+        _carried_build_confirmed = (
+            len(_carried_build_types) == 1 and next(iter(_carried_build_types)) == data_type_value
+        )
+        if not _carried_build_confirmed:
+            data_type_value = None
 
     # 웹 화면에서 사용자가 메뉴를 명시적으로 고정한 경우(allowed_data_types), 그게 최종
     # 후보 범위다. LLM이 뽑은 데이터유형이 그 범위 안이면 더 구체적이니 그대로 쓰고,
@@ -1259,6 +1961,15 @@ def _build_filter(
             values.pop(field, None)
 
     conditions = []
+    # (source_ids, attachment_types) — 첨부+카테고리필터(심의결과 등) 조합에서 부모 레코드
+    # 조회로 원본ID 후보를 확정한 경우에만 채워진다. 아래에서 세팅되면 `_search()`가 이걸로
+    # 벡터 top-K에 의존하지 않고 각 원본ID의 첨부를 전부 직접 가져와 완전성을 보장한다
+    # (2026-11-03 발견 — "심의위원회 제공불가 안건"이 본문 스코프에선 16건인데 첨부파일
+    # 스코프에서는 7건만 나옴. 원인: 16개 원본ID에 딸린 첨부 조각이 총 66개(한 건에 최대
+    # 9개)라 벡터 top-20이 조각 많은 일부 레코드에 쏠려 다른 레코드가 통째로 밀려남 —
+    # 2026-09-22 "기관정보 전체표시"/2026-10-20 "날짜·수수료 최상급"과 같은 계열의 top-K
+    # 맹점. 이미 알고 있는 작은 원본ID 집합은 벡터 랭킹 없이 전부 직접 가져오는 게 안전).
+    attachment_full_fetch: tuple[frozenset, frozenset] | None = None
 
     # 첨부 청크는 payload에 "데이터유형/원본ID/첨부파일명/요약/text" 외의 메타데이터 필드가
     # 전혀 없다(기관명·연도·요청자·제공자·담당자·결재자·심의결과·차수 전부 부모 레코드에만
@@ -1339,6 +2050,13 @@ def _build_filter(
             # 되게 한다 — 조건이 조용히 사라져 무관한 결과가 섞이는 걸 막기 위함.
             conditions.append(qmodels.FieldCondition(key="원본ID", match=qmodels.MatchValue(value="__no_such_parent__")))
 
+        # 원본ID 후보가 이미 확정됐고(비어있지 않음) 개수가 감당할 만하면(보통 수십 건
+        # 이내), 벡터 top-K에 맡기지 않고 `_search()`가 각각 전부 직접 가져오도록 넘긴다.
+        # 후보가 너무 많으면(예: 기관명 없이 전체 카테고리를 묻는 질문) 직접 가져오기 자체가
+        # 과도해지니 기존 벡터 top-K 동작으로 안전하게 폴백한다.
+        if source_ids and len(source_ids) <= _ATTACHMENT_FULL_FETCH_LIMIT:
+            attachment_full_fetch = (frozenset(source_ids), frozenset(resolved_types))
+
     # 방어: 요청자/제공자/담당자/결재자는 서로 다른 데이터유형에만 존재해 한 청크에서
     # 동시에 만족될 수 없다. 같은 이름이 질문 분석 단계에서 여러 역할 필드에 중복
     # 추출되면(예: "박다은이 담당한 자료" → 요청자·담당자 둘 다 "박다은"), AND로 걸면
@@ -1387,7 +2105,12 @@ def _build_filter(
                 )
             )
 
-    return qmodels.Filter(must=conditions) if conditions else None
+    return (
+        (qmodels.Filter(must=conditions) if conditions else None),
+        attachment_full_fetch,
+        unknown_committee_result,
+        unknown_statistics_type,
+    )
 
 
 def _scope_only_filter(allowed_data_types: set[str]) -> qmodels.Filter:
@@ -1634,6 +2357,21 @@ def _strip_untraceable_filters(analysis: QueryAnalysis, question: str, history: 
 
 _HANGUL_RE = re.compile(r"[가-힣]")
 _TRANSLATION_REQUEST_RE = re.compile(r"번역|영어로|일본어로|중국어로|불어로|프랑스어로|독일어로")
+# GroundedAnswer.summary 전체가 짧고 순수한 부정문("~관련된 자료는 없습니다.")으로만 끝나는지
+# 확인한다 — no_result=False인데 summary가 이 패턴에 걸리면 내부 모순으로 간주해 보정한다
+# (2026-11-10, _ask() 내부에서 사용). "~없지만 ~있습니다"처럼 긍정 내용이 뒤에 이어지면
+# `$` 앵커에 안 걸려 과도하게 오탐하지 않는다.
+# "포함되어 있지 않습니다"류도 같은 자기모순 패턴으로 추가 확인(2026-11-10, "농산물 수입쿼터"
+# 질문 5/5 재현) — 키워드 narrow(2026-11-04)가 질문의 좁은 단어("수입쿼터")를 못 찾고 더
+# 넓은 단어("농산물")로 줄여 매칭한 뒤 keyword_note가 no_result=false를 강제하는데,
+# summary는 "원래 좁은 개념은 없다"는 걸 정직하게 쓰려다 전체가 부정문으로만 끝나버림.
+_PURE_NEGATIVE_SUMMARY_RE = re.compile(
+    r"^[^.!?]{0,50}("
+    r"없습니다|없는\s*것으로\s*(확인(됩니다|됨|되었습니다)?|보입니다)|찾지\s*못했습니다|"
+    r"포함되어\s*있지\s*않습니다|관련(이|된\s*내용이)\s*없습니다|해당하지\s*않습니다|"
+    r"확인되지\s*않습니다"
+    r")\.?\s*$"
+)
 
 
 def _analyze_query(question: str, history: list[dict]) -> QueryAnalysis:
@@ -1678,6 +2416,12 @@ _NARROWING_FILTER_FIELDS = {
 }
 FILTERED_SEARCH_LIMIT = 20
 
+# 첨부+카테고리필터(심의결과 등) 조합에서 부모 레코드로 확정한 원본ID 후보 수가 이 이하면
+# `_search()`가 벡터 top-K 대신 각 원본ID의 첨부를 전부 직접 가져온다(`_build_filter`의
+# `attachment_full_fetch` 참고, 2026-11-03). 20(FILTERED_SEARCH_LIMIT)보다 조금 넉넉하게
+# 잡아 소규모 카테고리(예: 특정 연도+심의결과 조합)는 안정적으로 전부 커버되게 한다.
+_ATTACHMENT_FULL_FETCH_LIMIT = 30
+
 
 def _has_narrowing_filter(filters: FilterExtraction) -> bool:
     values = filters.model_dump(exclude_none=True)
@@ -1694,11 +2438,26 @@ def _pool_key(payload: dict) -> tuple:
     스캔은 정확히 찾아내는데도 최종 답변엔 전혀 반영 안 됨 — 벡터 검색이 같은 원본ID의 다른
     파일을 먼저 채워서 스캔 결과가 병합 단계에서 조용히 사라진 것). 첨부는 `첨부파일명`+본문
     앞부분(같은 파일이 여러 조각으로 쪼개진 경우까지 구분)까지 키에 포함해 이 충돌을 막는다.
-    첨부가 아닌 메뉴1~4 본문(기관정보 등)은 원래도 원본ID당 청크 1개라 기존 방식 그대로 둔다."""
+    첨부가 아닌 메뉴1~4 본문(기관정보 등)은 원래도 원본ID당 청크 1개라 기존 방식 그대로 둔다.
+
+    ⚠️ "본문 앞부분"을 `text[:50]`으로 고정한 게 그 자체로 또 다른 버그였다(2026-11-11
+    발견 — "...2012년 3분기 자료 찾아줘" 조사 중, 9조각으로 쪼개진 "(2025) 중소기업
+    수출통계(이력관리)시스템 관리 및 운영 계약.pdf"에서 scan_text_contains가 정확히
+    찾아낸 "제355조" 포함 조각이 최종 결과에선 완전히 다른(키워드 없는) 조각으로 바뀌어
+    있는 걸 발견). 조각 헤더(`[데이터유형 원본ID / 첨부파일명] (N/M번째 조각)`)가 긴
+    한글 파일명 탓에 50자를 넘기면, 모든 조각의 앞 50자가 조각번호 숫자가 나오기도 전에
+    똑같아져(이 경우 "...시스" 까지 50자 전부 공통 헤더) 서로 다른 조각이 같은 pool_key로
+    충돌 — 벡터 검색이 먼저 채운 무관한 조각에 막혀 스캔이 찾은 정답 조각이 "이미 봤다"며
+    조용히 버려짐(`scan_confirmed_keys`엔 기록되지만 실제 `merged`엔 안 들어가는 상태).
+    `_FRAGMENT_INDEX_RE`로 실제 조각번호를 뽑아 그걸로 구분하고, 조각번호가 없으면(단일
+    조각이거나 첨부 아닌 본문) 기존 `text[:50]` 방식으로 안전하게 폴백한다."""
     base = (payload["데이터유형"], payload["원본ID"])
     filename = payload.get("첨부파일명")
     if filename:
-        return base + (filename, payload.get("text", "")[:50])
+        text = payload.get("text", "")
+        frag_match = _FRAGMENT_INDEX_RE.search(text)
+        marker = frag_match.group(0) if frag_match else text[:50]
+        return base + (filename, marker)
     return base
 
 
@@ -1725,6 +2484,27 @@ _FRAGMENT_HEADER_RE = re.compile(r"^\[.+?\](?: \(\d+/\d+번째 조각\))?\n")
 # 넘김). 기존 `_CONTEXT_CHAR_BUDGET`(여러 자료를 합칠 때의 전체 예산)과 같은 값으로,
 # 한 문서를 병합하는 시점부터 미리 상한을 둔다.
 _MERGED_DOC_CHAR_LIMIT = 40000
+
+# "{연도}년이 본문에 리터럴로 있으면 교차오염 아니다"는 예외(2026-11-11, B-53)가 너무
+# 느슨해서, 여러 해에 걸친 반복 계약(한국에너지공단 등 매년 갱신되는 통계제공 계약)에서
+# 신청연도가 완전히 다른 레코드 여러 개가 그냥 과거 계약을 배경으로 언급("2019년에 체결된
+# 기존 계약을 바탕으로...")했다는 이유만으로 전부 통과해버려, 연도 필터가 사실상
+# 무력화되는 재발 버그가 같은 날 바로 확인됨("한국에너지공단 2019년 자료 중에 제401조
+# 관련된 내용이 있어?"가 2015/2019/2020/2021/2022/2023/2025년 계약 7건을 전부 반환).
+# 원래 B-53 사례(2012년이 진짜 서비스 대상 기간)는 "자료기간 : 2012년 4월 ~ 6월"처럼
+# 그 연도가 실제 날짜범위 표현의 일부로 등장했는데, 이번 재발 사례는 "2019년"이 그 어떤
+# 날짜범위 표현에도 안 들어가고 그냥 지나가는 서술이었음(직접 대조로 확인) — 날짜범위
+# 표현 안에 있을 때만 "진짜 서비스기간 언급"으로 보고, 단순 산문 속 언급은 더 이상
+# 예외로 인정하지 않는다.
+_YEAR_DATE_RANGE_RE = re.compile(
+    r"\d{4}년\s*\d{1,2}월\s*[~-]\s*\d{1,2}월"
+    r"|\d{4}\.\d{1,2}\.\d{1,2}\s*[~-]"
+    r"|\d{4}년\s*\d{1,2}월\s*\d{1,2}일\s*[~-]"
+)
+
+
+def _year_in_date_range(text: str, year: str) -> bool:
+    return any(str(year) in m for m in _YEAR_DATE_RANGE_RE.findall(text))
 
 
 def _merge_attachment_fragments(payloads: list[dict]) -> tuple[list[dict], bool]:
@@ -1876,14 +2656,37 @@ def _merge_by_display_identity(
     return merged_out, any_truncated
 
 
+# "첫번째"/"첫 번째"(공백 유무 둘 다) 등 목록 순서 참조 — _search()에서 carried_over를
+# 이번 턴 벡터검색 결과보다 앞세울지 판단하는 데 쓰인다(2026-11-09, 아래 _search() 안
+# 주석 참고).
+_ORDINAL_REFERENCE_RE = re.compile(r"첫\s*번째|두\s*번째|세\s*번째|네\s*번째|다섯\s*번째")
+
+
+def _results_miss_keyword(results: list, keyword: str | None) -> bool:
+    """results(ScoredPoint 리스트)가 비어있지 않아도, 그 안의 어떤 레코드도 키워드와
+    매칭되지 않으면 True. "결과가 있다"와 "질문과 실제로 관련 있는 결과가 있다"를 구분하기
+    위함 — 2026-11-11에 "연도=2012"가 Qdrant native 필터로 다른(무관한) 2012년 레코드
+    6건을 이미 채워버려, "0건이면 완화"라는 기존 캐스케이드 조건 자체가 전혀 발동 못 하는
+    문제가 실측 확인됨."""
+    if not keyword:
+        return False
+    return not any(
+        keyword_matches(keyword, r.payload.get("text") or "", r.payload.get("요약") or "")
+        for r in results
+    )
+
+
 def _search(
     analysis: QueryAnalysis,
     carried_over: list[dict],
     allowed_data_types: set[str] | None = None,
     force_narrowing: bool = False,
-) -> tuple[list[dict], bool]:
+    carried_scope_lock: str | None = None,
+) -> tuple[list[dict], bool, bool, str | None, str | None, bool]:
     vector = embed_texts([analysis.standalone_question])[0]
-    query_filter = _build_filter(analysis.filters, allowed_data_types, analysis.standalone_question)
+    query_filter, attachment_full_fetch, unknown_committee_result, unknown_statistics_type = _build_filter(
+        analysis.filters, allowed_data_types, analysis.standalone_question, carried_over
+    )
     # "A 말고" 류 제외 조건(기관명/역할필드/연도)은 filters가 아니라 질문 원문에서 정규식으로
     # 뽑아 _search() 반환 이후 결과를 걸러내는 방식이라, 여기선 narrowing 신호로 전혀 안
     # 보임(filters엔 그 값이 없거나 오히려 None임) — "외부요청 8건 중 2024년 아닌 거"처럼
@@ -1905,7 +2708,7 @@ def _search(
         carried_orgs = {p.get("기관명") for p in carried_over if p.get("기관명")}
         if len(carried_orgs) == 1:
             inferred = analysis.filters.model_copy(update={"기관명": next(iter(carried_orgs))})
-            inferred_filter = _build_filter(inferred, allowed_data_types, analysis.standalone_question)
+            inferred_filter = _build_filter(inferred, allowed_data_types, analysis.standalone_question)[0]
             if inferred_filter is not None:
                 inferred_limit = FILTERED_SEARCH_LIMIT if _has_narrowing_filter(inferred) else CHAT_TOP_K
                 probe = vector_search(vector, inferred_filter, inferred_limit)
@@ -1928,12 +2731,41 @@ def _search(
     # 평가원이랑 거래한 내부자료 중에 가장 비용이 많이 든 건" — 신청이력 레코드를
     # "내부자료"라고 단정). 완화가 실제로 발동했는지 플래그로 남겨 호출자(ask())가
     # 답변 생성 프롬프트에 안내를 붙일 수 있게 한다.
+    # ⚠️ 아래 세 단계(데이터유형/수출입구분/심의결과 완화)는 원래 각자 `analysis.filters`
+    # (원본)에서 자기 필드 하나만 지우고 다시 시도하는 독립적인 단계였다 — 신뢰할 수 없는
+    # 필드가 "하나만" 잘못 추출된 경우엔 문제없지만, **두 개 이상이 동시에 잘못 추출되면**
+    # 각 단계가 서로 다른 필드를 "복원"시켜(원본에서 다시 복사하므로) 결국 어느 조합도
+    # 성공 못 하고 최종 폴백(기관명까지 전부 제거)까지 떨어지는 버그가 실측 확인됨
+    # (2026-11-10 — "관세청 수출입 통계 요청 관련 이력 있어?"에서 데이터유형='신청이력'
+    # (관세청은 외부요청만 있어 0건이 맞음)과 수출입구분='수출입'(외부요청엔 이 필드 자체가
+    # 없어 역시 0건)이 동시에 잘못 추출됨 — 1단계는 {기관명+수출입구분}으로 재시도해 0건,
+    # 2단계는 원본을 복사해 수출입구분만 지우며 데이터유형을 다시 넣어 {기관명+데이터유형}
+    # 으로 재시도해 또 0건 → 최종 폴백이 기관명까지 날려버려 완전히 무관한 4개 기관의
+    # 레코드를 "관세청의 이력"이라고 확신에 차서 답함, 10회 중 9회 재현). 세 단계를 **누적**
+    # (이전 단계에서 이미 지운 필드는 계속 지운 채로 다음 단계도 이어감)으로 바꿔, 여러
+    # 필드가 동시에 잘못 추출돼도 신뢰할 수 있는 필드(기관명 등)만 남을 때까지 안전하게
+    # 좁혀가도록 한다.
     data_type_relaxed = False
-    if not results and analysis.filters.데이터유형 is not None:
+    _relaxed_filters = analysis.filters
+    if not results and _relaxed_filters.데이터유형 is not None:
         data_type_relaxed = True
-        relaxed = analysis.filters.model_copy(update={"데이터유형": None})
-        relaxed_limit = FILTERED_SEARCH_LIMIT if _has_narrowing_filter(relaxed) else CHAT_TOP_K
-        results = vector_search(vector, _build_filter(relaxed, allowed_data_types), relaxed_limit)
+        _relaxed_filters = _relaxed_filters.model_copy(update={"데이터유형": None})
+        relaxed_limit = FILTERED_SEARCH_LIMIT if _has_narrowing_filter(_relaxed_filters) else CHAT_TOP_K
+        results = vector_search(vector, _build_filter(_relaxed_filters, allowed_data_types)[0], relaxed_limit)
+        limit_used = relaxed_limit
+
+    # 수출입구분은 질문 본문의 맥락("치료재료 수입...")만 보고 LLM이 과신해서 채우는 경우가
+    # 있는데, 실제 DB 레코드는 이 필드가 "."(미입력)인 경우가 흔하다(2026-11-09 발견 —
+    # "건강보험심사평가원 치료재료 수입통관자료 요청 건 중에 2018년 거는?"이 정확히 이
+    # 조합으로 실패: 진짜 2018년 정답 레코드가 실존하는데 수출입구분='.'이라 AND 필터에
+    # 안 걸려 0건 → 그 다음 단계가 연도까지 통째로 날려버려 완전히 무관한 다른 해로 샘).
+    # 데이터유형과 같은 이유로 신뢰할 수 없는 필드이니, 기관명·연도 등 신뢰할 수 있는 필터는
+    # 유지한 채 수출입구분만 추가로 제거하고 재검색한다 — 바로 다음 단계(전체 필터 제거)로
+    # 건너뛰면 연도처럼 훨씬 신뢰할 수 있는 필터까지 같이 날아간다.
+    if not results and _relaxed_filters.수출입구분 is not None:
+        _relaxed_filters = _relaxed_filters.model_copy(update={"수출입구분": None})
+        relaxed_limit = FILTERED_SEARCH_LIMIT if _has_narrowing_filter(_relaxed_filters) else CHAT_TOP_K
+        results = vector_search(vector, _build_filter(_relaxed_filters, allowed_data_types)[0], relaxed_limit)
         limit_used = relaxed_limit
 
     # 심의결과는 원본 DB 값 자체가 자유 텍스트라 표기가 제각각이고("원안수용"/"원안대로승인"/
@@ -1942,13 +2774,57 @@ def _search(
     # "항목조정후제공된"으로 추출돼 정확매칭이 항상 0건, 2026-09-21 재현). 데이터유형과 같은
     # 이유로 신뢰할 수 없는 필드이니, 기관명 등 신뢰할 수 있는 필터는 유지한 채 심의결과만
     # 추가로 제거하고 재검색한다.
-    if not results and analysis.filters.심의결과 is not None:
+    if not results and _relaxed_filters.심의결과 is not None:
         # 데이터유형(원래 추출값, 대개 "심의위원회"로 맞게 뽑힘)은 그대로 유지하고 심의결과만
         # 지운다 — 둘 다 지우면 기관정보·신청이력까지 섞여 너무 넓어진다.
-        relaxed = analysis.filters.model_copy(update={"심의결과": None})
-        relaxed_limit = FILTERED_SEARCH_LIMIT if _has_narrowing_filter(relaxed) else CHAT_TOP_K
-        results = vector_search(vector, _build_filter(relaxed, allowed_data_types), relaxed_limit)
+        _relaxed_filters = _relaxed_filters.model_copy(update={"심의결과": None})
+        relaxed_limit = FILTERED_SEARCH_LIMIT if _has_narrowing_filter(_relaxed_filters) else CHAT_TOP_K
+        results = vector_search(vector, _build_filter(_relaxed_filters, allowed_data_types)[0], relaxed_limit)
         limit_used = relaxed_limit
+
+    # "무역관련지식재산권보호협회 자동차부품 수수료 청구 중에 2012년 3분기 자료 찾아줘"가
+    # 정답 레코드(D20240100178238)를 전혀 못 찾던 버그가 실측 확인됨(2026-11-11) — 질문의
+    # "2012년"은 첨부파일 내용(청구 분기)을 가리키는데, 레코드의 구조화 `연도` 필드는
+    # 신청일 기준(2011)이라 서로 다름. "연도"는 보통 신뢰할 수 있는 필터라 끝까지 유지하지만,
+    # 장기계약처럼 신청연도와 내용상 언급 연도가 어긋나는 레코드가 실제로 존재한다. 키워드가
+    # 있으면(이 경우 "자동차부품") 그 키워드가 진짜 관련성을 보장해주므로, 연도만 추가로
+    # 완화해도 무관한 레코드가 섞일 위험이 낮다 — 키워드 없이 연도만 완화하면 너무 넓어지니
+    # 키워드가 있을 때만 적용한다.
+    #
+    # ⚠️ 처음엔 `if not results`로만 게이트했는데, trace로 재확인한 결과 {기관명+연도=2012}
+    # 만으로 Qdrant native 검색이 이미 "결과 있음"(그 기관의 다른 2012년 레코드 6건)을
+    # 만들어버려 이 단계 자체가 전혀 발동 안 했음 — "결과가 있지만 전부 키워드와 무관한
+    # 레코드뿐"인 경우를 "0건"과 똑같이 취급해야 한다. `_results_miss_keyword()`로 이
+    # 경우도 함께 감지한다(앞선 데이터유형/수출입구분/심의결과 완화 3단계는 건드리지 않음 —
+    # 그쪽은 훨씬 광범위하게 쓰이는 기존 로직이라 게이트 조건을 바꾸면 회귀 위험이 큼, 이
+    # 연도 완화는 오늘 신설한 좁은 범위라 안전하게 확장 가능).
+    # ⚠️ 이 완화가 "연도 조건을 사실상 포기했다"는 사실 자체를 신호로 남겨야 한다 — 그렇지
+    # 않으면 답변 생성 LLM이 "이 자료들이 질문의 연도와 맞는지" 검증할 근거가 전혀 없는데도
+    # 확신에 차서 답하는 문제가 실측 확인됨(2026-11-11 — "한국환경공단 관련 자료 중에
+    # 재활용 관련된 내용이 있어?" 다음 "그 중에 2024년 거는 뭐야?"를 물으면, 2024년
+    # 레코드는 단 1건도 없는데 2014/2017/2009/2011년 레코드 4건을 마치 2024년인 것처럼
+    # 제시 — 연도 완화 자체는 "재활용"이라는 키워드가 진짜 관련성을 보장한다는 전제로
+    # 설계됐지만(B-53 원래 사례), 이번 질문처럼 "그 중에 특정 연도 하나"를 콕 집어 묻는
+    # 경우엔 그 전제가 안 맞아 연도 검증이 반드시 필요함).
+    year_relaxed = False
+    if (
+        (not results or _results_miss_keyword(results, analysis.filters.키워드))
+        and _relaxed_filters.연도 is not None
+        and analysis.filters.키워드
+    ):
+        _relaxed_filters = _relaxed_filters.model_copy(update={"연도": None})
+        relaxed_limit = FILTERED_SEARCH_LIMIT if _has_narrowing_filter(_relaxed_filters) else CHAT_TOP_K
+        _year_relaxed_results = vector_search(vector, _build_filter(_relaxed_filters, allowed_data_types)[0], relaxed_limit)
+        # 완화해도 키워드와 안 맞는 결과만 나오면(진짜 무관한 질문일 수 있음), 원래 결과를
+        # 버리지 않는다 — 정말 아무것도 없는 것보다 기존 결과(설령 안 맞아도)가 안전.
+        if _year_relaxed_results and not _results_miss_keyword(_year_relaxed_results, analysis.filters.키워드):
+            results = _year_relaxed_results
+            limit_used = relaxed_limit
+            year_relaxed = True
+        elif not results:
+            results = _year_relaxed_results
+            limit_used = relaxed_limit
+            year_relaxed = True
 
     if not results and query_filter is not None:
         # 그래도 없으면 나머지 필터는 다 제거하고 재검색한다. 단, 메뉴 스코프(allowed_data_types)는
@@ -1958,7 +2834,21 @@ def _search(
         # 할 상황) 오히려 후보가 줄어 진짜 정답이 top-6 밖으로 밀리는 문제가 재현됨(예: "한국
         # 무역통계진흥원 홈페이지 보안 취약점 점검" — 기관명 필터가 있었는데도 최종 폴백에서
         # 6개로 잘려 정답인 내부자료첨부가 순위 밖으로 밀림, 2026-09-21 발견).
-        fallback_filter = _scope_only_filter(allowed_data_types) if allowed_data_types else None
+        # "그 중에" narrowing(carried_scope_lock)이 있으면 sidebar 스코프(allowed_data_types)와
+        # 함께(또는 단독으로) 그 메뉴로도 좁힌다 — 위 데이터유형 복원만으로는, 다른 필터
+        # (수출입구분/요청자 등)가 엉뚱하게 뽑혀 0건이 나서 여기까지 떨어지는 경우를 못
+        # 막는다(2026-11-09 실측 — 이 최종 폴백이 원래 완전 무제한이라 다시 무관한 메뉴가
+        # 섞여 나옴).
+        _fallback_scope = set(allowed_data_types or set())
+        if carried_scope_lock:
+            _lock_set = {carried_scope_lock}
+            _lock_set.update(
+                v
+                for v in (_ATTACHMENT_TYPE_OF.get(carried_scope_lock), _BASE_TYPE_OF.get(carried_scope_lock))
+                if v
+            )
+            _fallback_scope = (_fallback_scope & _lock_set) if allowed_data_types else _lock_set
+        fallback_filter = _scope_only_filter(_fallback_scope) if _fallback_scope else None
         results = vector_search(vector, fallback_filter, search_limit)
         limit_used = search_limit
 
@@ -1985,26 +2875,31 @@ def _search(
             seen.add(key)
             vector_payloads.append(r.payload)
 
-    # 이번 턴에 기관명 필터가 명확히 있으면 carried_over(직전 턴 안전장치)를 아예 건너뛴다.
+    # 이번 턴에 기관명 필터가 있으면, carried_over 중 그 기관과 "다른" 것만 걸러낸다.
     # 브라우저를 새로고침하지 않고 완전히 다른 주제로 화제를 바꾸면(실사용에서 흔함) 직전
     # 턴의 무관한 출처가 이번 턴에 그대로 섞여 나오는 교차오염이 실측 확인됨(2026-10-20 —
     # "내부자료 댓글" 질문 직후 "한국환경공단 신청이력" 질문에, 직전 턴의 내부자료 10건이
     # carried_over로 끼어들어 날짜필터까지 우연히 통과하며 완전히 무관한 메뉴의 레코드가
-    # "확인된 자료"로 제시됨). 내부자료처럼 기관명 필드 자체가 없는 레코드는 기관명 불일치
-    # 검사로 못 걸러지므로(None이라 "다르다"고 판단 못 함), 아예 기관명이 명시된 질문에서는
-    # carried_over를 쓰지 않기로 한다 — 이런 질문은 _search()의 narrowing filter(top-20)와
-    # find_by_type_and_field(기관정보 전체표시)가 이미 그 기관 자료를 충분히 정확하게 가져와
-    # carried_over 안전장치가 애초에 불필요하다(기존 "그것만 알려줘"류 모호한 후속질문을
-    # 위한 안전장치는 기관명이 없을 때만 의미가 있음).
+    # "확인된 자료"로 제시됨). 내부자료처럼 기관명 필드 자체가 없는 레코드는 `p.get("기관명")`
+    # 이 None이라 `!= 기관명`으로 자동으로 걸러져 이 시나리오는 그대로 막힌다.
+    # ⚠️ 예전엔 "기관명 필터가 있으면 carried_over 자체를 통째로 건너뛴다"(all-or-nothing)
+    # 였는데, 이게 "같은 기관을 그대로 이어가는 단순 대명사 후속질문"까지 같이 막아버리는
+    # 회귀를 발견함(2026-11-10 — "대한무역투자진흥공사 관련 이력" → "그 중에 가장 최근 거는?"
+    # → "그거 수수료는 얼마야?" 3턴 시퀀스에서, 이 기관이 같은 사업명으로 41건이나 등록돼
+    # 있어 carried_over 없이는 turn2가 정확히 짚어준 특정 레코드가 turn3의 일반 검색 결과
+    # 24건 안에 아예 안 들어가 완전히 다른 레코드의 수수료를 "정답"으로 답함). carried_over
+    # 쪽 기관명이 이번 턴 필터와 정확히 일치하면("화제 전환"이 아니라 "같은 기관 이어가기")
+    # 그 특정 레코드는 그대로 안전망으로 살려둔다.
     carried_payloads = []
-    if not analysis.filters.기관명:
-        for p in carried_over:
-            if allowed_data_types is not None and p["데이터유형"] not in allowed_data_types:
-                continue
-            key = _pool_key(p)
-            if key not in seen:
-                seen.add(key)
-                carried_payloads.append(p)
+    for p in carried_over:
+        if analysis.filters.기관명 and p.get("기관명") != analysis.filters.기관명:
+            continue
+        if allowed_data_types is not None and p["데이터유형"] not in allowed_data_types:
+            continue
+        key = _pool_key(p)
+        if key not in seen:
+            seen.add(key)
+            carried_payloads.append(p)
 
     # 키워드가 추출됐으면, 벡터 유사도 순위와 무관하게 본문에 그 단어가 실제로 들어간 건을
     # 전수 스캔해서 빠짐없이 합친다 (벡터 검색은 상위 몇 개만 가져와 놓치는 경우가 있음).
@@ -2043,6 +2938,17 @@ def _search(
     # 스캔 결과도 좁힌다(첨부까지 포함해야 하는 이유: 내부자료의 진짜 유일한 매치가
     # 본문이 아니라 내부자료첨부였음 — 메뉴 범위는 원래부터 본문+첨부를 함께 가리킴).
     confirmed_scan_type = _confirmed_menu_data_type(analysis.filters.데이터유형, analysis.standalone_question)
+    # "그 중에 X만 알려줘"로 narrowing된 경우 analysis.filters.데이터유형이 carried_over
+    # 스코프에서 복원된 값일 수 있는데(2026-11-09, ask() 안 "그 중에" 데이터유형 복원
+    # 로직) — _confirmed_menu_data_type은 질문에 메뉴 이름이 문자 그대로 있어야만
+    # 신뢰하므로 이 경우를 못 잡는다(실측: 데이터유형은 제대로 복원됐는데 스캔은 여전히
+    # 전체 컬렉션을 훑어 완전히 다른 메뉴의 레코드가 섞여 나옴). carried_over가 전부
+    # 하나의 데이터유형으로 일치하고 그게 filters.데이터유형과 같으면, 명시적 텍스트
+    # 확인 없이도 같은 수준으로 신뢰해 스캔도 좁힌다.
+    if not confirmed_scan_type:
+        _carried_scan_types = {p.get("데이터유형") for p in carried_over if p.get("데이터유형")}
+        if len(_carried_scan_types) == 1 and next(iter(_carried_scan_types)) == analysis.filters.데이터유형:
+            confirmed_scan_type = analysis.filters.데이터유형
     # ⚠️ 루프 안에서 사후 필터링(스캔이 다 끝난 뒤 걸러내기)만으로는 부족했다 — "보안점검"
     # 전체 183건 중 174건이 신청이력첨부라 scan_text_contains의 limit(30)이 전부 그
     # 노이즈로 채워져, 내부자료첨부의 유일한 진짜 매치(1건)는 애초에 scan 결과 자체에
@@ -2072,14 +2978,43 @@ def _search(
                 getattr(analysis.filters, f, None)
                 and payload.get(f)
                 and str(payload.get(f)) != str(getattr(analysis.filters, f))
-                for f in ("기관명", "연도", "통계종류", "수출입구분", "심의결과", "차수")
+                for f in ("기관명", "통계종류", "수출입구분", "심의결과", "차수")
             ):
                 continue
+            # "연도"는 신청연도를 담는데, 장기계약처럼 본문이 실제로 다루는 연도가 신청연도와
+            # 다를 수 있다(2026-11-11 발견 — "무역관련지식재산권보호협회 자동차부품 수수료
+            # 청구 중에 2012년 3분기 자료 찾아줘"의 정답 레코드는 2011년에 신청됐지만 "2011년
+            # 4분기 및 2012년 자동차부품관련" 계약으로 2012년 청구 내용을 실제로 다룸 — 위
+            # 교차오염 방지가 신청연도만 보고 이 진짜 정답을 걸러내 완전히 못 찾는 버그로
+            # 이어짐). 구조화 연도가 달라도 본문에 질문 연도가 리터럴로 적혀있으면(그 연도를
+            # 실제로 다룬다는 신호) 교차오염으로 보지 않는다 — 기관명 등 나머지 필드는 본문에
+            # 그런 식으로 자연스럽게 재언급되는 경우가 드물어 이 예외를 연도에만 좁게 적용한다.
+            if (
+                analysis.filters.연도
+                and payload.get("연도")
+                and str(payload.get("연도")) != str(analysis.filters.연도)
+            ):
+                _year_text = (payload.get("text") or "") + (payload.get("요약") or "")
+                if not _year_in_date_range(_year_text, analysis.filters.연도):
+                    continue
             # 첨부 청크는 메타필드가 전혀 없어(None) 위 체크 자체가 통과되므로, 기관명이나
             # 역할필드 조건이 있을 때만 부모 레코드를 조회해 실제 값으로 검증한다.
+            # ⚠️ 2026-11-09 발견: 이 부모조회 트리거가 기관명·역할필드만 보고 연도/통계종류/
+            # 수출입구분/심의결과/차수는 빠뜨리고 있었음 — "건강보험심사평가원 ... 2018년
+            # 거는?"(키워드+연도 조합)에서 키워드가 다른 연도(2021/2023 등)의 첨부 안에서도
+            # 매칭되는데, 그 첨부 payload엔 연도 필드 자체가 없어(None) 위 교차오염 체크
+            # (연도 불일치 비교)를 그냥 통과해버리고, 부모조회도 안 일어나 끝까지 검증
+            # 안 된 채로 살아남음 — 결과적으로 정확히 필터링된 진짜 2018년 정답은 뒤이은
+            # "키워드 매칭 안 된 자료 제거" 단계에서 걸러지고, 검증 안 된 다른 연도 첨부만
+            # 남아 "2018년 자료"라고 확신에 차서 답하는 심각한 사례로 재현됨. 연도 등 나머지
+            # 필드도 같은 트리거·검증 대상에 포함한다.
+            _OTHER_SCAN_CHECK_FIELDS = ("연도", "통계종류", "수출입구분", "심의결과", "차수")
             effective = payload
-            if analysis.filters.기관명 and not payload.get("기관명") or any(
-                getattr(analysis.filters, f, None) and not payload.get(f) for f in _ROLE_FIELDS_FOR_SCAN
+            parent_missing = False
+            if (
+                (analysis.filters.기관명 and not payload.get("기관명"))
+                or any(getattr(analysis.filters, f, None) and not payload.get(f) for f in _ROLE_FIELDS_FOR_SCAN)
+                or any(getattr(analysis.filters, f, None) and not payload.get(f) for f in _OTHER_SCAN_CHECK_FIELDS)
             ):
                 base_type = _BASE_TYPE_OF.get(payload.get("데이터유형"))
                 if base_type:
@@ -2090,7 +3025,45 @@ def _search(
                     parent = attachment_org_cache[cache_key]
                     if parent:
                         effective = parent
+                    else:
+                        parent_missing = True
+            # 부모 레코드 자체가 통째로 사라진(고아) 첨부는 기관명·역할필드 등을 검증할
+            # 방법이 전혀 없다 — 기존엔 "검증 불가 → 통과"로만 처리해서, 완전히 다른
+            # 기관의 고아 첨부(원본 신청이력은 삭제됐지만 첨부 청크는 남아있는 경우,
+            # 2026-09-17에 이미 확인된 "DB만 삭제, 파일은 남음" 패턴의 변형)가 질문한
+            # 기관의 자료인 것처럼 확신에 차서 제시되는 심각한 교차오염으로 이어짐
+            # (2026-11-13, 사용자가 브라우저로 직접 재현 — "대한무역투자진흥공사 2026년
+            # 청구금액"에 완전히 무관한 "대구테크노파크 2022년" 첨부가 유일한 근거로
+            # 제시됨). "메뉴 자체에 그 개념이 없어 검증 불가"(parent는 있지만 그 필드가
+            # None, 예: 내부자료의 기관명 — 이건 그대로 통과가 맞음)와 달리, "부모가
+            # 통째로 없어서 검증 불가"는 안전하게 제외한다.
+            if parent_missing and (
+                analysis.filters.기관명
+                or any(getattr(analysis.filters, f, None) for f in _ROLE_FIELDS_FOR_SCAN)
+                or any(getattr(analysis.filters, f, None) for f in _OTHER_SCAN_CHECK_FIELDS)
+            ):
+                continue
             if analysis.filters.기관명 and effective.get("기관명") and effective.get("기관명") != analysis.filters.기관명:
+                continue
+            # 위 첫 번째 교차오염 체크와 동일한 이유로(2026-11-11), 여기서도 "연도"는
+            # `_OTHER_SCAN_CHECK_FIELDS`의 일반 비교에서 빼고 리터럴 본문 예외를 따로
+            # 적용한다 — 안 그러면 부모조회로 바뀐 `effective`(또는 변경 없는 payload
+            # 자신)가 다시 신청연도만으로 재검사되며 똑같이 걸러져 위 수정이 무효화된다.
+            if (
+                analysis.filters.연도
+                and effective.get("연도")
+                and str(effective.get("연도")) != str(analysis.filters.연도)
+            ):
+                _eff_year_text = (effective.get("text") or "") + (effective.get("요약") or "")
+                if not _year_in_date_range(_eff_year_text, analysis.filters.연도):
+                    continue
+            if any(
+                getattr(analysis.filters, f, None)
+                and effective.get(f)
+                and str(effective.get(f)) != str(getattr(analysis.filters, f))
+                for f in _OTHER_SCAN_CHECK_FIELDS
+                if f != "연도"
+            ):
                 continue
             # 내부자료는 부모조회를 거쳐도 기관명 필드 자체가 구조적으로 존재하지 않는다
             # (2026-08-01 확정). 위 체크는 "값이 있는데 다름"만 걸러내서, 내부자료 레코드는
@@ -2177,7 +3150,34 @@ def _search(
     # 스캔으로 확인된 건이 우연히 vector_payloads 안에 먼저 들어있던 경우(무관한 상위
     # 유사도 20건 중 낮은 순위로 끼어있던 경우)까지 잡아야 해서, "새로 추가됐는지"가 아니라
     # scan_confirmed_keys(스캔이 실제로 확인한 키 전체)로 판단한다.
-    merged = vector_payloads + carried_payloads + scan_payloads
+    # "그 중에 첫번째 건 누가 요청한거야?"처럼 직전 턴에서 보여준 작은 목록(carried_over)
+    # 안에서 순서를 가리켜 하나를 고르는 질문은, carried_over가 이번 턴의 generic 벡터검색
+    # 결과보다 먼저 와야 한다 — 그래야 [자료 1]이 실제로 사용자가 말하는 "첫번째 건"과
+    # 일치한다. 기본 순서(이번 턴 결과 먼저)는 "완전히 새로운 주제" 질문을 보호하기 위한
+    # 것인데(2026-08-18), 순서 참조 질문은 정반대로 이전 목록 자체가 대화 주제이므로 이
+    # 보호가 오히려 방해가 된다(2026-11-09 발견 — "작년 심의위원회 안건 2건" 다음 "그
+    # 중에 첫번째 건 누가 요청?"이 carried_over의 진짜 첫 번째(한국은행)가 아니라 이번
+    # 턴 벡터검색 1위(완전히 무관한 한국수출입은행, 우연히 "차수=1" 류 넓은 범위에 속해
+    # 유사도 상위에 걸림)를 "첫번째 건"이라고 확신에 차서 답함). carried_over가 2건
+    # 이상일 때만(순서 개념이 성립하는 최소 조건) 이 재배치를 적용한다.
+    #
+    # carried_payloads가 1건이어도 같은 문제가 재현된다 — "그거 수수료는 얼마야?"처럼 직전
+    # 턴에서 특정 레코드 하나를 짚어준 뒤 그걸 가리키는 단순 대명사 후속질문에서, 그 기관이
+    # 같은 사업명으로 수십 건 등록돼 있으면(실측: 대한무역투자진흥공사 "성약바이어..." 41건)
+    # carried_payloads가 뒤에 있는 한 이번 턴의 일반 검색 결과(같은 사업명을 공유하는 다른
+    # 레코드들)에 묻혀 답변 LLM이 엉뚱한 레코드의 수수료를 "정답"으로 답하는 게 실측 확인됨
+    # (2026-11-10). standalone_question 재작성이 "그거"를 사업명 전체로 풀어써버려 원문
+    # 지시어가 안 남는 경우가 많아 `_ORDINAL_REFERENCE_RE`류 텍스트 매칭은 못 쓰므로, 이
+    # 시점에 carried_payloads가 하나라도 있으면(바로 위에서 이미 "이번 턴 기관명과 일치하는
+    # 것만" 거른 뒤이므로 무관한 레코드가 섞일 위험이 없다) 무조건 앞으로 당긴다 — 완전히
+    # 새로운 하위질문이어도 같은 기관의 레코드 하나가 맨 앞에 추가로 보이는 것뿐이라 해롭지
+    # 않고, LLM이 다른 명시적 조건(연도 등)과 안 맞으면 그 레코드를 자연스럽게 제외한다.
+    if carried_payloads and (
+        _ORDINAL_REFERENCE_RE.search(analysis.standalone_question) or len(carried_payloads) == 1
+    ):
+        merged = carried_payloads + vector_payloads + scan_payloads
+    else:
+        merged = vector_payloads + carried_payloads + scan_payloads
     if scan_confirmed_keys:
         merged.sort(key=lambda p: _pool_key(p) not in scan_confirmed_keys)
 
@@ -2204,9 +3204,27 @@ def _search(
     # 후속질문을 해보다가 발견 — 스크립트로 미리 짠 시나리오가 아니라 실제 화면에서 자연스럽게
     # 이어 물어보다가 나온 사례). Qdrant 세부항목 라벨을 직접 조회해 신청이력에만 있고
     # 기관정보엔 없는 필드명(수수료/수출입구분/신청일/요청구분/요청내용/전송방식/제공주기/
-    # 제공항목/통계종류)을 확인해 신호 단어로 추가 — 수출입구분·통계종류는 이미
-    # _history_signal_fields로 커버되니 나머지만 추가한다.
-    _history_only_content_fields = ("수수료", "신청일", "요청구분", "요청내용", "전송방식", "제공주기", "제공항목")
+    # 제공항목/통계종류)을 확인해 신호 단어로 추가.
+    # ⚠️ 2026-11-09 발견: "수출입구분·통계종류는 이미 _history_signal_fields로 커버되니
+    # 나머지만 추가한다"는 원래 가정이 틀렸음 — `_history_signal_fields`는
+    # `analysis.filters.통계종류`/`수출입구분`에 실제 "값"이 뽑혔을 때만 신호가 되는데,
+    # "통계종류는?"/"수출입구분은?"처럼 값을 묻는(필터링이 아니라 질의) 질문은 그 필드가
+    # 전부 None으로 남아 이 신호가 전혀 안 걸림 — 신청이력이 통째로 제거돼 기관정보 1건만
+    # 남고, 그 기관정보엔 해당 필드 자체가 없는데도 답변 LLM이 "수출입 구분은 수입입니다"
+    # 처럼 그 1건과 무관한 값을 확신에 차서 지어내는 걸 실측 확인(통계종류 쪽은 더 안전하게
+    # "찾지 못함"으로 나왔지만 수출입구분은 5/5 결정론적으로 근거 없는 값을 단정). 두 단어
+    # 자체도 이 목록에 포함시킨다.
+    _history_only_content_fields = (
+        "수수료",
+        "신청일",
+        "요청구분",
+        "요청내용",
+        "전송방식",
+        "제공주기",
+        "제공항목",
+        "통계종류",
+        "수출입구분",
+    )
     # ⚠️ 띄어쓰기 때문에 또 뚫림(2026-10-15, 같은 날 바로 발견) — LLM이 standalone_question을
     # 재작성할 때 "제공주기"를 "제공 주기"로(띄어쓰기 있게) 쓰는 경우가 있어, 단순 포함 검사로는
     # 매칭이 빗나감. 2026-08-11에 키워드 검색에서 "자료 제공"/"자료제공" 문제를 고쳤던 것과
@@ -2229,13 +3247,49 @@ def _search(
     # 중복 등록돼 있어도 원래 건수가 적어서(보통 1~4건) 전부 가져와도 안전하다 — 정확
     # 매칭(MatchValue)이라 전수 스캔이 아닌 필터 조회만으로 완전성이 보장되니 스캔 상한에
     # 걸릴 걱정도 없다(possibly_truncated 신호에 영향 없음).
+    # ⚠️ 이 병합이 질문의 실제 주제와 무관하게 "기관명만 있으면 무조건" 실행돼 심각한
+    # 교차오염을 일으키는 사례가 실측 확인됨(2026-11-11) — "한국은행 심의위원회 안건 중
+    # 가장 최근 건은 뭐야?"(정확히 1건, H20251000179401, 담당자 개념 자체가 없음) 다음
+    # "그거 담당자는 누구야?"를 물으면, 기관명="한국은행"만으로 완전히 무관한 기관정보
+    # 레코드(H20230900176562, "항목별 수출입 통계자료 제공 계약" — 전혀 다른 사업 건)가
+    # 본문에 우연히 적힌 "-담당자 : 박민우"와 함께 섞여 들어가고, 답변 생성 LLM이 그
+    # 이름을 "심의위원회 안건의 담당자"로 확신에 차서 잘못 귀속(6회 재현 6회 다 재현,
+    # sources에 기관정보 레코드가 안 보일 때조차 그 이름을 그대로 답함 — 컨텍스트에
+    # 들어가기만 해도 오염됨). 질문이 심의위원회/외부요청/내부자료 중 하나를 명시적으로
+    # 지목했다고 LLM과 질문 원문 둘 다 확인되면(`_confirmed_menu_data_type`, 2026-10-22
+    # 기존 인프라 재사용), 그 메뉴와 무관한 기관정보 전체병합은 건너뛴다 — 기관정보/
+    # 신청이력(또는 데이터유형 미확정) 질문의 기존 동작은 전혀 안 건드림.
     org_name = analysis.filters.기관명
-    if org_name and (allowed_data_types is None or "기관정보" in allowed_data_types):
+    # `_confirmed_menu_data_type`(메뉴 이름 리터럴만)이 아니라 더 넓은
+    # `_confirmed_non_org_menu`("심의결과" 등 전용 개념어도 포함, 2026-11-18)를 쓴다 —
+    # 자세한 경위는 `_ORG_MERGE_BLOCK_KEYWORDS` 주석 참고.
+    _org_info_merge_blocked = _confirmed_non_org_menu(
+        analysis.filters.데이터유형, analysis.standalone_question
+    ) in ("외부요청", "내부자료", "심의위원회")
+    if (
+        org_name
+        and not _org_info_merge_blocked
+        and (allowed_data_types is None or "기관정보" in allowed_data_types)
+    ):
         for payload in find_by_type_and_field("기관정보", "기관명", org_name):
             key = _pool_key(payload)
             if key not in seen:
                 seen.add(key)
                 merged.append(payload)
+
+    # 첨부+카테고리필터(심의결과 등) 조합으로 확정된 원본ID 집합(attachment_full_fetch)이
+    # 있으면, 벡터 top-K에 맡기지 않고 각 원본ID의 첨부를 전부 직접 가져와 추가한다 —
+    # 조각 많은 일부 레코드가 top-K를 독점해 다른 레코드가 통째로 빠지는 문제를 막는다
+    # (위 `_build_filter`의 `attachment_full_fetch` 주석 참고, 2026-11-03).
+    if attachment_full_fetch:
+        _fetch_source_ids, _fetch_attachment_types = attachment_full_fetch
+        for _fetch_oid in _fetch_source_ids:
+            for _fetch_type in _fetch_attachment_types:
+                for payload in find_by_type_and_source(_fetch_type, _fetch_oid, limit=200):
+                    key = _pool_key(payload)
+                    if key not in seen:
+                        seen.add(key)
+                        merged.append(payload)
 
     # 전수 스캔을 하나라도 돌렸으면, 그 스캔들이 실제로 다 훑었는지 여부가 vector_search
     # 단계의 절단 여부보다 더 정확한 신호다("박상용" 8건 전부가 스캔으로 이미 확인됐는데도
@@ -2246,7 +3300,14 @@ def _search(
 
     merged_fragments, fragments_truncated = _merge_attachment_fragments(merged)
     merged_identity, identity_truncated = _merge_by_display_identity(merged_fragments, scan_confirmed_files)
-    return merged_identity, possibly_truncated or fragments_truncated or identity_truncated, data_type_relaxed
+    return (
+        merged_identity,
+        possibly_truncated or fragments_truncated or identity_truncated,
+        data_type_relaxed,
+        unknown_committee_result,
+        unknown_statistics_type,
+        year_relaxed,
+    )
 
 
 AGGREGATION_REFUSAL = (
@@ -2287,6 +3348,21 @@ INTERNAL_INFO_PROBE_REFUSAL = (
     "시스템 내부 정보는 제공하지 않습니다. 이력관리시스템 검색과 관련된 질문을 해주세요."
 )
 EMPTY_QUESTION_ANSWER = "질문을 입력해 주세요."
+
+# "그거 수수료는?"처럼 완전히 새로운(이전 대화 이력도 carried_over도 없는) 세션에서
+# 지시대명사만으로 뭔가를 가리키려는 질문이 발견됨(2026-11-09) — 가리킬 대상이 전혀
+# 없는데도(filters가 비어있어 벡터검색이 사실상 무제한) LLM이 그중 우연히 상위에 걸린
+# 레코드 하나를 "그것"의 답인 것처럼 확신에 차서 구체적인 숫자를 지어내 답함(2026-10-13
+# "빈 질문 지어내기"와 같은 위험 계열, 하지만 원인은 다름 — 질문은 비어있지 않고 ask()의
+# 빈 질문 가드에 걸리지 않음). 지시대명사가 가리킬 과거 맥락 자체가 구조적으로 존재하지
+# 않는 이 상황만 좁게 감지해 안전하게 되묻는다.
+DANGLING_REFERENCE_ANSWER = (
+    "무엇을 가리키는지 확인할 수 없습니다. 기관명이나 구체적인 조건을 포함해 "
+    "다시 질문해 주세요."
+)
+_DANGLING_REFERENCE_RE = re.compile(
+    r"(?:^|\s)(?:그것|그거|이것|이거|저것|저거|거기|해당)(?:은|는|이|가|의)?(?:\s|$|[?!.,])"
+)
 
 # "한국환경공단이랑 한국철강협회 중에 어디가 이력이 더 많아?"류 복수 기관 비교 질문 —
 # 이 챗봇은 기관명 필터가 단일 값이라(2026-10-15 즉흥 테스트로 발견) 비교 의도를 처리할
@@ -2394,6 +3470,24 @@ def _looks_like_internal_info_probe(question: str) -> bool:
 _RECENT_INGESTION_RE = re.compile(
     r"(요즘|최근|최신).{0,12}(새로\s*)?(등록|추가|올라온|올라온거|들어온|업데이트|적재)"
 )
+
+# "수정일자/갱신일자/변경일자"처럼 레코드가 언제 마지막으로 수정·갱신됐는지 추적하는
+# "진짜 DB 수정 타임스탬프" 개념은 이 시스템 어디에도 노출돼 있지 않다(CR_DTM/IN_DTM은
+# 내부 증분적재 워터마크 비교용으로만 Oracle 쿼리에서 쓰이고, chunk_builder.py가 만드는
+# 본문·세부항목 어디에도 안 들어간다 — 2026-11-18 직접 확인). 그런데 "가장/제일
+# 최근/최신"이라는 superlative 표현만 보고 묻는 대상이 뭔지는 전혀 확인 안 한 채 신청일/
+# 연도 등 완전히 다른 필드값을 찾아 사용자가 쓴 단어("업데이트일자"/"갱신일자" 등)로
+# 그대로 relabel해버리는 버그가 실측 확인됨(2026-11-18, "한국환경공단 사업정보의 가장
+# 최근 업데이트일자를 알려줘"가 5/5 결정론적으로 "2025년 12월 31일"을 그 답이라고 확신에
+# 차서 제시 — 실제론 그 기관의 가장 최근 신청일일 뿐, 업데이트/수정 개념과 무관). "업데이트"
+# 는 `_RECENT_INGESTION_RE`가 이미 알지만 "수정"/"갱신"/"변경"은 모른다 — 다만 이 세
+# 단어를 `_RECENT_INGESTION_RE`에 그냥 추가하면 "최근에 상호명이 변경된 기관"(내용 서술,
+# 정상 검색 대상 — 장명근#6/C-5와 동일 계열)까지 오탐할 위험이 있어, "일자/날짜/시점"이
+# 바로 뒤에 와서 명확히 "날짜를 묻는 질문"일 때만 매치하는 별도 패턴으로 좁힌다. "최근/
+# 가장" co-occurrence 없이 단독으로 물어도("수정일자를 알려줘") 이미 안전하게
+# "찾지 못함"으로 수렴하지만(실측 확인), LLM 판단에만 기대지 않고 코드로 명시적으로
+# 거절해 일관성을 보장한다.
+_LAST_MODIFIED_FIELD_RE = re.compile(r"(수정|갱신|변경|업데이트)\s*(일자|날짜|시점)")
 _YEAR_MENTION_RE = re.compile(r"\d{4}\s*년")
 
 # "작년/올해/내년" 같은 상대적 날짜 표현은 구조화 필터(연도 등)가 전혀 못 담아 LLM이 그냥
@@ -2463,6 +3557,33 @@ def _resolve_relative_month_words(text: str) -> str:
             resolved = resolved.replace(word, range_text)
     return resolved
 
+
+# "최근 N개년/N년간" 같은 기간 표현도 "작년/올해"와 완전히 같은 문제를 겪는다(2026-11-13
+# 발견 — "최근 5개년 철강협회 심의결과 알려줘"가 연도이후/연도이전/연도 전부 None으로
+# 남아 아무 연도 제약도 안 걸리고, 벡터 유사도만으로 15건이 반환되며 그중 다수가 철강협회와
+# 무관한 다른 기관 레코드였음). "작년/올해"와 동일한 전략으로 코드가 직접 절대 연도 범위
+# 문구로 치환해, 이후 파이프라인(_YEAR_RANGE_RE/_apply_year_range_guard)이 평범한
+# "YYYY년부터 YYYY년까지" 질문과 동일하게 처리하도록 한다. "최근 N개년"은 올해를 포함해
+# N년 전부터 올해까지를 가리키는 것으로 해석한다(예: 2026년에 "최근 5개년"=2022~2026년).
+# 숫자는 1~2자리로 제한해 "최근 2024년"(절대 연도 표현)과 혼동되지 않게 한다.
+_RELATIVE_YEAR_RANGE_RE = re.compile(r"최근\s*(\d{1,2})\s*(?:개년간|개년|년간|년)")
+
+
+def _resolve_relative_year_range_words(text: str) -> str:
+    if not text:
+        return text
+    this_year = date.today().year
+
+    def _replace(match: "re.Match[str]") -> str:
+        n = int(match.group(1))
+        if n <= 0:
+            return match.group(0)
+        start_year = this_year - n + 1
+        return f"{start_year}년부터 {this_year}년까지"
+
+    return _RELATIVE_YEAR_RANGE_RE.sub(_replace, text)
+
+
 # "요즘 심의위원회에서 가장 최근에 처리된 안건이 뭐야?"처럼 "가장/제일 최근·최신·오래된"은
 # 날짜 기준 최댓값/최솟값을 묻는 집계 질문인데, is_aggregation_question이 이를 포착하지
 # 못해 top-6/20 검색 결과 중 하나를 LLM이 그냥 골라 "가장 최근"이라고 확신에 차서 답하는
@@ -2474,6 +3595,23 @@ def _resolve_relative_month_words(text: str) -> str:
 # (_SINGLE_ITEM_SELECTOR_WORDS가 이미 처리) 건드리지 않는다.
 _SUPERLATIVE_DATE_RE = re.compile(
     r"(가장|제일)\s*(최근|최신|오래된|오래|나중|늦은|이른|먼저)"
+)
+
+# "2026년 계약한 기관 리스트 알려줘"처럼 구조화 필터(연도 등)로 명확히 좁혀진 평범한
+# 목록 질문이, 세션 히스토리의 영향으로(직전 턴에 진짜 집계 질문이 거절된 직후 등)
+# is_aggregation_question이 True로 잘못 판단되는 비결정성이 운영 사용자 스크린샷으로
+# 제보됨(2026-11-13 — 같은 세션 안에서는 거절되는데 창을 새로 열어 같은 질문만 물으면
+# 정상 응답). 전달받은 경로가 사용자 본인 테스트가 아니라 담당자를 거친 제보라 직전
+# 대화의 정확한 내용을 확인할 수 없었고, 유사한 2~3턴 조합을 수십 차례 직접 재현
+# 시도해도 거절이 재현되지는 않았다(검색 레이어 자체는 항상 정확했음) — 다만 재현
+# 여부와 무관하게 이 판단에는 일반적인 방어 공백이 있다: 구조화 필터로 명확히 좁혀진
+# 질문인데 진짜 집계 신호(합계·평균·총 개수·순위·전부 등)가 전혀 없다면 애초에
+# is_aggregation_question이 True일 근거가 없다. "제일/가장"은 위에서 이미 전용
+# 로직(단건선택/랭킹 구분, _SUPERLATIVE_DATE_RE 등)으로 처리되므로 이 override
+# 대상에서 제외해 그 로직과 겹치지 않게 한다.
+_GENUINE_AGGREGATE_HINT_RE = re.compile(
+    r"합계|총액|총\s*(금액|비용|건수|개수)|평균|최댓값|최솟값|최대값|최소값|"
+    r"순위|1위|몇\s*(개|건|명|곳)|전부|모두|통째로|빠짐없이"
 )
 
 # "등록된/등록되"를 "신청된/신청되"로 치환 — 답변 생성 LLM에게 보여줄 질문 텍스트 전용
@@ -2502,8 +3640,24 @@ _NEGATIVE_CONDITION_RE = re.compile(r"(없는\s*(거|것|건)|이\s*아닌|아�
 # 조건을 완전히 무시한 반복 답변만큼은 피한다. "전송방식이 TRASS Upload인거"처럼 값에
 # 영문 단어 사이 공백이 섞이는 경우("TRASS Upload")도 있어 값 부분은 공백을 허용하되
 # lazy(non-greedy)로 매칭해 "~인(것|거|건)" 경계를 최대한 좁게 잡는다.
+# ⚠️ 2026-11-09 발견: "~인 것/거/건"으로 끝나는 경우만 잡아서, 훨씬 자연스러운 "~인
+# 자료/이력/신청이력 있어?" 류 표현은 전혀 매칭이 안 돼 "전송방식이 FTP인 자료 있어?"가
+# 조건을 무시하고 "전체 83건"을 그대로 반복하는 버그로 재현됨(ground truth는 0건인데
+# 전체 이력을 보여줌). 끝 명사를 것/거/건으로 한정하지 않고 "인 + 짧은 명사 + 있다/없다/
+# 알려주다/보여주다" 구조 전체를 넓게 인식하도록 1차 확장했으나, standalone_question
+# 재작성이 "~있어?"류 질문을 거의 항상 "~은/는 무엇인가요?"로 바꿔버리는 걸 재확인(예:
+# "FTP인 자료 알려줘" → "FTP인 자료는 무엇인가요?") — 이 형태까지 커버하도록 종결어
+# 집합에 "무엇"/"뭐"도, 명사 뒤 조사 집합에 "은/는/이/가"도 추가.
+# ⚠️ 2026-11-10 발견: "전송방식이 FTP인 자료의 담당자는 누구인가요?"처럼 조건을 만족하는
+# 레코드의 "다른 필드"를 되묻는 멀티턴 후속질문("그거 담당자는 누구야?")이 여전히 안 잡힘
+# — "인" 뒤에 명사가 "자료의 담당자는"처럼 두 단계(소유격 "~의" 연결)로 이어지는데 기존
+# 패턴은 "인" 바로 뒤 명사 하나만 허용했고, 종결어도 "누구"가 빠져있었음(실측: 이 질문이
+# 전송방식 조건을 완전히 무시하고 "전체 신청이력 83건" 캔드 답변을 반복). "~의" 소유격으로
+# 이어지는 중간 명사(선택적)를 허용하고, 종결어 집합에 "누구"/"언제"/"어디"/"어떻게"를 추가.
 _ATTRIBUTE_VALUE_CONDITION_RE = re.compile(
-    r"[가-힣]{2,10}\s*(?:이|가)\s*[가-힣A-Za-z0-9][가-힣A-Za-z0-9\s]{0,19}?\s*인\s*(?:것|거|건)"
+    r"[가-힣]{2,10}\s*(?:이|가)\s*[가-힣A-Za-z0-9][가-힣A-Za-z0-9\s]{0,19}?\s*인"
+    r"\s*(?:[가-힣]{1,6}\s*의\s*)?[가-힣]{1,6}\s*(?:은|는|이|가|을|를)?"
+    r"\s*(?:있|없|알려|보여|무엇|뭐|누구|언제|어디|어떻게)"
 )
 
 # 위 _ATTRIBUTE_VALUE_CONDITION_RE는 "83건 반복" 오답만 막아줄 뿐 실제 값 필터링은
@@ -2524,10 +3678,161 @@ _DETAIL_FIELD_CONDITION_REVERSED_RE = re.compile(
 )
 
 
+# "전송방식은 무엇인가요?"/"제공주기는 얼마인가요?"처럼 값을 묻는(조건이 아니라 질의)
+# 순수 "~는 무엇/얼마/몇~?" 질문이 _DETAIL_FIELD_CONDITION_RE에 "값=은/는 무엇" 등으로
+# 오매칭됨(2026-11-09 발견) — "무엇인가요"/"얼마인가요"의 "인"이 "~인(것|거|건)" 어미로
+# 오인됨. B-29에서 _detail_match가 확정되면 결과를 무조건 신뢰하도록 바꾼 뒤, 이 오매칭이
+# "전송방식/제공주기는?"류 정상 후속질문의 결과를 통째로 지워버리는 회귀를 일으킴(ground
+# truth로 신청이력 수십 건이 정상 존재하는데도 0건으로 반환). 캡처된 "값"에서 조사(은/는/
+# 이/가)를 뗀 나머지가 알려진 의문사 중 하나면 실제 조건이 아니라 질문 어미가 섞인
+# 오매칭으로 보고 버린다.
+_DETAIL_FIELD_INTERROGATIVES = {"무엇", "얼마", "몇일", "몇", "며칠", "뭐"}
+# "전송방식이 FTP가 아닌 자료는 무엇인가요?"(제외+의문문 결합) 같은 경우, 값 그룹이
+# 위 의문사 집합과 정확히 일치하지는 않지만("FTP가 아닌 자료는 무엇") 그 안에 "아니"가
+# 섞여있음 — 이것도 같은 "무엇인가요"의 '인'에 끌려 캡처가 과도하게 늘어난 동일 원인의
+# 오매칭(2026-11-09 발견, 긍정 regex가 제외 전용 regex의 영역을 가로채 _find_detail_field_
+# exclusion이 호출될 기회조차 없어짐 → 0건으로 확신에 차게 틀린 응답). 값에 "아니"가
+# 있으면 긍정 조건일 수 없으므로(FTP/매월 등 실제 값은 이 글자를 포함할 일이 없음) 버린다.
+# 주의: 한글 음절은 받침까지 합쳐진 완성형 글자라 "아닌"(아+닌)은 "아니"(아+니)를
+# 부분문자열로 포함하지 않는다("닌"≠"니") — "아니"만 검사하면 이 케이스를 놓친다.
+# "댓글 여러 개 달린 내부자료"/"댓글이 여러 개인 글" 같은 수량 질문(2026-11-10 발견) —
+# 리터럴 키워드 매칭("댓글")만으로는 댓글 1개짜리와 여러 개짜리를 구분 못 함(모든
+# 내부자료가 댓글이 있으면 세부항목 "댓글" 필드에 "(YYYY-MM-DD) ..." 공통 템플릿을
+# 쓰기 때문). `_comment_entry_count()`로 날짜 접두사 개수를 직접 세어 임계값 이상인
+# 레코드만 남긴다. "여러 개/복수/둘 이상"은 암묵적으로 2를, "N개 이상"은 그 숫자를
+# 임계값으로 쓴다 — "댓글 3개 이상 달린 내부자료"를 이 구조화 필터 없이 순수 LLM
+# 판단에 맡기면, 후보가 11건뿐으로 적어도 여전히 건수는 우연히 맞히면서 **엉뚱한
+# 레코드**(댓글 2개짜리를 포함하고 3개짜리를 빠뜨림)를 고르는 걸 실측 확인(2026-11-10,
+# "여러 개"만 구조화 필터로 잡고 "N개 이상"은 안 잡았을 때 재현) — 숫자가 맞아도
+# 레코드 자체가 틀리면 사용자가 그 레코드를 열어봤을 때 모순을 발견하게 됨.
+_QUANTITY_PHRASE_RE = r"(?:여러\s*개|복수|둘\s*이상|두\s*개\s*이상|(\d+)\s*개\s*(?:이상|초과|넘는))"
+_COMMENT_MULTIPLE_RE = re.compile(r"댓글.{0,10}" + _QUANTITY_PHRASE_RE)
+# "첨부파일 여러 개 달린 OO 있어?"(코퍼스 전체 수량 존재 질문) 감지용(2026-11-10) —
+# `_COMMENT_MULTIPLE_RE`와 같은 수량 표현이지만 대상이 "첨부(파일)".
+_ATTACHMENT_MULTIPLE_RE = re.compile(r"첨부(?:파일)?.{0,15}" + _QUANTITY_PHRASE_RE)
+_COMMENT_ENTRY_DATE_RE = re.compile(r"\(\d{4}-\d{2}-\d{2}\)")
+
+
+def _quantity_threshold(match: re.Match) -> int:
+    digits = match.group(1)
+    return int(digits) if digits else 2
+
+
+def _comment_entry_count(payload: dict) -> int:
+    for item in payload.get("세부항목") or []:
+        if item.get("label") == "댓글":
+            return len(_COMMENT_ENTRY_DATE_RE.findall(item.get("value") or ""))
+    return 0
+
+
+def _attachment_entry_count(payload: dict) -> int:
+    """레코드 하나(기준 메뉴 payload)가 가진 distinct 첨부파일 개수 — "N개의 첨부파일"
+    같은 최상급 질문에서 코드가 직접 셀 때 쓴다(2026-11-10, B-49와 동일 패턴을 첨부
+    개수에도 적용)."""
+    base_type = payload.get("데이터유형")
+    att_type = _ATTACHMENT_TYPE_OF.get(base_type)
+    if not att_type:
+        return 0
+    names = {
+        a.get("첨부파일명")
+        for a in find_by_type_and_source(att_type, payload.get("원본ID"), limit=200)
+        if a.get("첨부파일명")
+    }
+    return len(names)
+
+
+# "그 중에 수수료는 얼마야?"/"담당자는 누구야?" 같은 단순 필드 값 조회 후속질문이
+# 검색 결과(일반 검색이든 carried_over가 섞인 것이든) 2건 이상일 때, 답변 생성 LLM이
+# 여러 레코드에 걸친 특정 필드 값을 일관되게 추출·보고하지 못하는 문제가 실측 확인됨
+# (2026-11-11 관찰, 2026-11-12 해결) — "그룹 개수가 적다"가 아니라 "질문이 요구한
+# 특정 필드 값 자체를 답변 텍스트에서 누락하거나 거짓으로 '없다'고 단정"하는 형태.
+# 날짜/수수료/댓글/첨부 최상급(recency/fee/comment/attachment superlative)에서 이미
+# 검증된 "코드가 직접 확인했다" 주입 패턴을 비교(최댓값/최솟값)가 아니라 "단순 나열"
+# 용도로 일반화한다. 결과가 1건뿐이면 관찰된 실패 사례가 전부 2건 이상에서만
+# 재현됐으므로(LLM이 단일 레코드는 이미 잘 처리), 2건 이상일 때만 적용한다.
+#
+# ⚠️ "통계종류"/"수출입구분"/"심의결과"/"차수"는 의도적으로 제외한다(2026-11-12 실측
+# 확인) — 이 필드들은 `_KNOWN_COMMITTEE_RESULTS`/`_KNOWN_STATISTICS_TYPES` 등 "닫힌
+# 카테고리 집합"으로 이미 다뤄지는 값인데, 레코드별로 "심의결과=원안수용"/"심의결과=
+# 요청안대로제공"처럼 서로 다른 카테고리명을 나열하는 안내를 주면, 답변 생성 LLM이
+# "이 필드엔 다른 카테고리도 더 있다"는 자신의 배경지식을 끌어와 검색 결과에 없는
+# 값("일부제공"/"제공불가" 등)까지 "등"으로 지어내 덧붙이는 사례가 실측 확인됨("한국은행
+# 관련 심의위원회 안건" 2건(원안수용/요청안대로제공) 다음 "그 안건들 심의결과는 뭐야?"를
+# 8회 반복 — 수정 전(이 안내 없음) 0/8은 지어낸 값 없이 완전성만 부족(3/5 완전정답+2/5
+# 일부 값 생략), 이 안내를 넣은 뒤로는 오히려 절반 이상이 존재하지 않는 값을 "등"으로
+# 지어냄. "다른 카테고리를 끌어오지 말라"는 명시적 금지 문구를 추가로 시도했으나
+# 역효과만 커짐 — 부정 지시가 그 개념 자체를 더 활성화시키는 것으로 추정). 수수료/
+# 담당자/결재자/요청자/제공자 등 열린 자유값 필드는 "완성할 고정 카테고리"라는 틀 자체가
+# 없어 이 문제가 재현 안 됨(5회 이상 반복 검증) — 닫힌 카테고리 필드는 이 메커니즘
+# 적용 대상에서 빼고, 기존처럼 완전성 부족(값 일부 생략)이라는 더 안전한 실패 모드로
+# 남겨둔다.
+_SIMPLE_FIELD_QUERY_LABELS = [
+    (re.compile(r"수수료"), "수수료"),
+    (re.compile(r"담당자"), "담당자"),
+    (re.compile(r"결재자"), "결재자"),
+    (re.compile(r"요청자"), "요청자"),
+    (re.compile(r"제공자"), "제공자"),
+    (re.compile(r"전송\s*방식"), "전송방식"),
+    (re.compile(r"제공\s*주기"), "제공주기"),
+    (re.compile(r"요청구분"), "요청구분"),
+    (re.compile(r"제공목적"), "제공목적"),
+    (re.compile(r"제공항목"), "제공항목"),
+    (re.compile(r"신청일"), "신청일"),
+    (re.compile(r"사업명"), "사업명"),
+]
+
+
+def _simple_field_value(payload: dict, label: str, cache: dict | None = None) -> str | None:
+    """레코드 하나에서 주어진 라벨의 값을 찾는다 — 담당자/결재자/요청자/제공자/통계종류/
+    수출입구분/심의결과/차수처럼 top-level 구조화 필드로 저장된 경우 그 값을, 수수료/
+    요청구분/제공목적/제공항목/전송방식/제공주기/신청일/사업명처럼 세부항목에만 있는
+    경우 그 리스트를 라벨로 찾아 반환한다. '.'/'-' 같은 "값 없음" placeholder는 None.
+
+    첨부 청크(신청이력첨부 등)는 메타데이터(세부항목 포함)가 전혀 없고 전부 부모
+    레코드에만 있다(2026-10-13 확정, `_effective_field` 주석 참고) — payload 자신에게서
+    못 찾으면 `cache`가 주어졌을 때만 부모 레코드를 조회해 재시도한다(2026-11-12 발견 —
+    "그 중에 수수료는 얼마야?" 후속질문이 키워드 검색으로 신청이력첨부 청크만 모인
+    `results`에서 "수수료=정보 없음"으로 확신에 차서 틀리게 답하던 버그, 실제 수수료는
+    같은 원본ID의 부모 신청이력 레코드 세부항목에 정확히 있었음)."""
+
+    def _lookup(p: dict) -> str | None:
+        top_value = p.get(label)
+        if top_value:
+            return str(top_value)
+        for item in p.get("세부항목") or []:
+            if item.get("label") == label:
+                value = str(item.get("value") or "").strip()
+                if value and value not in (".", "-"):
+                    return value
+                return None
+        return None
+
+    found = _lookup(payload)
+    if found is not None or cache is None:
+        return found
+    base_type = _BASE_TYPE_OF.get(payload.get("데이터유형"))
+    if not base_type:
+        return None
+    source_id = payload.get("원본ID")
+    cache_key = (base_type, source_id)
+    if cache_key not in cache:
+        parents = find_by_type_and_source(base_type, source_id, limit=1)
+        cache[cache_key] = parents[0] if parents else None
+    parent = cache[cache_key]
+    return _lookup(parent) if parent else None
+
+
 def _find_detail_field_condition(text: str) -> tuple[str, str] | None:
     m = _DETAIL_FIELD_CONDITION_RE.search(text)
     if m:
-        return m.group(1), m.group(2).strip()
+        label, value = m.group(1), m.group(2).strip()
+        stripped = re.sub(r"^(?:은|는|이|가)\s*", "", value)
+        if (
+            stripped not in _DETAIL_FIELD_INTERROGATIVES
+            and "아니" not in value
+            and "아닌" not in value
+        ):
+            return label, value
     m = _DETAIL_FIELD_CONDITION_REVERSED_RE.search(text)
     if m:
         return m.group(2), m.group(1).strip()
@@ -2550,6 +3855,56 @@ def _find_detail_field_exclusion(text: str) -> tuple[str, str] | None:
     if m:
         return m.group(1), m.group(2).strip()
     return None
+
+
+# "지역 항목이 제공되는 업체 알려줘"/"국가 항목을 요청한 업체" 같은 질문(2026-11-18,
+# 차영경 피드백 "지역 항목이 제공되는 업체가 많지만 기계산업진흥회만 검색됨" 조사 중
+# 발견) — "제공항목"/"요청항목"은 "HS코드, 지역, 세관, 국가, ..."처럼 콤마로 여러
+# 항목명을 열거하는 필드인데, 기존엔 이 질문을 일반 키워드로 보고 scan_text_contains
+# (본문 전체 전수 스캔)에 맡겼음. 그러면 그 단어가 요청목적·주요내용 같은 서술문에
+# 그냥 언급만 돼도 걸려서(실측: "지역"은 728건이나 이렇게 걸리고 그중 다수가 "지역
+# 수출기업 모니터링"처럼 완전히 무관함), 진짜 대상(필드값 자체에 그 항목이 열거된
+# 33건)이 노이즈에 묻혀 거의 안 보임. 이 레이블은 "전송방식"/"제공주기"(2026-10-27)와
+# 달리 값 종류가 닫혀있지 않지만(자유 열거), 사용자가 "~항목" 형태로 물을 때 그 앞의
+# 명사는 거의 항상 그 필드에 실제로 열거될 법한 구체적 항목명(지역/국가/통관 등)이라
+# 리터럴로 그 필드만 좁혀 스캔하는 게 훨씬 정확하다.
+# 공백으로 토큰을 나눠(한글은 음절 경계가 없어 고정 글자수 캡처보다 신뢰도가 높음),
+# "항목"을 포함한 토큰을 찾아 그 토큰 안에서(붙여쓴 경우, 예: "지역항목이") 또는
+# 바로 앞 토큰(띄어쓴 경우, 예: "지역 항목이")에서 후보를 뽑는다. "제공"/"요청" 자체는
+# 필드명의 일부일 뿐 구체적 항목이 아니므로("제공항목이 뭐야?"처럼 필드 자체를 묻는
+# 질문과 구분하기 위해) 제외어 목록에 넣는다.
+_PROVIDED_ITEM_JUNK_WORDS = {
+    "제공", "요청", "이", "그", "저", "해당", "각", "다른", "모든", "어떤",
+    "관련", "위", "아래", "전체", "일부", "세부", "상세", "그런", "이런", "저런",
+}
+
+
+def _extract_provided_item_candidate(text: str) -> str | None:
+    tokens = text.split()
+    for i, tok in enumerate(tokens):
+        idx = tok.find("항목")
+        if idx < 0:
+            continue
+        if idx > 0:
+            candidate = tok[:idx]
+        elif i > 0:
+            candidate = tokens[i - 1]
+        else:
+            continue
+        # ⚠️ 후보 끝의 조사를 떼려고 했다가("가"/"이" 등) "국가"처럼 단어 자체가 그
+        # 글자로 끝나는 경우까지 1글자로 잘라버리는 걸 실측 확인(2026-11-18) — 후보는
+        # 이미 "항목" 바로 앞에서 끊긴 토큰(또는 그 토큰 자체)이라 조사가 따로 붙을
+        # 자리가 없으므로, 별도 조사 제거 없이 그대로 쓴다.
+        if (
+            2 <= len(candidate) <= 10
+            and candidate not in _PROVIDED_ITEM_JUNK_WORDS
+            and re.match(r"^[가-힣A-Za-z0-9]+$", candidate)
+        ):
+            return candidate
+    return None
+
+
+_PROVIDED_ITEM_LABELS = ("제공항목", "요청항목")
 
 
 def _looks_like_recent_ingestion_question(question: str) -> bool:
@@ -2583,16 +3938,68 @@ _FIELD_TOPIC_PARTICLE = {"업체명": "은", "담당자": "는", "결재자": "�
 # LLM이 추출한 메뉴/항목을 그대로 믿지 않고, 질문 원문에 그 단어가 실제로 있는지 코드가
 # 재확인한다 (언급이 전혀 없는데도 지어내거나, 대화 후속 질문에서 감지를 놓치는 경우가
 # 반복 재현됨 — "명시 안 됐으면 null" 지침이 프롬프트만으로는 지켜지지 않음)
-_MENU_KEYWORDS = {"외부요청": "외부요청", "심의위원회": "심의위원회", "내부자료": "내부자료"}
+# ⚠️ "내부자료" 리터럴 하나만 인식했더니, "양해각서 체결과 관련된 내부 문서 있어?"처럼
+# 사용자가 시스템 기술 용어("내부자료")가 아니라 자연스러운 표현("내부 문서")을 쓰면
+# 메뉴 확정 자체가 안 돼(None 반환) 스캔이 전체 메뉴로 열리고, 완전히 무관한 다른 메뉴의
+# 보일러플레이트 문구가 노이즈로 섞여 나오는 버그가 실측 확인됨(2026-11-04 — "지재권 침해
+# 조사·분석" 신청이력첨부 7건이 "내부 문서" 질문에 그대로 노출). `_LIST_FIELD_KEYWORDS`가
+# 이미 쓰는 동의어 튜플 패턴으로 확장 — "내부자료"만 자연스러운 변형이 여럿이고, 나머지
+# 두 메뉴는 그 자체가 이미 가장 자연스러운 표현이라 추가할 동의어가 마땅치 않다.
+_MENU_KEYWORDS = {
+    "외부요청": ("외부요청", "외부 요청"),
+    # ⚠️ "1차/2차 위원회 안건"처럼 "심의" 접두어 없이 "위원회"만으로 지칭하는 게 이 메뉴의
+    # 실제 데이터 템플릿 자체가 쓰는 자연스러운 표현(청크 본문이 "2025년 1차 위원회 안건"
+    # 식으로 저장됨)인데, standalone_question 재작성도 종종 "심의"를 빼고 "위원회"만
+    # 남겨서 이 키워드 목록에 안 걸리는 경우가 실측 확인됨(2026-11-11 — B-63 검증
+    # 라운드 중 "한국은행이 요청한 1차 위원회 안건"에서 `_confirmed_menu_data_type`이
+    # None을 반환해 기관정보 전체병합이 다시 새어 들어가는 걸 발견). "위원회" 단독도
+    # 추가 — 다른 메뉴 키워드와 성격이 다르지만("위원회"는 심의위원회 전용 고유명사가
+    # 아님), 이 시스템 도메인에서 "위원회"가 등장하는 맥락은 사실상 전부 이 메뉴뿐이라
+    # 오탐 위험은 낮다고 판단.
+    # ⚠️ "심의결과"/"심의 결과"는 여기 넣으면 안 된다(2026-11-18, 한 차례 넣었다가 되돌림) —
+    # 이 집합은 "사용자가 그 메뉴로 완전히 좁혀도 된다"는 강한 확신이 필요한 scan narrowing
+    # (confirmed_scan_type)/_build_filter의 "키워드 있으면 데이터유형 불신" 예외 판단이
+    # 같이 쓰는데, "심의결과"는 메뉴 이름이 아니라 내용어라 신청이력 본문에도 실제로
+    # 등장한다("무역통계 작성 및 교부에 관한 고시에 의한 통계자료제공심의위원회 심의결과에
+    # 따라 계약해지 및 변경 조항 추가" — 박유희#1 검토 중 실측 확인). 여기 넣으면 "전체"
+    # 스코프에서 "OO 심의결과 알려줘"를 물을 때 scan이 심의위원회로만 좁혀져 신청이력에
+    # 있는 이 서술을 영영 못 찾는다(실측: 0건, "기관별 사업정보"로 메뉴를 고정해야만
+    # 7건 찾아짐 — 사용자가 "전체면 모든 메뉴를 다 찾아야 한다"고 정확히 지적해 발견).
+    # "심의결과"가 필요한 건 기관정보 전체병합 차단(`_ORG_MERGE_BLOCK_KEYWORDS`, 아래
+    # 별도 정의)뿐이다.
+    "심의위원회": ("심의위원회", "심의 위원회", "위원회"),
+    "내부자료": ("내부자료", "내부 자료", "내부 문서", "내부 글", "내부 게시글", "내부게시글"),
+}
+
+# 기관정보 전체병합 차단(`_search()`의 `_org_info_merge_blocked`, 2026-11-11) 전용
+# — 위 `_MENU_KEYWORDS`보다 범위가 넓다. 이 판단은 "사용자가 그 메뉴로 완전히 좁혀도
+# 되는가"가 아니라 "기관정보라는 다른 메뉴의 레코드를 섞어도 되는가"만 보는 거라 기준이
+# 다르다 — 메뉴 이름뿐 아니라 그 메뉴가 아니면 존재할 수 없는 전용 개념어("심의결과")도
+# 포함해도 안전하다(2026-11-18, 박유희#1 검토 중 분리).
+_ORG_MERGE_BLOCK_KEYWORDS = {
+    "외부요청": _MENU_KEYWORDS["외부요청"],
+    "내부자료": _MENU_KEYWORDS["내부자료"],
+    "심의위원회": _MENU_KEYWORDS["심의위원회"] + ("심의결과", "심의 결과"),
+}
+
+
+def _confirmed_non_org_menu(data_type_value: str | None, question_text: str) -> str | None:
+    if not data_type_value or data_type_value not in _ORG_MERGE_BLOCK_KEYWORDS:
+        return None
+    normalized = "".join((question_text or "").split())
+    for kw in _ORG_MERGE_BLOCK_KEYWORDS[data_type_value]:
+        if "".join(kw.split()) in normalized:
+            return data_type_value
+    return None
 
 
 def _confirmed_menu_data_type(data_type_value: str | None, question_text: str) -> str | None:
-    """LLM이 뽑은 데이터유형이 질문 원문에 그 메뉴 이름을 실제로 포함하는지 확인한다.
-    "내부자료 중에 보안점검 관련 글 있어?"처럼 사용자가 메뉴를 직접 명시한 경우만
-    신뢰하고, 그 외(기관정보/신청이력처럼 _MENU_KEYWORDS에 없는 값, 또는 명시 안 된
-    경우)는 None을 반환해 "LLM이 추측해 채웠을 수 있다"고 보수적으로 처리한다."""
-    keyword = _MENU_KEYWORDS.get(data_type_value)
-    if keyword and question_text and keyword in question_text:
+    """LLM이 뽑은 데이터유형이 질문 원문에 그 메뉴 이름(또는 자연스러운 동의어)을 실제로
+    포함하는지 확인한다. "내부자료 중에 보안점검 관련 글 있어?"처럼 사용자가 메뉴를 직접
+    명시한 경우만 신뢰하고, 그 외(기관정보/신청이력처럼 _MENU_KEYWORDS에 없는 값, 또는
+    명시 안 된 경우)는 None을 반환해 "LLM이 추측해 채웠을 수 있다"고 보수적으로 처리한다."""
+    keywords = _MENU_KEYWORDS.get(data_type_value)
+    if keywords and question_text and any(kw in question_text for kw in keywords):
         return data_type_value
     return None
 
@@ -2604,8 +4011,8 @@ _LIST_ASK_WORDS = ("목록", "리스트", "어디", "뭐가 있", "누가 있", 
 
 
 def _resolve_list_menu(text: str) -> str | None:
-    for data_type, keyword in _MENU_KEYWORDS.items():
-        if keyword in text:
+    for data_type, keywords in _MENU_KEYWORDS.items():
+        if any(kw in text for kw in keywords):
             return data_type
     return None  # 각 항목의 기본 메뉴로 폴백 (예: 업체명 → 기관정보)
 
@@ -2658,6 +4065,71 @@ def _list_field_answer(field: str, menu: str | None, exclude: str | None = None)
     )
 
 
+# "2026년 계약한 기관 리스트 알려줘"처럼 '연도' 조건이 하나 붙은 업체명 목록 질문은,
+# 조건이 있다는 이유로 위 is_list_question 가드(narrowing 필터가 있으면 목록조회 자체를
+# 포기)에 막혀 일반 검색으로 떨어진다 — 그런데 거기서는 N건(top-20)을 LLM이 그룹으로
+# 묶어 답해야 해서 "LLM이 다건을 완전하게 그룹화 못 하는" 기존 한계(2026-09-29 등)에
+# 그대로 노출되고, 실측 결과 모든 매칭을 1건으로 뭉개거나 "찾지 못했습니다"로 완전히
+# 틀리게 답하는 경우까지 확인됨(2026-11-13 — 운영 사용자 제보로 시작된 조사). 위
+# `_list_field_answer`(조건 없는 전체 목록)와 완전히 같은 철학 — "DB에서 직접 가져오면
+# LLM 없이도 완전하고 정확하다" — 을 '연도' 조건이 있는 경우까지 확장한다. 통계종류·
+# 요청자 등 다른 조건까지 섞이면 이 화이트리스트 밖이라(SQL 템플릿이 그 조건을 표현
+# 못 함) 일반 검색으로 그대로 둔다 — 필요해지면 그때 화이트리스트를 넓히면 된다.
+_LIST_FIELD_YEAR_QUERIES = {
+    "업체명": {
+        # 기관정보/신청이력 둘 다 "그 연도에 신청 건(DETAIL)이 있는 기관"을 묻는 것이라
+        # _LIST_FIELD_REGISTRY와 동일하게 같은 조인을 공유한다.
+        "기관정보": (
+            "SELECT DISTINCT A.CRP_NAME AS V FROM HISTORY_ORGANIZATION_INFO{sfx} A, "
+            "HISTORY_ORGANIZATION_DETAIL{sfx} B WHERE A.ORGANIZATION_ID = B.ORGANIZATION_ID "
+            "AND SUBSTR(B.REQ_DTM, 1, 4) = :year AND A.CRP_NAME IS NOT NULL ORDER BY A.CRP_NAME"
+        ),
+        "신청이력": (
+            "SELECT DISTINCT A.CRP_NAME AS V FROM HISTORY_ORGANIZATION_INFO{sfx} A, "
+            "HISTORY_ORGANIZATION_DETAIL{sfx} B WHERE A.ORGANIZATION_ID = B.ORGANIZATION_ID "
+            "AND SUBSTR(B.REQ_DTM, 1, 4) = :year AND A.CRP_NAME IS NOT NULL ORDER BY A.CRP_NAME"
+        ),
+        "외부요청": (
+            "SELECT DISTINCT A.CRP_NAME AS V FROM HISTORY_EXTERNAL_REQUEST{sfx} A "
+            "WHERE SUBSTR(A.REQ_DTM, 1, 4) = :year AND A.CRP_NAME IS NOT NULL ORDER BY A.CRP_NAME"
+        ),
+        # 심의위원회는 REQ_DTM 대신 YEAR 컬럼(문자열)을 직접 갖고 있어 조인이 필요 없다.
+        "심의위원회": (
+            "SELECT DISTINCT A.CRP_NAME AS V FROM HISTORY_DISCUSSION_COMMITTEE{sfx} A "
+            "WHERE A.YEAR = :year AND A.CRP_NAME IS NOT NULL ORDER BY A.CRP_NAME"
+        ),
+    }
+}
+
+
+def _list_field_answer_by_year(field: str, menu: str | None, year: str, exclude: str | None = None) -> str | None:
+    """`_list_field_answer`의 '연도 조건부' 버전. 화이트리스트 밖(지원 안 하는
+    field/menu 조합이거나 연도 값이 4자리 숫자가 아님)이면 None을 반환해 호출부가
+    일반 검색으로 안전하게 폴백하게 한다."""
+    if not re.fullmatch(r"\d{4}", str(year or "")):
+        return None
+    menu_map = _LIST_FIELD_YEAR_QUERIES.get(field)
+    if not menu_map:
+        return None
+    chosen_menu = menu if menu in menu_map else next(iter(menu_map))
+    sql = menu_map[chosen_menu].format(sfx=_SFX)
+    rows = fetch_all(sql, {"year": year})
+    values = [r["V"] for r in rows]
+    excluded_note = ""
+    if exclude:
+        _before = len(values)
+        values = [v for v in values if exclude not in v]
+        if len(values) < _before:
+            excluded_note = f"({exclude} 제외) "
+    if not values:
+        return f"{year}년 {_MENU_LABELS[chosen_menu]}에 등록된 {field}이(가) 없습니다."
+    particle = _FIELD_TOPIC_PARTICLE.get(field, "은")
+    return (
+        f"{year}년 {_MENU_LABELS[chosen_menu]}의 {field}{particle} {excluded_note}총 {len(values)}개입니다.\n\n"
+        + " · ".join(values)
+    )
+
+
 # 웹 화면 드릴다운에서 사용자가 메뉴를 명시적으로 고정했을 때(menu_scope), 그 메뉴에 해당하는
 # 데이터유형 범위. "기관별 사업정보"는 기관정보/신청이력 두 데이터유형에 걸쳐 있어 OR로 묶는다.
 # 각 메뉴의 스코프에는 그 메뉴 자신의 첨부 데이터유형도 반드시 포함해야 한다 — 안 그러면
@@ -2702,7 +4174,7 @@ def _payloads_to_history_items(payloads: list[dict]) -> list[HistoryItem]:
     items = []
     for p in payloads:
         detail = {f["label"]: f["value"] for f in (p.get("세부항목") or [])}
-        items.append(HistoryItem(원본ID=p["원본ID"], 신청일=detail.get("신청일"), 사업명=detail.get("사업명")))
+        items.append(HistoryItem(원본ID=p["원본ID"], 신청일=detail.get("신청일"), 요청구분=detail.get("요청구분")))
     items.sort(key=lambda x: x.신청일 or "", reverse=True)
     return items
 
@@ -2723,6 +4195,74 @@ def get_record_detail(data_type: str, source_id: str) -> SourceItem | None:
     if not payloads:
         return None
     return _build_source_item(payloads[0])
+
+
+def keyword_search(keyword: str, menu_scope: str | None = None) -> KeywordSearchResponse:
+    """"빠른 검색" — 사용자가 직접 입력한 단어를 자연어 질문분석(LLM 키워드 추출) 없이
+    그대로 scan_text_contains로 전수 스캔하고, 매칭된 레코드를 답변 생성 LLM의 종합 없이
+    소스카드 그대로 보여준다(2026-11-12, 사용자 제안 — "비교·최상급 질문은 실사용 빈도가
+    낮으니 테스트는 콘텐츠 검색에 집중하자"는 방향 전환과 함께 나온 아이디어). 지금까지
+    가장 많이 발견된 버그 두 축 — ①LLM이 자연어 질문에서 키워드를 잘못 뽑아내는 것(필러
+    포함, 복합명사 축소 실패, 다른 필드로 오추출 등) ②검색은 정확했는데 답변 생성 LLM이
+    여러 레코드를 하나의 문장으로 종합하다가 지어내거나 누락하는 것 — 을 둘 다 통째로
+    건너뛰어 원천적으로 제거한다. 메뉴 스코프는 사이드바에서 이미 선택된 범위를 ask()와
+    동일하게(`_MENU_SCOPE_DATA_TYPES`) 받아 적용한다."""
+    keyword = (keyword or "").strip()
+    if not keyword:
+        return KeywordSearchResponse(keyword=keyword, count=0, truncated=False, sources=[])
+
+    data_types = _MENU_SCOPE_DATA_TYPES.get(menu_scope)
+
+    # 필러 제거(ask()의 키워드 정리와 동일) — "자료 제공 관련 내용"처럼 수식어가 섞인
+    # 문구를 그대로 입력해도 핵심어만 남긴다.
+    final_keyword = _strip_keyword_filler(keyword)
+    hits = scan_text_contains(final_keyword, KEYWORD_SCAN_LIMIT, data_types)
+
+    # 리터럴 매칭 0건이면 ask()와 동일한 narrow 축소를 시도한다(여러 단어→핵심 단어,
+    # 공백 없는 한글 복합명사→2음절 단위 축소) — 0건일 때만 호출해야 한다는 각 함수의
+    # 전제 조건을 그대로 지킨다.
+    if not hits:
+        if " " in final_keyword:
+            narrowed = _narrow_keyword_to_match(final_keyword, data_types)
+            if narrowed != final_keyword:
+                final_keyword = narrowed
+                hits = scan_text_contains(final_keyword, KEYWORD_SCAN_LIMIT, data_types)
+        if not hits and " " not in final_keyword:
+            narrowed2 = _narrow_compound_keyword_to_match(final_keyword, data_types)
+            if narrowed2 != final_keyword:
+                final_keyword = narrowed2
+                hits = scan_text_contains(final_keyword, KEYWORD_SCAN_LIMIT, data_types)
+
+    truncated = len(hits) >= KEYWORD_SCAN_LIMIT
+
+    # 같은 파일의 다른 조각/같은 이력의 다른 첨부파일이 각각 별개 항목으로 뜨면 사용자가
+    # 보기에 중복으로 느껴진다 — ask()의 _search()가 쓰는 것과 동일한 중복 제거·병합
+    # 파이프라인(_pool_key → 조각 병합 → 레코드 병합)을 그대로 재사용한다.
+    seen: set[tuple] = set()
+    deduped = []
+    for h in hits:
+        key = _pool_key(h)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(h)
+
+    merged, frag_truncated = _merge_attachment_fragments(deduped)
+    merged, display_truncated = _merge_by_display_identity(merged)
+    truncated = truncated or frag_truncated or display_truncated
+
+    sources: list[SourceItem] = []
+    seen_display: set[tuple[str, str]] = set()
+    for payload in merged:
+        source = _resolve_source_for_payload(payload, final_keyword)
+        display_key = (source.데이터유형, source.원본ID)
+        if display_key in seen_display:
+            continue
+        seen_display.add(display_key)
+        sources.append(source)
+
+    return KeywordSearchResponse(
+        keyword=final_keyword, count=len(sources), truncated=truncated, sources=sources,
+    )
 
 
 _FULL_HISTORY_ASK_WORDS = ("전체", "모든", "전부", "다 보여", "다보여", "다 알려")
@@ -2790,11 +4330,17 @@ def _looks_like_full_org_history_question(text: str, filters: FilterExtraction) 
     # 자체가 있으면(필드 추출 성공 여부와 무관하게) 조건이 있는 것으로 보고 전체이력
     # 경로로 새지 않게 막는다 — 완벽한 범위 필터링까지는 보장 못 해도, 최소한 질문을
     # 완전히 무시한 반복 답변만큼은 피한다.
+    # "첨부파일 여러 개 달린 거 있어?"/"댓글 3개 이상 달린 거 있어?" 같은 수량 조건도
+    # 같은 계열 — 이 가드가 모르면 "전체 83건" 캔드 답변이 조건을 완전히 무시하고
+    # 반복되는 걸 실측 확인(2026-11-10, B-47/B-48 신규 기능이 처음 겪는 하이재킹).
     if (
         _YEAR_MENTION_RE.search(text)
         or _THRESHOLD_CONDITION_RE.search(text)
         or _NEGATIVE_CONDITION_RE.search(text)
         or _ATTRIBUTE_VALUE_CONDITION_RE.search(text)
+        or _DETAIL_FIELD_EXCLUSION_RE.search(text)
+        or _COMMENT_MULTIPLE_RE.search(text)
+        or _ATTACHMENT_MULTIPLE_RE.search(text)
     ):
         return False
     # "거기 말고 다른 기관 이력도 있어?"처럼 직전 기관을 명시적으로 제외하는 질문도 "이력"
@@ -2816,6 +4362,10 @@ def _full_org_history_answer(org_name: str) -> tuple[str, list[SourceItem], list
     0건이어도 기관정보 자체는 있으면 먼저 보여줘야 한다. 처음엔 신청이력 개수만 문장으로
     답하고 sources를 비워뒀다가, "그럼 기관정보는 왜 안 보여주냐"는 지적을 받고 수정:
     항상 기관정보를 sources에 채우고, 신청이력 목록은 그 뒤에 텍스트로 붙인다."""
+    # 기관명 변경(구 명칭→신 명칭)·약칭 수동 매핑(`_ORG_NAME_SYNONYM_GROUPS` 참고)을
+    # 아래 fuzzy 폴백보다 먼저 적용 — 이 함수는 data_type="기관정보"로 좁혀 스캔하므로,
+    # 신 명칭이 기관정보에 아예 등록 안 된 경우(2026-11-17 실측 확인) fuzzy만으로는 못 찾음.
+    org_name = _org_name_synonym_map().get(org_name, org_name)
     org_payloads = find_by_type_and_field("기관정보", "기관명", org_name)
     if not org_payloads:
         # 사용자가 줄임말로 기관명을 물으면(예: "무역협회" → 실제 정식명칭은 "한국무역협회")
@@ -2865,6 +4415,68 @@ def _full_org_history_answer(org_name: str) -> tuple[str, list[SourceItem], list
     return answer, sources, org_payloads
 
 
+# 기관명 변경(구 명칭→신 명칭)·오타·두문자/음역 약칭("코트라"=대한무역투자진흥공사처럼
+# 글자 자체가 안 겹쳐 아래 부분문자열 매칭으로는 절대 못 찾는 경우)은, 문자열 유사도로
+# 자동 추론하기 안전하지 않거나 아예 불가능해서 사람이 직접 확인한 매핑만 신뢰한다
+# (2026-11-17, 장명근#6 "중소기업진흥공단→중소벤처기업진흥공단" 제보를 계기로 사용자와
+# 논의 후 도입 — "중소벤처기업진흥공단"이라는 신 명칭은 이 시스템 DB에 당사자로 등록된
+# 적이 한 번도 없어서, 자동 매칭이 성공해도 가져올 자료 자체가 없는 경우까지 실측으로
+# 확인됨).
+# 입력은 "같은 기관을 가리키는 표현들의 묶음"(그룹)으로만 한다 — 어느 게 DB에 실제
+# 등록된 "정식 명칭"인지 사람이 미리 구분할 필요 없이, 같은 기관이면 그냥 한 그룹에
+# 몰아넣으면 된다. 코드가 각 그룹 안에서 실제로 DB에 존재하는 이름(`field_value_exists`)을
+# 찾아 그걸 대표로 삼고 나머지를 거기로 매핑한다 — 실사용 중 발견되는 대로 그룹을
+# 추가/확장할 것(기관당 한 그룹, 그 안에 구 명칭·오타·약칭을 전부 나열).
+_ORG_NAME_SYNONYM_GROUPS: list[list[str]] = [
+    ["중소기업진흥공단", "중소벤처기업진흥공단", "중진공"],
+]
+
+_org_name_synonym_cache: dict[str, str] | None = None
+
+
+def _org_name_synonym_map() -> dict[str, str]:
+    """`_ORG_NAME_SYNONYM_GROUPS`를 평면화해 {별칭: DB 실제 등록명} 딕셔너리로 만든다.
+    프로세스당 1회만 계산해 캐시(그룹 수가 늘어나도 매 호출마다 Qdrant를 다시 스캔하지
+    않도록)."""
+    global _org_name_synonym_cache
+    if _org_name_synonym_cache is not None:
+        return _org_name_synonym_cache
+    mapping: dict[str, str] = {}
+    for group in _ORG_NAME_SYNONYM_GROUPS:
+        canonical = next((n for n in group if field_value_exists("기관명", n)), None)
+        if canonical:
+            for n in group:
+                if n != canonical:
+                    mapping[n] = canonical
+    _org_name_synonym_cache = mapping
+    return mapping
+
+
+# 위 수동 매핑으로도 못 찾으면, fuzzy 폴백(scan_field_contains, data_type="기관정보" 한정)은
+# "전체 이력" 전용경로에만 있었는데, 일반 검색 경로(ask()가 _build_filter 호출 전에 하는
+# 존재확인, 아래)는 기관명이 field_value_exists로 정확매칭 안 되면 그냥 "존재하지 않는 값"으로
+# 보고 키워드로 demote해버린다(2026-10-27) — "철강협회"처럼 실제 기관명("한국철강협회")의
+# 부분 문자열인 정당한 줄임말까지도 이 규칙에 걸려 키워드로 전환되고, 그 직후 "키워드 있으면
+# 데이터유형 불신"(_build_filter) 규칙까지 같이 작동해 기관명·데이터유형 둘 다 사라진
+# 완전히 무제한 스캔으로 떨어지는 버그가 실측 확인됨(2026-11-13 — "최근 5개년 철강협회
+# 심의결과 알려줘"가 심의위원회는 물론 기관명과도 무관한 신청이력/다른 기관 레코드까지
+# 뒤섞어 반환). 데이터유형 제한 없이(기관명은 기관정보/신청이력/외부요청/심의위원회 등
+# 여러 메뉴에 걸쳐 나타남) 부분 문자열로 스캔해, 매칭되는 실제 기관명이 정확히 하나로
+# 좁혀지면 그 정식 명칭으로 치환한다 — 모호하면(둘 이상의 다른 기관에 매칭) 섣불리
+# 단정하지 않고 None을 반환해 기존 키워드 demote 동작으로 안전하게 폴백한다.
+def _resolve_org_name_fuzzy(name: str) -> str | None:
+    if not name:
+        return None
+    manual = _org_name_synonym_map().get(name)
+    if manual:
+        return manual
+    candidates = scan_field_contains("기관명", name, limit=200)
+    matched_names = {p.get("기관명") for p in candidates if p.get("기관명")}
+    if len(matched_names) == 1:
+        return matched_names.pop()
+    return None
+
+
 def ask(question: str, session_id: str | None, menu_scope: str | None = None) -> ChatResponse:
     session_id = session_id or str(uuid.uuid4())
 
@@ -2895,18 +4507,45 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         session_store.append_turn(session_id, question, MULTI_ORG_COMPARISON_REFUSAL)
         return ChatResponse(session_id=session_id, answer=MULTI_ORG_COMPARISON_REFUSAL, sources=[])
 
-    # 질문분석에는 "작년/올해/내년"·"이번 달/지난달" 등을 실제 날짜로 치환한 사본을 넘긴다 —
-    # session_store 저장·정규식 가드·이후 _answer_question_text 등은 사용자가 입력한 원문
-    # (question) 그대로 유지해, 상대 날짜 치환이 이 함수의 다른 동작에 영향을 주지 않게 한다.
+    # 질문분석에는 "작년/올해/내년"·"이번 달/지난달"·"최근 N개년" 등을 실제 날짜/연도범위로
+    # 치환한 사본을 넘긴다 — session_store 저장·정규식 가드·이후 _answer_question_text 등은
+    # 사용자가 입력한 원문(question) 그대로 유지해, 치환이 이 함수의 다른 동작에 영향을
+    # 주지 않게 한다.
     analysis = _analyze_query(
-        _resolve_relative_month_words(_resolve_relative_year_words(question)), history
+        _resolve_relative_month_words(
+            _resolve_relative_year_words(_resolve_relative_year_range_words(question))
+        ),
+        history,
     )
     allowed_data_types = _MENU_SCOPE_DATA_TYPES.get(menu_scope)
 
-    if analysis.filters.키워드:
-        trimmed = _strip_keyword_filler(analysis.filters.키워드)
-        if trimmed != analysis.filters.키워드:
-            analysis.filters = analysis.filters.model_copy(update={"키워드": trimmed})
+    # ⚠️ "최근 5개년 OO 심의결과 알려줘"를 "전체" 스코프에서도 신청이력까지 찾도록
+    # "심의결과"를 키워드로 돌려 데이터유형='심의위원회' 단정을 풀어주는 시도를
+    # 했었는데(박유희#1 검토, 2026-11-18), 끝까지 안전한 키워드를 못 찾아 되돌렸다 —
+    # 1차: 키워드="심의결과" 그대로 → 신청이력 73건 중 72건이 "기관자료: 2018년
+    # 심의위원회 심의결과 관련.pdf"라는 공용 참고문서 파일명 인용 노이즈라, 원래 0건이
+    # 정답인 건강보험심사평가원 질문까지 "확인됨"으로 거짓 양성. 2차: 키워드="심의결과에
+    # 따라"(서술형 패턴으로 좁힘) → 노이즈는 줄었지만, 이 문구 자체가 신청이력첨부
+    # 계약서 25건에 박힌 **표준 계약 조항**("...요청건의 제공여부 심의 결과에 따라
+    # 해지 또는 변경할 수 있다")이라 여전히 기관명 없는 질문에서 전혀 무관한 기관(한국
+    # 환경공단 등)이 섞여 나옴 — "진짜 서술형"이라고 봤던 사례(대한무역투자진흥공사)도
+    # 사실 같은 표준 조항을 본문에 옮겨 적은 것뿐이었음. "심의결과"는 이 데이터에서
+    # 거의 전부 인용/보일러플레이트라 깨끗하게 "진짜 내용"만 골라낼 방법이 없다고
+    # 판단해, 원래대로 데이터유형='심의위원회'로 단정짓는 쪽으로 되돌림 — 기관정보
+    # 전체병합 차단(`_org_info_merge_blocked`, 위 `_confirmed_non_org_menu`)만 유지.
+
+    # "중진공 관련 이력 알려줘"처럼 아주 짧은 약칭은, 질문분석 LLM이 기관명으로도 키워드로도
+    # 전혀 인식 못 해 `analysis.filters`가 완전히 빈 채로 나오는 경우가 실측 확인됨(2026-11-17
+    # — "중소벤처기업진흥공단"처럼 긴 이름은 기관명으로 잘 뽑혀 아래 수동 동의어 매핑이
+    # 정상 작동하는데, "중진공"은 필터 자체가 없어 그 매핑이 적용될 기회조차 없이 완전히
+    # 다른 안전망(키워드 복구)으로 빠져 무관한 레코드가 섞임). 기관명이 비어있고 질문
+    # 원문에 동의어 그룹의 별칭이 리터럴로 있으면, LLM 추출과 무관하게 코드가 직접
+    # 기관명으로 채운다 — 이 목록은 사람이 수동으로 엄선한 것이라 오탐 위험이 낮다.
+    if not analysis.filters.기관명:
+        for alias in _org_name_synonym_map():
+            if alias in question:
+                analysis.filters = analysis.filters.model_copy(update={"기관명": alias})
+                break
 
     # "요청 사유에 통계청이 언급된 자료 있어?"처럼, 질문에 등장하는 기관스러운 명사를
     # LLM이 "본문에서 언급됐는지 찾아달라"는 의도가 아니라 "기관명 필터"로 잘못 뽑는
@@ -2915,9 +4554,119 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 전혀 안 뽑혀 거의 못 찾음). `_build_filter`가 존재하지 않는 기관명은 이미 걸러내
     # 필터 자체는 안전하지만, 그 값이 "키워드"로 전환되지 않으면 전수 스캔 기회 자체가
     # 없다 — 기관명이 DB에 실존하지 않고 키워드가 비어있으면, 사용자가 본문에서 그 이름을
-    # 찾으려는 의도일 가능성이 높으므로 키워드로 옮긴다.
-    if analysis.filters.기관명 and not analysis.filters.키워드 and not field_value_exists("기관명", analysis.filters.기관명):
-        analysis.filters = analysis.filters.model_copy(update={"키워드": analysis.filters.기관명})
+    # 찾으려는 의도일 가능성이 높으므로 키워드로 옮긴다. 옮긴 뒤에는 기관명 필드를 반드시
+    # None으로 비워야 한다(2026-11-06 발견 — "감사원 관련 내용 있어?"에서 지금까지 그냥
+    # 둬서, 키워드=기관명='감사원'이 동시에 남아있는 상태로 `_search()`까지 흘러가면,
+    # 그 안의 "기관명 교차오염 방지" 로직(2026-10-19/10-22)이 "이 결과의 실제 기관명이
+    # 필터의 기관명과 다르면 제외"라고 판단해 — 진짜 키워드 매칭(감사원 감사·지적사항을
+    # 언급하는 문서 10건, 실제 소속기관은 제각각이라 당연히 '감사원'과 다름)을 전부
+    # 걸러내 버려 100% "찾지 못함"으로 실패했음. 검색은 정상인데 그 직후 단계가 스스로
+    # 지워버리는 구조였던 것 — `_build_filter`가 이미 무효한 기관명을 걸러내 Qdrant
+    # 필터 자체엔 안 들어가므로(1373행), 여기서 지워도 안전.
+    # ⚠️ 키워드로 demote하기 전에 먼저 fuzzy 줄임말 해석을 시도한다(2026-11-13, "철강협회"→
+    # "한국철강협회" 같은 정당한 줄임말까지 무조건 키워드로 바꿔버리면, 그 직후 "키워드
+    # 있으면 데이터유형 불신" 규칙까지 겹쳐 기관명·데이터유형이 둘 다 사라진 무제한 스캔으로
+    # 떨어지는 문제가 실측 확인됨 — `_resolve_org_name_fuzzy` 참고).
+    # 원래(줄임말) 표현은 `_raw_org_name_before_fuzzy`에 보존한다 — 아래
+    # `_recover_dropped_content_keyword` 복구 단계가 질문 원문에서 기관명을 떼어낼 때
+    # 정식 명칭("한국철강협회")으로만 떼면, 원문엔 줄임말("철강협회")만 있어 안 떼어지고
+    # "철강협회의"가 가짜 키워드로 복구돼버린다(2026-11-13 실측 확인 — 그 가짜 키워드가
+    # 다시 "키워드 있으면 데이터유형 불신" 규칙을 건드려 방금 고친 문제가 되살아남).
+    # ⚠️ "외부요청 중 수수료 관련 내역 보여줘"처럼 순수 키워드 질문에서, 질문분석 LLM이
+    # 그 키워드를 간헐적으로 `기관명` 필드에도 똑같이(글자 그대로) 중복해서 채워버리는
+    # 경우가 실측 확인됨(2026-11-16, "데이터 정합성" 사용자 제보로 발견 — 8회 중 1회
+    # analysis.filters={'기관명': '수수료', '키워드': '수수료'}). 아래 가드가 "키워드가
+    # 이미 있으면 기관명을 안 건드린다"(정당한 "기관명+별도 주제어" 조합을 보호하려는
+    # 의도)는 원래 맞는 설계인데, 이 블라인드 스팟 때문에 가짜 기관명이 끝까지 안 걸러지고
+    # `_search()`의 스캔 교차오염 방지 로직("효과적 기관명이 필터와 다르면 제외")에서 그
+    # 레코드의 진짜 기관명("관세청")과 비교돼 엉뚱하게 제외됨 — 매번 동일한 키워드 질문을
+    # 반복해도 특정 레코드가 들쭉날쭉 누락되는 원인이었다. 기관명과 키워드가 완전히
+    # 똑같은 문자열이면 "별도 주제어 조합"이 아니라 "같은 값이 중복 추출된 것"이 거의
+    # 확실하므로, 이 경우는 키워드가 있어도 기관명을 검증 대상에 포함한다.
+    _raw_org_name_before_fuzzy: str | None = None
+    if (
+        analysis.filters.기관명
+        and (not analysis.filters.키워드 or analysis.filters.기관명 == analysis.filters.키워드)
+        and not field_value_exists("기관명", analysis.filters.기관명)
+    ):
+        _raw_org_name_before_fuzzy = analysis.filters.기관명
+        _resolved_org_name = _resolve_org_name_fuzzy(analysis.filters.기관명)
+        if _resolved_org_name:
+            analysis.filters = analysis.filters.model_copy(update={"기관명": _resolved_org_name})
+        else:
+            analysis.filters = analysis.filters.model_copy(
+                update={"키워드": analysis.filters.기관명, "기관명": None}
+            )
+
+    # "그 중에 X만 알려줘"처럼 직전 턴에서 보여준 목록 안에서 narrowing하는 질문은 그
+    # 목록의 데이터유형(메뉴)을 유지해야 하는데, LLM이 새 질문의 키워드(예: "수입통관자료")
+    # 어휘에 이끌려 완전히 다른 메뉴로 데이터유형을 잘못 추출하는 버그가 재현됨(2026-11-09,
+    # 브라우저 실사용 — "건강보험심사평가원 관련 심의위원회 안건 알려줘"(5건, 전부
+    # 심의위원회) 다음 "그 중에 치료재료 수입통관자료 요청한 건만 알려줘"가 심의위원회가
+    # 아닌 완전히 다른 메뉴(신청이력) 레코드를 보여줌 — "그 중에"로 명시적으로 narrowing을
+    # 요청했는데 그 목록을 완전히 벗어난 결과). 직전 턴 근거(carried_over)의 데이터유형이
+    # 전부 하나로 일치하면, 질문이 명시적으로 다른 메뉴를 지목하지 않는 한
+    # (`_confirmed_menu_data_type`) 그 데이터유형으로 되돌린다.
+    # 이 값은 아래 `_search()`에도 넘겨, 다른 필터(수출입구분/요청자 등)가 엉뚱하게 뽑혀
+    # 0건→단계적 완화를 거쳐 결국 "필터 완전 제거" 최종 폴백까지 떨어지는 경우에도(위
+    # 데이터유형 복원만으로는 못 막음, 2026-11-09 실측 — 그 폴백은 무제한 벡터검색이라
+    # 다시 무관한 메뉴가 섞여 나옴) 최종 폴백 단계에서도 이 메뉴로 좁히게 한다.
+    _carried_scope_lock: str | None = None
+    if carried_over and _LIST_NARROWING_CONTINUATION_RE.search(question):
+        _carried_types = {p.get("데이터유형") for p in carried_over if p.get("데이터유형")}
+        if len(_carried_types) == 1:
+            _carried_dominant = next(iter(_carried_types))
+            _carried_scope_lock = _carried_dominant
+            if analysis.filters.데이터유형 != _carried_dominant and not _confirmed_menu_data_type(
+                analysis.filters.데이터유형, question
+            ):
+                analysis.filters = analysis.filters.model_copy(update={"데이터유형": _carried_dominant})
+
+    # "온실가스 관련 통계 요청한 곳 있어?"처럼, 본문에 실제로 많이 등장하는 구체적인 주제어가
+    # 기관명 사례와 똑같이 "통계종류" 필드로 잘못 지어내지는 버그가 실측 확인됨(2026-11-06
+    # — "온실가스"는 실제 DB 통계종류 값(`_KNOWN_STATISTICS_TYPES`: 통관기초/세부가공 등)이
+    # 아닌데도 그 필드로 뽑혀, `_build_filter`가 신뢰 못 할 값이라 조용히 버려버리면 키워드
+    # 쪽은 비어있어 전수 스캔 기회 자체가 없어짐 — ground truth로는 심의위원회 본문에
+    # 직접 9건 언급돼 있는데도 "찾지 못함"으로 100% 재현. `_build_filter`가 버리기 전에,
+    # 키워드가 비어있으면 그 값을 먼저 키워드로 옮겨 살린다(기관명→키워드 폴백과 동일 패턴).
+    # 통계종류/수출입구분/역할필드 전부가 똑같은 지어내기 문제를 겪는다 — LLM이 질문
+    # 속 구체적인 단어를 "이 필드값인가보다"라고 추측해 채우는데, 실제 DB엔 그런 값이
+    # 한 번도 없는 경우(통계종류: 2026-11-06, 수출입구분: 2026-11-11, 역할필드: 2026-11-12
+    # 사용자 지적 — "대한무역투자진흥공사 2026 글로벌공급망팀 청구내역 알려줘"에서
+    # "글로벌공급망팀"을 엉뚱하게 담당자로 지어냄). 각 필드가 지어낸 값인지 먼저 전부
+    # 판정해서 지운 뒤(아직 키워드로는 안 옮김), 한꺼번에 `_recover_dropped_content_keyword`로
+    # 원문 전체에서 복구를 시도한다 — 순서가 중요하다: 만약 역할필드 정리보다 먼저
+    # 복구를 돌리면, 그 함수가 "진짜 역할필드 값이려니" 하고 `filters.담당자`(아직 안
+    # 지워진 지어낸 값)를 후보 텍스트에서 떼어내버려 정작 그 부분(이번 사례의
+    # "글로벌공급망팀")이 복구 결과에서 사라진다 — 지우고 나서 복구해야 전체 구절
+    # ("글로벌공급망팀 청구내역")을 온전히 살릴 수 있다. 복구가 끝내 실패하면(관련/
+    # 어미 패턴 둘 다 안 맞는 질문), 지어낸 값들 중 하나라도 있으면 그걸 그대로 키워드로
+    # 쓴다(기존 동작 그대로 — 완전한 구절은 아니어도 없는 것보단 낫다).
+    _hallucinated_value: str | None = None
+    if (
+        analysis.filters.통계종류
+        and analysis.filters.통계종류 not in _KNOWN_STATISTICS_TYPES
+    ):
+        _hallucinated_value = _hallucinated_value or analysis.filters.통계종류
+        analysis.filters = analysis.filters.model_copy(update={"통계종류": None})
+
+    if (
+        analysis.filters.수출입구분
+        and analysis.filters.수출입구분 not in _NON_NAME_DOMAIN_WORDS
+    ):
+        _hallucinated_value = _hallucinated_value or analysis.filters.수출입구분
+        analysis.filters = analysis.filters.model_copy(update={"수출입구분": None})
+
+    # 콤마 다중값 저장을 지원해야 하므로 정확매칭이 아니라 `scan_field_contains`
+    # (부분 문자열)로 실제 그 역할로 저장된 적이 있는지 확인한다.
+    for _role_field in _ROLE_FIELDS_FOR_SCAN:
+        _role_value = getattr(analysis.filters, _role_field, None)
+        if not _role_value:
+            continue
+        if scan_field_contains(_role_field, _role_value, 1):
+            continue
+        _hallucinated_value = _hallucinated_value or _role_value
+        analysis.filters = analysis.filters.model_copy(update={_role_field: None})
 
     # "내부자료에서 댓글 달린 글 알려줘"/"~있는거 알려줘"처럼 "~달린/있는" 서술형 수식이
     # 붙으면 필터 추출이 "댓글"을 키워드로 안 뽑는 경우가 재현됨(2026-10-19 즉흥 테스트
@@ -2929,6 +4678,96 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     if not analysis.filters.키워드 and "댓글" in question:
         analysis.filters = analysis.filters.model_copy(update={"키워드": "댓글"})
 
+    # 위 어떤 폴백으로도 키워드가 안 채워졌으면, "~ 관련(된) 내용/자료가 있어?" 구절
+    # 자체에서 마지막으로 복구를 시도한다(`_recover_dropped_content_keyword` 참고 —
+    # 2026-11-11, 기관명+연도가 같이 있으면 LLM이 순수 한글 키워드를 통째로 버리는
+    # 버그의 안전망). standalone_question과 원문 question 둘 다 시도 — 재작성
+    # 과정에서 이 구절 자체가 사라지는 경우를 대비한다. 위에서 정리한 통계종류/수출입구분/
+    # 역할필드 지어내기 값이 하나라도 있으면 최후의 폴백으로 그걸 쓴다.
+    if not analysis.filters.키워드:
+        recovered = _recover_dropped_content_keyword(
+            analysis.standalone_question, analysis.filters, _raw_org_name_before_fuzzy
+        ) or _recover_dropped_content_keyword(question, analysis.filters, _raw_org_name_before_fuzzy)
+        if recovered:
+            analysis.filters = analysis.filters.model_copy(update={"키워드": recovered})
+        elif _hallucinated_value:
+            analysis.filters = analysis.filters.model_copy(update={"키워드": _hallucinated_value})
+
+    # "그 중에 첫번째 건 누가 요청한거야?"처럼 목록 안에서 순서를 가리키는 "첫번째"/
+    # "두번째"가 심의위원회 회차를 뜻하는 "차수"(1차/2차 위원회)로 잘못 추출되는 경우를
+    # 방어한다(2026-11-09 발견) — carried_over에 이미 그 목록(한국은행/건강보험심사평가원
+    # 2건)이 있어도, query_filter가 데이터유형+차수만으로도 "유효해 보이는" 필터가 돼
+    # carried_over 우선 로직(query_filter가 None일 때만 발동, 2026-10-26)이 건너뛰어지고
+    # 완전히 무관한 "진짜 1차 위원회" 레코드(한국수출입은행)를 확신에 차서 답하는 버그가
+    # 재현됨. 질문에 "{차수}차"가 글자 그대로 없으면(=순서 표현에서 지어낸 값이면) 지운다
+    # — 기관명 2026-10-20 trace-verification과 같은 원리, 진짜 "1차 위원회 안건" 질문은
+    # "1차"가 문자 그대로 있어 영향 없음.
+    if analysis.filters.차수 is not None:
+        _round_text = f"{analysis.filters.차수}차"
+        if _round_text not in question and _round_text not in analysis.standalone_question:
+            analysis.filters = analysis.filters.model_copy(update={"차수": None})
+
+    # narrow 축소로 단어가 하나라도 떨어져 나가면(`keyword_narrowed_from`) 그 사실을
+    # 답변 생성 프롬프트에 알려야 한다 — "API 연동 방식"→"API"처럼 떨어진 단어가 필러성
+    # 수식어면 안전하지만, "원산지 자율발급"→"원산지"처럼 떨어진 단어가 사용자 의도의
+    # 핵심(자율발급)이면 "원산지"라는 아주 흔한 단어 하나만으로 관세신고 데이터필드
+    # 목록 같은 전혀 무관한 문서까지 "관련 있다"고 확신에 차서 보여주는 문제가 실측
+    # 확인됨(2026-11-05) — narrowing 로직 자체(필러인지 핵심어인지 구분)는 일반화하기
+    # 위험하므로 건드리지 않고, 대신 "이 축소가 있었다"는 사실만 LLM에게 전달해 판단을
+    # 맡긴다(기존 keyword_note가 "무조건 관련 있다고 간주하라"고 강제하던 것을 완화).
+    keyword_narrowed_from: str | None = None
+
+    # "품목 분류 오류, 재심의"처럼 LLM이 콤마로 여러 주제를 몰아넣은 경우, 아래 필러
+    # 제거·narrow 파이프라인에 그대로 넘기면 콤마 뒤 두 번째 주제가 영구히 사라지므로
+    # (2026-11-05 실측 확인) 가장 먼저 단일 주제로 정리해둔다.
+    if analysis.filters.키워드 and "," in analysis.filters.키워드:
+        resolved = _resolve_multi_topic_keyword(analysis.filters.키워드, allowed_data_types)
+        if resolved != analysis.filters.키워드:
+            keyword_narrowed_from = analysis.filters.키워드
+            analysis.filters = analysis.filters.model_copy(update={"키워드": resolved})
+
+    # 필러 제거·narrow 축소는 위 두 폴백(기관명→키워드, 댓글)이 끝난 뒤 마지막에 한 번만
+    # 적용한다 — 원래는 이 블록이 맨 먼저 있어서 LLM이 직접 뽑은 키워드에만 적용되고,
+    # 기관명→키워드 폴백으로 뒤늦게 채워진 값("전자상거래 수출입 통계"처럼 필러 섞인
+    # 긴 구절)은 narrow 기회 자체가 없어 0건으로 완전히 새는 버그가 실측 확인됨
+    # (2026-11-05, 사용자 지시로 내용·키워드 기반 질문 품질을 우선 점검하다 발견 —
+    # "전자상거래 수출입 통계 요청한 곳 알려줘"가 진짜 정답(한국무역협회 등)이 있는데도
+    # "찾지 못함"으로 실패).
+    if analysis.filters.키워드:
+        trimmed = _strip_keyword_filler(analysis.filters.키워드)
+        if trimmed != analysis.filters.키워드:
+            analysis.filters = analysis.filters.model_copy(update={"키워드": trimmed})
+        # 필러까지 뗀 뒤에도 여전히 여러 단어로 된 키워드는, 본문에 그 문구 그대로는
+        # 없고 더 짧은 핵심어("API 연동 방식"의 "API")만 있는 경우가 실측 확인됨
+        # (2026-11-04). 0건 확인 후에만 좁혀본다 — 애초에 매칭되면 축소 불필요.
+        if " " in trimmed and not scan_text_contains(trimmed, 1, allowed_data_types):
+            narrowed = _narrow_keyword_to_match(trimmed, allowed_data_types)
+            if narrowed != trimmed:
+                keyword_narrowed_from = trimmed
+                analysis.filters = analysis.filters.model_copy(update={"키워드": narrowed})
+        # 공백 없는 단일 한글 복합명사("탄소국경조정제도")는 위 공백 기반 narrow가 전혀
+        # 적용 안 되므로 별도로 시도한다(2026-11-05 — 사용자가 "이런 질문은 찾을 수 있어야
+        # 하는 거 아니냐"고 재확인 요청해 B-14 관찰 상태에서 실제 수정으로 전환).
+        final_keyword = analysis.filters.키워드 or ""
+        if (
+            " " not in final_keyword
+            and not keyword_narrowed_from
+            and not scan_text_contains(final_keyword, 1, allowed_data_types)
+        ):
+            narrowed2 = _narrow_compound_keyword_to_match(final_keyword, allowed_data_types)
+            if narrowed2 != final_keyword:
+                keyword_narrowed_from = final_keyword
+                analysis.filters = analysis.filters.model_copy(update={"키워드": narrowed2})
+    # "대한무역투자진흥공사 2026년 청구금액 알려줘"가 "청구금액"을 키워드로 정확히
+    # 복구해도 "찾지 못함"으로 실패하는 게 실측 확인됨(2026-11-13, 사용자 지적) — 이
+    # 시스템 데이터는 그 개념을 "수수료"(PAY_AMT 컬럼, 청크 템플릿의 실제 라벨)라는
+    # 단어로만 저장하므로, 사용자가 흔히 쓰는 동의어("청구금액"/"청구액")로는 리터럴
+    # 매칭이 본문에서 전혀 안 걸림(실측: "수수료"로 바꿔 물으면 9건 전부 정상 검색).
+    # 키워드 필드는 원래 리터럴 전수 스캔 전용이라 동의어 개념이 없었는데, 이 특정
+    # 쌍만큼은 사용 빈도가 높을 수 있어 좁게 정규화한다.
+    _FEE_KEYWORD_SYNONYMS = {"청구금액", "청구액", "청구 금액", "청구 액"}
+    if analysis.filters.키워드 in _FEE_KEYWORD_SYNONYMS:
+        analysis.filters = analysis.filters.model_copy(update={"키워드": "수수료"})
     # 심의결과 값("제공불가" 등)이 기관명으로 잘못 들어가는 경우는 _build_filter에서
     # 방어했지만(_KNOWN_COMMITTEE_RESULTS), LLM이 그 값을 기관명·심의결과 어느 구조화
     # 필드에도 아예 안 채우는 경우도 상당히 자주 재현됨(2026-10-19, 8회 중 절반가량) —
@@ -2976,9 +4815,16 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 프롬프트 지시만으로 두 차례 시도했으나 매번 다른 회귀를 일으켜서(주석 참고) 코드로
     # 직접 강제. standalone_question(대명사 해석된 재작성 질문)과 원문 둘 다 확인 — 후속
     # 질문에서 "거기" 같은 대명사가 풀리면서 패턴이 드러나는 경우까지 잡기 위함.
-    if _looks_like_recent_ingestion_question(question) or _looks_like_recent_ingestion_question(
-        analysis.standalone_question
-    ):
+    # `_LAST_MODIFIED_FIELD_RE`(위 정의부 참고)도 같은 "이 시스템이 추적 안 하는 날짜
+    # 개념" 범주라 같은 플래그로 묶는다 — 이러면 아래 narrowing-superlative 역방향
+    # 가드도 자동으로 똑같이 보호받는다.
+    _recent_ingestion_flagged = (
+        _looks_like_recent_ingestion_question(question)
+        or _looks_like_recent_ingestion_question(analysis.standalone_question)
+        or bool(_LAST_MODIFIED_FIELD_RE.search(question))
+        or bool(_LAST_MODIFIED_FIELD_RE.search(analysis.standalone_question))
+    )
+    if _recent_ingestion_flagged:
         analysis.is_aggregation_question = True
 
     # "기관명뿐 아니라 요청자/담당자 등 다른 narrowing 필드로 좁혀진 질문도 '좁은 목록
@@ -2986,8 +4832,21 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # — 기관명만 체크하던 최초 구현이 이런 경우를 놓치는 게 즉흥 테스트로 재현됨
     # (2026-10-19). _TEXT_TRACE_FILTER_FIELDS(+기관명)로 좁힌 조건이 하나라도 있으면
     # "narrowing됨"으로 본다.
-    _has_narrowing_for_superlative = analysis.filters.기관명 or any(
-        getattr(analysis.filters, f, None) for f in _TEXT_TRACE_FILTER_FIELDS
+    # ⚠️ 기관명이 "제외"된 경우(filters.기관명=None이지만 "한국환경공단 말고 다른 기관")는
+    # 연도 등 다른 narrowing 필드가 있어도 후보가 "좁혀진 한 개체"가 아니라 "제외 대상 하나만
+    # 뺀 나머지 전체 기관"에 걸쳐 흩어져 있다 — 2026-10-20에 이미 "통계종류/수출입구분만으로는
+    # 개체 하나로 안 좁혀진다"고 구분했던 것과 같은 이유로, 수수료 최상급 전용 지름길(_fee_org,
+    # 아래)도 기관명이 None이면 발동 안 해 이 조합은 결국 일반 벡터검색+LLM 판단에만 의존하는데,
+    # 그 판단이 동일 질문 5회 반복에 320,000,000원/116,990,000원/0원으로 매번 다른(심지어
+    # 0원처럼 명백히 틀린) "제일 비싼 것"을 확신에 차서 답하는 게 실측 확인됨(2026-11-10,
+    # "한국환경공단 말고 다른 기관 이력 중에 2024년 이후에 신청된거 있어?" → "그 중에 제일
+    # 비싼 거는?"). 기관명 제외 문구가 있으면 다른 narrowing 필드가 있어도 "좁혀진 한 개체"로
+    # 보지 않는다.
+    _org_excluded_for_superlative = bool(
+        _has_genuine_exclusion_phrase(question) or _has_genuine_exclusion_phrase(analysis.standalone_question)
+    )
+    _has_narrowing_for_superlative = (not _org_excluded_for_superlative) and (
+        analysis.filters.기관명 or any(getattr(analysis.filters, f, None) for f in _TEXT_TRACE_FILTER_FIELDS)
     )
 
     # "가장 최근" 류 날짜 기준 최댓값/최솟값 질문도 집계와 같은 성격이다(위
@@ -3016,10 +4875,18 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 레코드 중 하나 고르기)와는 근본적으로 다름. "많이/적게"(빈도·개수 비교)가 들어간
     # 문장은 narrowing 여부와 무관하게 역방향 가드를 적용하지 않는다(LLM이 이미 올바르게
     # is_aggregation_question=True로 판단한 걸 코드가 잘못 뒤집지 않도록).
+    # ⚠️ "한국환경공단 사업정보의 가장 최근 업데이트일자를 알려줘"처럼 기관명(narrowing)과
+    # "가장"이 같이 있으면, 바로 위에서 세워둔 `_recent_ingestion_flagged`(진짜 집계
+    # 거절 사유)를 이 역방향 가드가 그대로 뒤집어버려 — 이 시스템에 없는 "업데이트일자"
+    # (레코드가 언제 수정/갱신됐는지 추적하는 필드)를 신청일 등 전혀 다른 필드로 대체해
+    # 확신에 차서 답하는 버그가 실측 확인됨(2026-11-18, 5/5 결정론적으로 2025-12-31을
+    # "업데이트일자"라고 답함 — 실제론 그 기관의 가장 최근 신청일일 뿐). "많이/적게"
+    # 집계와 동일한 이유로, 이 경우도 뒤집지 않는다.
     _is_count_based_superlative = bool(re.search(r"(제일|가장)\s*(많이|적게)", analysis.standalone_question))
     if (
         _has_narrowing_for_superlative
         and not _is_count_based_superlative
+        and not _recent_ingestion_flagged
         and ("제일" in analysis.standalone_question or "가장" in analysis.standalone_question)
     ):
         analysis.is_aggregation_question = False
@@ -3046,9 +4913,41 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         session_store.append_turn(session_id, question, OUT_OF_SCOPE_GREETING)
         return ChatResponse(session_id=session_id, answer=OUT_OF_SCOPE_GREETING, sources=[])
 
+    # "그거 수수료는?"처럼 완전히 새로운 세션(history도 carried_over도 없음)에서 지시
+    # 대명사로만 뭔가를 가리키려는 질문은 가리킬 대상 자체가 구조적으로 존재하지 않는다
+    # (2026-11-09 발견). 데이터유형(메뉴 분류)만으로는 "식별 조건"이라 볼 수 없으므로
+    # 제외하고, 그 외 필터가 하나도 없는지로 판단 — 우연히 기관명·키워드 등이 뽑혔다면
+    # (드물지만) 정상 검색으로 진행해도 안전하다.
+    _has_identifying_filter = any(
+        v is not None
+        for k, v in analysis.filters.model_dump().items()
+        if k != "데이터유형"
+    )
+    if (
+        not history
+        and not carried_over
+        and not _has_identifying_filter
+        and _DANGLING_REFERENCE_RE.search(question)
+    ):
+        session_store.append_turn(session_id, question, DANGLING_REFERENCE_ANSWER)
+        return ChatResponse(session_id=session_id, answer=DANGLING_REFERENCE_ANSWER, sources=[])
+
     # 기관명이 명시된 "전체 이력" 질문은, 메뉴 스코프가 신청이력을 배제하지 않는 한
     # 집계 거절보다 우선해서 정확한 전체 이력을 코드로 직접 가져와 보여준다.
-    if _looks_like_full_org_history_question(analysis.standalone_question, analysis.filters):
+    # ⚠️ `_full_org_history_answer`는 "신청이력" 전용 캔드 응답인데, 사이드바 스코프
+    # (allowed_data_types)로는 안 막혀도 질문 텍스트 자체가 다른 메뉴를 명시한 경우(예:
+    # "한국은행 외부요청 이력 알려줘", 사이드바 스코프 없음)에도 똑같이 발동해버려 "전체
+    # 신청이력은 총 31건입니다"라는 완전히 무관한 메뉴의 캔드 답변이 나오는 버그가 실측
+    # 확인됨(2026-11-10 — 한국은행은 외부요청이 실제 0건인데 전혀 다른 메뉴를 "정답"처럼
+    # 제시, B-37의 수수료 최상급 지름길과 같은 계열). `_confirmed_menu_data_type`
+    # (2026-10-22 B-10/B-37과 동일 패턴)로 질문이 수수료 없는 메뉴와 마찬가지로 "신청이력
+    # 아닌 다른 메뉴"를 명시적으로 지목했는지 확인해, 그런 경우 이 지름길을 건너뛰고
+    # 일반 검색(정직한 라벨링 또는 "찾지 못함")으로 넘긴다.
+    _full_history_blocked_menu = any(
+        _confirmed_menu_data_type(dt, question) or _confirmed_menu_data_type(dt, analysis.standalone_question)
+        for dt in ("외부요청", "내부자료", "심의위원회")
+    )
+    if _looks_like_full_org_history_question(analysis.standalone_question, analysis.filters) and not _full_history_blocked_menu:
         if allowed_data_types is None or "신청이력" in allowed_data_types:
             _full_history_result = _full_org_history_answer(analysis.filters.기관명)
             if _full_history_result is not None:
@@ -3095,7 +4994,15 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         _list_exclude_org = analysis.filters.기관명
     _has_other_narrowing_filter = any(
         getattr(analysis.filters, f, None) for f in (*_TEXT_TRACE_FILTER_FIELDS, "차수")
+    ) or bool(
+        _find_detail_field_condition(analysis.standalone_question)
+        or _find_detail_field_exclusion(analysis.standalone_question)
     )
+    # "전송방식이 FTP인 다른 기관은 어디인가요?"처럼 전송방식/제공주기 조건(구조화 필터가
+    # 아니라 자유텍스트 정규식으로만 잡히는 narrowing)이 있는데도 "기관"+"어디" 단어가
+    # 섞여 있으면 `_looks_like_list_question`이 "전체 업체명 목록"으로 오인해 질문과 전혀
+    # 무관한 33개 업체 리스트로 가로채는 버그(2026-11-10 실측 확인) — 위 narrowing 체크가
+    # 구조화 필드만 보고 이런 자유텍스트 조건을 놓쳐서 생김, 여기서 같이 잡아낸다.
     is_list_question = (
         not analysis.is_aggregation_question
         and not analysis.filters.키워드
@@ -3128,6 +5035,32 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         # field를 끝내 못 정했으면(요청자/제공자처럼 전체목록조회 자체를 지원 안 하는 항목)
         # 엉뚱한 필드로 답하는 대신 목록조회 처리를 포기하고 아래 일반 검색으로 넘어간다.
 
+    # 위 is_list_question은 "조건이 하나라도 있으면 포기"하지만, '연도' 조건 하나뿐인
+    # 업체명 목록 질문만큼은 `_list_field_answer_by_year`(위 정의부 참고)로 LLM 그룹화
+    # 없이 직접 답할 수 있다 — 다른 narrowing 조건이 섞이면(화이트리스트 밖) None이
+    # 돌아와 자연스럽게 일반 검색으로 폴백한다.
+    if (
+        not analysis.is_aggregation_question
+        and not analysis.filters.키워드
+        and (not analysis.filters.기관명 or _list_exclude_org)
+        and analysis.filters.연도
+        and not any(
+            getattr(analysis.filters, f, None)
+            for f in ("통계종류", "수출입구분", "요청자", "제공자", "담당자", "결재자", "심의결과", "차수")
+        )
+        and (analysis.is_full_list_question or _looks_like_list_question(analysis.standalone_question, analysis.filters))
+    ):
+        llm_field = analysis.list_field
+        if llm_field and not any(k in analysis.standalone_question for k in _LIST_FIELD_KEYWORDS.get(llm_field, ())):
+            llm_field = None
+        field = resolved_field or llm_field
+        if field:
+            menu = _resolve_list_menu(analysis.standalone_question) or _MENU_SCOPE_LIST_MENU.get(menu_scope)
+            answer_text = _list_field_answer_by_year(field, menu, analysis.filters.연도, exclude=_list_exclude_org)
+            if answer_text is not None:
+                session_store.append_turn(session_id, question, answer_text)
+                return ChatResponse(session_id=session_id, answer=answer_text, sources=[])
+
     # "원안수용도 아니고 제공불가도 아닌거 있어?" 같은 다중 값 제외 질문을, 집계질문
     # 분류기가 "아니다"를 반복하는 복잡한 불리언 구조만 보고 가끔(2026-10-27 실측 4회
     # 중 2회) 통계·집계 질문으로 잘못 분류하는 비결정성이 확인됨 — 실제로는 조건에 맞는
@@ -3146,6 +5079,30 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         or _excluded_years(analysis.standalone_question)
         or _excluded_rounds(question)
         or _excluded_rounds(analysis.standalone_question)
+    ):
+        analysis.is_aggregation_question = False
+
+    # 일반화된 안전망(2026-11-13, _GENUINE_AGGREGATE_HINT_RE 정의부 참고) — 구조화
+    # 필터로 명확히 좁혀진 질문인데 진짜 집계 신호가 전혀 없으면, is_aggregation_question이
+    # 여전히 True로 남아있어도(위의 개별 예외 패턴에 안 걸렸거나 세션 히스토리 등 다른
+    # 이유로) 집계가 아니라고 되돌린다.
+    # ⚠️ "가장/제일" 없이도("한국환경공단 사업정보의 수정일자를 알려줘") 기관명 narrowing이
+    # 있으면 이 일반화된 안전망이 똑같이 되돌려버릴 수 있다 — `_recent_ingestion_flagged`
+    # (업데이트/수정/갱신/변경일자 등 이 시스템이 추적 안 하는 날짜 개념)로 거절된 경우는
+    # 예외로 둔다(2026-11-18).
+    if (
+        analysis.is_aggregation_question
+        and not _recent_ingestion_flagged
+        and "제일" not in question
+        and "가장" not in question
+        and "제일" not in analysis.standalone_question
+        and "가장" not in analysis.standalone_question
+        and not _GENUINE_AGGREGATE_HINT_RE.search(question)
+        and not _GENUINE_AGGREGATE_HINT_RE.search(analysis.standalone_question)
+        and (
+            analysis.filters.키워드
+            or any(getattr(analysis.filters, f, None) for f in _NARROWING_FILTER_FIELDS)
+        )
     ):
         analysis.is_aggregation_question = False
 
@@ -3184,6 +5141,22 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     if org_excluded:
         excluded_org = analysis.filters.기관명
         analysis.filters = analysis.filters.model_copy(update={"기관명": None})
+    elif (
+        not analysis.filters.기관명
+        and any(w in question for w in _CONTINUATION_REFERENCE_WORDS)
+        and (_has_genuine_exclusion_phrase(_carried_text) or _has_genuine_exclusion_phrase(analysis.standalone_question))
+    ):
+        # "거기 말고 다른 기관 중에..."처럼 "거기"가 제외 대상 자체를 가리키면, LLM이
+        # standalone_question을 재작성할 때 아예 "다른 기관"으로만 일반화해버려서
+        # `filters.기관명`에 제외 대상 이름 자체가 애초에 채워지지 않는 경우가 있다
+        # (2026-11-10 실측 — "전송방식이 FTP인 **다른** 기관은 어디인가요?"로 재작성,
+        # 한국환경공단이라는 이름 자체가 통째로 사라짐) — 위 분기(LLM이 그 이름을 채워준
+        # 경우)로는 못 잡으므로, 직전 턴에 인용된 출처가 전부 한 기관이면 그 기관을
+        # 제외 대상으로 추론한다(carried_over 기반, 2026-10-26에 확립된 단일기관 추론과
+        # 동일한 패턴).
+        _carried_excl_orgs = {p.get("기관명") for p in carried_over if p.get("기관명")}
+        if len(_carried_excl_orgs) == 1:
+            excluded_org = next(iter(_carried_excl_orgs))
 
     # "1차 빼고" 같은 차수 제외 질문도 기관명과 같은 문제를 겪는다 — `filters.차수`는
     # 포함할 값만 담을 수 있어, LLM이 제외 대상을 그대로 채우거나(기관명 패턴과 동일)
@@ -3300,9 +5273,83 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         or excluded_stat_group
         or excluded_trade_types
     )
-    results, possibly_truncated, data_type_relaxed = _search(
-        analysis, carried_over, allowed_data_types, force_narrowing=_pre_force_narrowing
+    results, possibly_truncated, data_type_relaxed, unknown_committee_result, unknown_statistics_type, year_relaxed = _search(
+        analysis,
+        carried_over,
+        allowed_data_types,
+        force_narrowing=_pre_force_narrowing,
+        carried_scope_lock=_carried_scope_lock,
     )
+
+    # "첨부파일 여러 개 달린 신청이력 있어?"처럼 narrowing(키워드) 없이 코퍼스 전체에
+    # 대한 수량 존재 질문을 물으면, 평범한 벡터 top-6(narrowing 신호가 없어 그대로
+    # CHAT_TOP_K)는 질문과 의미상 비슷한 임의 6건일 뿐 "첨부 여러 개" 조건과 무관한데,
+    # 그 6건만 보고 LLM이 "없습니다"라고 확신에 차서 답하는 버그가 실측 확인됨(2026-11-10
+    # — ground truth 69건 실존, top-6 중엔 하나도 없어 전부 없다고 틀리게 답함, 게다가
+    # sources는 그 6건 그대로 붙어 자기모순까지). 댓글 수량(B-47)과 같은 "구조화 필터
+    # 없는 수량 질문" 계열이지만, 이번엔 narrowing 자체가 없는 코퍼스 전체 질문이라
+    # top-K 샘플링으로는 원천적으로 못 푼다 — Qdrant 전수 스캔으로 직접 센다.
+    # ⚠️ 기관명으로 narrowing된 경우("한국철강협회 중에 첨부파일 여러 개 달린 거")도
+    # 같은 패턴의 불신뢰가 재현됨(2026-11-10 — ground truth 0건인데 기관정보 레코드
+    # 하나를 "포함되어 있다"고 제시, 그 레코드조차 첨부 1개뿐이라 "여러 개" 자체가
+    # 틀림) — 키워드 없이 기관명만 있는 경우까지 범위를 넓혀, 그 기관의 레코드만
+    # 대상으로 같은 정확한 카운팅을 적용한다(코퍼스 전체 스캔 대신 그 기관 레코드
+    # 각각의 첨부 개수만 직접 센다 — 건수가 적어 비용 문제 없음).
+    # standalone_question 재작성이 "여러 개" 수량 표현 자체를 통째로 빼먹는 경우가
+    # 재현됨(2026-11-10 — "첨부파일 여러 개 달린 거 중에 한국철강협회꺼 있어?"가
+    # "첨부파일 중에 한국철강협회의 자료가 있나요?"로 재작성되며 "여러 개"가 사라짐) —
+    # `_COMMENT_MULTIPLE_RE`(아래)는 이미 원문 question도 함께 확인하는데 이 블록만
+    # standalone_question만 보고 있었던 누락, 같은 폴백을 추가한다.
+    _attachment_multiple_match = (
+        None
+        if analysis.filters.키워드
+        else (_ATTACHMENT_MULTIPLE_RE.search(analysis.standalone_question) or _ATTACHMENT_MULTIPLE_RE.search(question))
+    )
+    # "한국철강협회꺼 아닌거"처럼 기관명이 실제로는 "제외" 대상인데 `filters.기관명`에
+    # 긍정값으로 들어오는 건 기관명 제외의 흔한 패턴(2026-10-20 등)이지만, 이번엔 조사가
+    # "가/이 아닌"(공용 `_EXCLUSION_NAME_RE`가 "통계가 아닌 것은" 오탐 방지를 위해 일부러
+    # "도 아니고" 조합만 트리거로 인정하도록 2026-10-27에 좁혀둔 범위라 안 걸림)이라
+    # 기존 제외 감지가 못 잡음(2026-11-10 실측 — 0건이어야 할 질문이 여전히 0건으로
+    # 나왔지만, 이는 한국철강협회 자체가 우연히 0건이라 증상이 안 보였을 뿐, 다른 기관으로
+    # 바꾸면 완전히 틀린 기관 하나로 좁혀져 나머지 전부를 숨기는 진짜 버그). 전역
+    # `_EXCLUSION_NAME_RE`를 느슨하게 고치면 그 2026-10-27 수정이 막던 오탐이 재발할
+    # 위험이 크므로, 이미 알고 있는 구체적 기관명 문자열 하나만 보는 좁은 로컬 체크로
+    # 처리한다(일반화된 정규식이 아니라 리터럴 문자열 검사라 다른 영역에 영향 없음).
+    _att_org_excluded = bool(
+        analysis.filters.기관명
+        and re.search(re.escape(analysis.filters.기관명) + r"(?:꺼|것|거)?\s*(?:가|이)\s*아닌", question + " " + analysis.standalone_question)
+    )
+    if _attachment_multiple_match and analysis.filters.데이터유형 in _ATTACHMENT_TYPE_OF:
+        _att_base_type = analysis.filters.데이터유형
+        _att_type = _ATTACHMENT_TYPE_OF[_att_base_type]
+        _att_min_count = _quantity_threshold(_attachment_multiple_match)
+        if analysis.filters.기관명 and not _att_org_excluded:
+            _org_records = find_by_type_and_field(_att_base_type, "기관명", analysis.filters.기관명, limit=300)
+            _multi_results = [
+                r for r in _org_records
+                if len({
+                    a["첨부파일명"] for a in find_by_type_and_source(_att_type, r["원본ID"], limit=200)
+                    if a.get("첨부파일명")
+                }) >= _att_min_count
+            ]
+            if _multi_results:
+                results = _multi_results
+                possibly_truncated = len(_multi_results) < len(_org_records)
+            else:
+                results = []
+        elif not analysis.filters.기관명 or _att_org_excluded:
+            _multi_source_ids = find_sources_with_multiple_attachments(
+                _att_type, min_count=_att_min_count, limit=20
+            )
+            if _multi_source_ids:
+                _multi_results = []
+                for _sid in _multi_source_ids:
+                    _multi_results.extend(find_by_type_and_source(_att_base_type, _sid))
+                if _att_org_excluded:
+                    _multi_results = [r for r in _multi_results if r.get("기관명") != analysis.filters.기관명]
+                if _multi_results:
+                    results = _multi_results
+                    possibly_truncated = True
 
     # "한국환경공단 이력 중에 통관기초통계 아닌거 있어?"처럼 기관명+제외 조건이 있을 때,
     # 벡터 top-20(narrowing 상한)이 하필 제외 대상 범주로 쏠려있으면(이 질문 자체가
@@ -3356,23 +5403,38 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         # 거의 없어 완전성이 깨진다(2026-10-27 실측 — ground truth 10건인데 2건만 나옴).
         # 다른 필터가 같이 있으면 전체(최대 900, "아닌" 케이스와 동일 상한)를 가져와
         # 거른 뒤에야 표시 상한을 적용한다.
-        _detail_scan_limit = 900 if analysis.filters.연도 else KEYWORD_SCAN_LIMIT
+        # ⚠️ "거기(한국환경공단) 말고 다른 기관 중에 전송방식이 FTP인거"처럼 제외 질문과
+        # 결합되면, excluded_org를 몰라서 표시상한(30)을 먼저 적용해버리면 그 30건이
+        # 레코드 수가 압도적으로 많은 제외 대상 기관(한국환경공단, 157건 중 36건)으로
+        # 거의 다 채워지고, 뒤이은 제외 필터가 그걸 전부 걷어내 0건이 되는 걸 실측 확인함
+        # (2026-11-10) — 연도와 동일한 원인·동일한 해법이라 excluded_org도 전체스캔(900)
+        # 트리거 조건에 포함한다.
+        _detail_scan_limit = 900 if (analysis.filters.연도 or excluded_org) else KEYWORD_SCAN_LIMIT
         _detail_matches = scan_field_contains(_detail_label, _detail_value, _detail_scan_limit, data_type="신청이력")
         # 기관명이 명시돼 있으면 그 기관으로만 좁힌다(흔한 교차오염 방지 패턴 재사용).
         if analysis.filters.기관명:
             _detail_matches = [p for p in _detail_matches if p.get("기관명") == analysis.filters.기관명]
+        if excluded_org:
+            _detail_matches = [p for p in _detail_matches if p.get("기관명") != excluded_org]
         if analysis.filters.연도:
             _detail_matches = [p for p in _detail_matches if p.get("연도") == analysis.filters.연도]
         _detail_matches = _detail_matches[:KEYWORD_SCAN_LIMIT]
-        if _detail_matches:
-            # ⚠️ 끝에 붙이는 것도, 기존 results를 뒤에 남겨두는 것도 안 된다 — 처음엔
-            # "맨 앞에 추가"만 했는데, 뒤에 남은 기존(벡터검색) results가 전혀 무관한
-            # 레코드(예: 제공주기='-'인 것)를 섞여 들여보내서, "매월인 자료"라는 답변에
-            # 제공주기가 '-'인 레코드까지 "건별 상세"로 나열되는 문제가 실측 확인됨
-            # (2026-10-27, 브라우저 테스트 — 35건 중 31~35번째가 전부 무관). 제외("아닌")
-            # 케이스에서 이미 확인한 것과 같은 결론 — 코드로 이미 완전하게 확인한 이
-            # 집합 자체가 신뢰할 수 있는 전부이므로, 검증 안 된 기존 results는 버린다.
-            results = _detail_matches
+        # ⚠️ 끝에 붙이는 것도, 기존 results를 뒤에 남겨두는 것도 안 된다 — 처음엔
+        # "맨 앞에 추가"만 했는데, 뒤에 남은 기존(벡터검색) results가 전혀 무관한
+        # 레코드(예: 제공주기='-'인 것)를 섞여 들여보내서, "매월인 자료"라는 답변에
+        # 제공주기가 '-'인 레코드까지 "건별 상세"로 나열되는 문제가 실측 확인됨
+        # (2026-10-27, 브라우저 테스트 — 35건 중 31~35번째가 전부 무관). 제외("아닌")
+        # 케이스에서 이미 확인한 것과 같은 결론 — 코드로 이미 완전하게 확인한 이
+        # 집합 자체가 신뢰할 수 있는 전부이므로, 검증 안 된 기존 results는 버린다.
+        # ⚠️ _detail_matches가 빈 리스트일 때도 이 원칙은 동일하게 적용돼야 한다
+        # (2026-11-09 발견) — 예전엔 `if _detail_matches:` 조건 안에서만 덮어써서, 0건
+        # 확인(코드가 신청이력 전체를 정확히 스캔해 "진짜 없다"고 검증한 것)인데도 그 전에
+        # 있던 stale results(흔히 질문분석이 데이터유형을 다른 메뉴로 잘못 추출해 생긴,
+        # 이 속성조건과 무관한 벡터검색 결과)가 그대로 남아 답변 LLM에 전달됨 — "한국환경
+        # 공단 이력 중에 제공주기 매월로 된 자료는 무엇인가요?"(실제 0건)가 전혀 무관한
+        # 신청이력 2건을 "제공주기가 매월인 자료"라고 확신에 차서 지어내는 걸로 재현됨.
+        # 0건으로 확인됐으면 무조건 결과를 비워 그 확신을 반영한다.
+        results = _detail_matches
         # 이 필드는 이제 코드가 정확히 처리하므로, 같은 라벨/값을 LLM이 또 "키워드"로
         # 뽑아 일반 키워드 스캔(본문에 그 단어가 아무 데나 있어도 걸리는 느슨한 매칭)이
         # 중복으로 끼어들지 않게 한다 — 안 지우면 정확한 매치 위에 노이즈가 섞인다.
@@ -3406,6 +5468,33 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
             # 코드로 정확히 계산한 완전한 결과라 기존 results를 보존할 이유도 없다.
             results = _detail_excl_matches
         analysis.filters = analysis.filters.model_copy(update={"키워드": None})
+
+    # "지역 항목이 제공되는 업체 알려줘"(2026-11-18) — 제공항목/요청항목 필드 자체를
+    # 좁혀 스캔한다(전송방식/제공주기와는 별개 필드라 둘 다 매칭되는 경우는 실무상
+    # 드물지만, 혹시 겹치면 더 안정적으로 검증된 전송방식/제공주기 블록을 우선한다).
+    # 전송방식/제공주기와 달리 후보 추출이 "~항목" 앞 토큰을 뽑는 휴리스틱이라 신뢰도가
+    # 낮으므로, 0건이면(전송방식/제공주기처럼 강제로 신뢰하지 않고) 기존 흐름(일반
+    # 키워드 검색)으로 조용히 폴백한다.
+    if not _detail_match and not _detail_excl_match:
+        _item_candidate = (
+            _extract_provided_item_candidate(analysis.standalone_question)
+            or _extract_provided_item_candidate(question)
+        )
+        if _item_candidate:
+            _item_scan_limit = 900 if (analysis.filters.연도 or excluded_org) else KEYWORD_SCAN_LIMIT
+            _item_matches = scan_detail_field_contains(
+                _PROVIDED_ITEM_LABELS, _item_candidate, _item_scan_limit
+            )
+            if analysis.filters.기관명:
+                _item_matches = [p for p in _item_matches if p.get("기관명") == analysis.filters.기관명]
+            if excluded_org:
+                _item_matches = [p for p in _item_matches if p.get("기관명") != excluded_org]
+            if analysis.filters.연도:
+                _item_matches = [p for p in _item_matches if p.get("연도") == analysis.filters.연도]
+            _item_matches = _item_matches[:KEYWORD_SCAN_LIMIT]
+            if _item_matches:
+                results = _item_matches
+                analysis.filters = analysis.filters.model_copy(update={"키워드": None})
 
     if excluded_org:
         # 첨부 청크는 기관명 필드 자체가 없어(None) 이 비교를 그냥 통과하는데, 화면에
@@ -3455,21 +5544,97 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # `_recency_min`) 기능은 이미 독립된 두 불리언으로 감지하고 있어 그 패턴을 따라
     # 둘 다 검출될 수 있게 하고, 각각에 대해 별도로 극값을 계산해 둘 다 [자료] 맨 앞에
     # 포함시킨다.
+    # ⚠️ "수수료" 필드는 구조적으로 신청이력에만 존재(외부요청/내부자료/심의위원회 전수
+    # 확인 결과 0건, 2026-11-10) — 질문이 "외부요청 중에 수수료 제일 비싼 거" 처럼 다른
+    # 메뉴를 명시했는데도 이 기능이 메뉴와 무관하게 무조건 신청이력을 조회해버려서,
+    # "한국은행 외부요청"(외부요청 0건인 기관)에 대해 신청이력 데이터를 "정답"으로
+    # 확신에 차서 답하는 버그가 실측 확인됨(질문이 외부요청을 물었는데 "~의 신청이력
+    # 중..."으로 조용히 메뉴를 바꿔치기함). `_confirmed_menu_data_type`(2026-10-22
+    # B-10과 동일 패턴)로 질문이 수수료 데이터가 없는 메뉴를 명시적으로 지목했는지
+    # 확인해, 그런 경우 이 지름길 자체를 건너뛰고 일반 검색(그 메뉴엔 당연히 0건이라
+    # 정직한 "찾지 못함")으로 넘긴다.
+    _fee_blocked_menu = any(
+        _confirmed_menu_data_type(dt, question) or _confirmed_menu_data_type(dt, analysis.standalone_question)
+        for dt in ("외부요청", "내부자료", "심의위원회")
+    )
+    # "1등"/"1위"/"1순위"도 "제일/가장"과 동의어인 비교 표현인데(실측 확인: standalone_
+    # question 재작성이 이 단어를 "가장"으로 안 바꾸는 경우가 있어, 이 게이트에서 빠지면
+    # 전용 경로가 발동 안 해 LLM의 비교 판단(신뢰 불가)에만 의존하게 됨) — 게이트와
+    # max-판정 둘 다에 포함시킨다. 순위 1등은 항상 "가장 좋은/높은/많은" 쪽을 의미하므로
+    # max로만 분류(꼴등 등 반대 표현은 이 패턴에 안 걸림).
     _fee_kinds: list[str] = []
-    if _fee_org and "수수료" in analysis.standalone_question and re.search(
-        r"(제일|가장)", analysis.standalone_question
+    if (
+        _fee_org
+        and not _fee_blocked_menu
+        and "수수료" in analysis.standalone_question
+        and re.search(r"(제일|가장|1\s*(등|위|순위))", analysis.standalone_question)
     ):
-        if re.search(r"비싼|높은|많은", analysis.standalone_question):
+        if re.search(r"비싼|높은|많은|1\s*(등|위|순위)", analysis.standalone_question):
             _fee_kinds.append("max")
-        if re.search(r"저렴한|싼|낮은|적은", analysis.standalone_question):
+        # ⚠️ "싼"(저렴하다) 단독 패턴이 "비싼"(비싸다, 정반대 의미) 안의 음절로도 매칭되는
+        # 버그를 실측 확인(2026-11-11) — "수수료 제일 비싼 거는?"(최댓값만 묻는 질문)에서도
+        # 매번 _fee_kinds=['max','min']으로 최솟값까지 불필요하게 계산되고 있었음(결과가
+        # 우연히 맞아떨어졌을 뿐, 설계상 맞는 동작은 아니었음). "비싼" 바로 뒤에 오는 "싼"은
+        # 제외하도록 lookbehind 추가.
+        if re.search(r"저렴한|(?<!비)싼|낮은|적은", analysis.standalone_question):
             _fee_kinds.append("min")
     _fee_extremes: dict[str, tuple[int, dict]] = {}
     _fee_total_checked = 0
     if _fee_kinds:
-        _all_history = find_by_type_and_field("신청이력", "기관명", _fee_org, limit=200)
+        # "저 3개 중에 수수료가 제일 비싼 거는?"처럼 직전 턴에 보여준 특정 목록으로 범위를
+        # 명시적으로 좁혔는데도, 이 기능은 항상 기관 전체 이력(최대 200건)을 가져와 비교하는
+        # 구조라 그 목록 밖의 레코드(예: 더 예전 턴에서 다룬 전혀 다른 금액의 레코드)를
+        # "그 3개 중 최댓값"이라고 확신에 차서 잘못 답하는 버그가 실측 확인됨(2026-11-11 —
+        # "한국농수산식품유통공사 2018년 자료 3건" 목록에서 물었는데, 그 3건 중 아무것도
+        # 아닌 완전히 다른(이전 턴의 2024년) 레코드의 수수료를 "가장 비싼 것"이라고 답함).
+        # "그 중에/저 N개 중에" 류 narrowing 신호가 있고 carried_over(직전 턴에 실제로
+        # 인용된 근거)가 있으면, 기관 전체가 아니라 그 목록 안에서만 비교한다.
+        # ⚠️ carried_over의 `기관명` 필드가 레코드마다 None일 때가 있다(실측 확인 — 같은
+        # 원본ID(D20240100178487)인데 어떤 턴에선 기관명이 채워져 있고 어떤 턴에선 None).
+        # 실제 원인: 이 원본ID는 Qdrant에 6개 point로 나뉘어 있음(신청이력 본체 1개 +
+        # 신청이력첨부 조각 5개) — 본체 point만 기관명/세부항목을 갖고, 첨부 조각
+        # point는 둘 다 없음(text/데이터유형/원본ID/첨부파일명/파일경로만 있음). 같은
+        # 원본ID라도 그 턴에 carried_over로 남은 게 본체냐 첨부조각이냐에 따라 "같은
+        # 레코드"의 payload 모양이 달라지는 것 — 단순 `p.get("기관명") == _fee_org`만
+        # 쓰면 진짜 그 기관 레코드(첨부조각)인데도 걸러져서 `_all_history`가 비게 되고,
+        # narrowing 자체가 무효화돼 범위 밖 레코드가 다시 새어 들어가는 버그로 이어진다
+        # — 기관명이 없으면 부모조회로 보강하는 `_effective_org_for_exclusion`과 동일한
+        # 원리로 보강한다. 부모 payload 자체를 캐시해 기관명 확인과 세부항목 추출 둘 다
+        # 재사용한다(중복 Qdrant 조회 방지).
+        _fee_parent_cache: dict = {}
+
+        def _fee_resolve_parent(r: dict) -> dict | None:
+            base_type = _BASE_TYPE_OF.get(r.get("데이터유형"), r.get("데이터유형"))
+            cache_key = (base_type, r.get("원본ID"))
+            if cache_key not in _fee_parent_cache:
+                parents = find_by_type_and_source(base_type, r.get("원본ID"), limit=1)
+                _fee_parent_cache[cache_key] = parents[0] if parents else None
+            return _fee_parent_cache[cache_key]
+
+        def _fee_candidate_org(r: dict) -> str | None:
+            if r.get("기관명"):
+                return r.get("기관명")
+            parent = _fee_resolve_parent(r)
+            return parent.get("기관명") if parent else None
+
+        # ⚠️ 기관명만 보강하고 세부항목(수수료 값이 들어있는 곳)은 안 보강하면, narrowing된
+        # carried_over가 첨부조각 payload로만 채워진 턴에서는 기관 확인은 통과해도 세부항목
+        # 자체가 없어 `_fee_candidates`가 계속 빈 채로 남는다 — "10~20% 틀린 답" 잔존의
+        # 진짜 원인(2026-11-16 추가 추적). 세부항목도 같은 방식으로 부모에서 보강한다.
+        def _fee_detail_source(r: dict) -> dict:
+            if r.get("세부항목"):
+                return r
+            parent = _fee_resolve_parent(r)
+            return parent if parent else r
+
+        _fee_scoped_to_carried = bool(carried_over) and bool(_LIST_NARROWING_CONTINUATION_RE.search(question))
+        if _fee_scoped_to_carried:
+            _all_history = [p for p in carried_over if _fee_candidate_org(p) == _fee_org]
+        else:
+            _all_history = find_by_type_and_field("신청이력", "기관명", _fee_org, limit=200)
         _fee_candidates = []
         for p in _all_history:
-            for item in p.get("세부항목") or []:
+            for item in _fee_detail_source(p).get("세부항목") or []:
                 if item.get("label") == "수수료":
                     # ⚠️ 대부분의 실데이터 수수료 값이 "270,000,000(부가세포함)"처럼
                     # 괄호 설명이 붙어있어서, 단순 int(value.replace(",","")) 시도는
@@ -3512,10 +5677,33 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
                 if _k not in _fee_keys_seen:
                     _fee_keys_seen.add(_k)
                     _fee_front.append(_payload)
-            results = _fee_front + [
-                r for r in results
-                if (r.get("데이터유형"), r.get("원본ID")) not in _fee_keys_seen
-            ]
+            # "저 3개 중에"처럼 비교 대상을 명시적으로 좁힌 경우, 일반 검색이 찾아온
+            # `results`(예: 더 큰 수수료가 적힌 무관한 다른 레코드)를 그대로 뒤에 붙이면
+            # 안내 문구가 "2건 전체 중 최댓값"이라고 정확히 말해도 LLM이 context에 보이는
+            # 더 큰 숫자에 끌려 엉뚱한 레코드를 고르는 문제가 실측 확인됨(2026-11-11 —
+            # "저 3개 중에 수수료가 제일 비싼 거는?"이 narrowing으로 정확히 75,130,400원을
+            # 계산해놓고도, results에 같이 들어있던 무관한 2024년 레코드의 116,990,000원을
+            # "가장 비싼 것"이라고 답함). narrowing된 경우엔 비교 대상 자체를 그 좁힌
+            # 집합(`_all_history`)으로 한정해, 더 큰 숫자를 가진 범위 밖 레코드가 애초에
+            # [자료]에 안 보이게 한다.
+            if _fee_scoped_to_carried:
+                results = _fee_front + [
+                    r for r in _all_history
+                    if (r.get("데이터유형"), r.get("원본ID")) not in _fee_keys_seen
+                ]
+            else:
+                results = _fee_front + [
+                    r for r in results
+                    if (r.get("데이터유형"), r.get("원본ID")) not in _fee_keys_seen
+                ]
+        elif _fee_scoped_to_carried and _all_history:
+            # ⚠️ "존재하지 않는 수수료 극값은 계산할 게 없다"는 이유로 위 분기가 안 타면,
+            # `results`가 원래의(좁혀지지 않은) 일반 검색 결과로 그대로 남아 똑같은
+            # 버그가 재현된다(2026-11-11 실측 — 어떤 실행에서는 narrowing된 carried_over가
+            # 비어있거나 수수료 필드가 없어 `_fee_candidates`가 비는데, 이때도 narrowing
+            # 자체는 명백하므로 비교값을 못 구해도 `results`만큼은 반드시 그 좁힌 집합으로
+            # 제한해야 한다 — 그래야 비교 대상 밖의 더 큰 숫자가 [자료]에 아예 안 보인다).
+            results = _all_history
 
     # 역할필드 제외 필터(및 아래 5개 제외 필터)가 첨부 청크의 부모 레코드를 조회할 때
     # 쓰는 캐시 — _attachment_metadata_header도 같은 (base_type, source_id)→parent
@@ -3659,6 +5847,35 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         ]
         if _matched_results:
             results = _matched_results
+        else:
+            # ⚠️ 매칭이 "하나도" 없으면 원래 벡터 결과를 그대로 두던 게 더 심각한 버그였다
+            # (2026-11-11 실측 확인 — "수출입 업체 식별코드 사용정지 사유 관련 자료 찾아줘"
+            # 처럼 narrow 축소가 전부 실패해 원본 긴 구절이 그대로 남으면, 그 구절은 본문
+            # 어디에도 리터럴로 없는데 narrowing 없는 순수 벡터 유사도 결과(완전히 무관한
+            # 레코드)가 그대로 답변 생성에 넘어가, LLM이 "확인되었습니다"라고 긍정 서술하며
+            # 지어내는 것으로 이어짐 — `_PURE_NEGATIVE_SUMMARY_RE`류 안전장치는 narrative가
+            # 긍정문이라 전혀 안 걸림). 매칭된 게 "일부"라도 있으면 그걸로 좁히는 위 분기와
+            # 달리, 매칭이 "전부" 없으면 그 키워드에 대해 신뢰할 근거가 전혀 없다는 뜻이므로
+            # 안전하게 비운다 — no_result로 정직하게 수렴하게 한다.
+            results = []
+
+    # "댓글 여러 개 달린 내부자료 있어?"처럼 "여러 개"(2건 이상) 수량을 묻는데도, 키워드
+    # "댓글" 매칭은 댓글이 1개뿐인 글까지 전부 포함해버림(2026-11-10 실측 확인 — ground
+    # truth 2건 이상 보유 5건인데 11건을 "여러 개"로 답함) — 모든 내부자료가 댓글이 있으면
+    # 세부항목 "댓글" 필드에 "(YYYY-MM-DD) ..." 템플릿을 공통으로 쓰기 때문에, 리터럴
+    # 키워드 매칭으로는 1건짜리와 여러 건짜리를 구분할 방법이 없다. 댓글은 구조화 필터가
+    # 없는 자유텍스트 필드라 전송방식/제공주기(2026-10-27)와 같은 계열이지만, 이번엔 값
+    # 비교가 아니라 "날짜 접두사 개수"를 코드가 직접 세야 하는 경우라 별도로 처리한다.
+    _comment_multiple_match = _COMMENT_MULTIPLE_RE.search(
+        analysis.standalone_question
+    ) or _COMMENT_MULTIPLE_RE.search(question)
+    if _comment_multiple_match:
+        _comment_min_count = _quantity_threshold(_comment_multiple_match)
+        _multi_comment_results = [
+            r for r in results if _comment_entry_count(r) >= _comment_min_count
+        ]
+        if _multi_comment_results:
+            results = _multi_comment_results
 
     # "제일 최근거는 뭐야"/"가장 오래된 건 언제야" 같은 날짜 최상급 질문도 날짜 비교를
     # LLM에게 맡기면 틀리는 걸 실측 확인(2026-10-20 — 3건 중 실제 최근은 2025-12-31인데
@@ -3747,6 +5964,76 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
                 r for r in results if (r.get("데이터유형"), r.get("원본ID")) != _rkey
             ]
 
+    # "그 중에 제일 댓글 많은 거는?"처럼 B-47(댓글 수량)의 연장선으로 "어느 게 가장
+    # 많은지" 비교까지 LLM에게 맡기면, 날짜·수수료 최상급과 똑같은 "LLM 비교 신뢰성
+    # 한계"가 재현됨(2026-11-10 실측 — 5회 중 2회만 정답, 1회는 완전히 틀린 레코드를
+    # "가장 많다"고 확신에 차서 답함, 2회는 안전하게 집계 거절). `_recency_max`와 동일한
+    # 전략 — 비교를 코드가 직접 한다.
+    # ⚠️ 원래 구현은 "많" 방향만 잡고 "적은"(최솟값)은 전혀 감지하지 못해, "그 중에 제일
+    # 댓글 적은 거는?"류 질문이 이 블록을 건너뛰고 다시 순수 LLM 추측(결과 풀 전체를 눈으로
+    # 세어 비교)에 맡겨지는 버그가 즉흥 테스트로 재현됨(2026-11-11) — `_recency_max`/
+    # `_recency_min`과 동일하게 방향을 분리해서 both 지원.
+    _comment_superlative_max = bool(
+        re.search(r"댓글.{0,10}(가장|제일)\s*많|(가장|제일)\s*댓글.{0,6}많", analysis.standalone_question)
+    )
+    _comment_superlative_min = bool(
+        re.search(r"댓글.{0,10}(가장|제일)\s*적|(가장|제일)\s*댓글.{0,6}적", analysis.standalone_question)
+    )
+    _comment_superlative = _comment_superlative_max or _comment_superlative_min
+    _comment_extreme_count = None
+    _comment_extreme_payload = None
+    if _comment_superlative:
+        _comment_pairs = [(cnt, r) for r in results if (cnt := _comment_entry_count(r)) > 0]
+        if _comment_pairs:
+            _comment_extreme_count, _comment_extreme_payload = (
+                max(_comment_pairs, key=lambda x: x[0])
+                if _comment_superlative_max
+                else min(_comment_pairs, key=lambda x: x[0])
+            )
+            _ckey = (_comment_extreme_payload.get("데이터유형"), _comment_extreme_payload.get("원본ID"))
+            results = [_comment_extreme_payload] + [
+                r for r in results if (r.get("데이터유형"), r.get("원본ID")) != _ckey
+            ]
+
+    # "그 중에 첨부파일 제일 많은 거는?" — B-49(댓글 최상급)와 완전히 같은 문제가 첨부
+    # 개수에도 재현됨(2026-11-10 실측 — 5회 중 4회가 정확히 같은 레코드를 골랐지만, 그
+    # 레코드의 실제 첨부 개수(5개, ground truth)를 "4개"로 잘못 세는 경우가 섞여 있었음 —
+    # 레코드 식별은 맞아도 숫자 자체가 LLM 본문-읽기 추측이라 신뢰 불가). 동일한 전략.
+    # ⚠️ 댓글과 마찬가지로 "적은" 방향도 함께 지원(2026-11-11).
+    _attachment_superlative_max = bool(
+        re.search(r"첨부(?:파일)?.{0,10}(가장|제일)\s*많|(가장|제일)\s*첨부(?:파일)?.{0,6}많", analysis.standalone_question)
+    )
+    _attachment_superlative_min = bool(
+        re.search(r"첨부(?:파일)?.{0,10}(가장|제일)\s*적|(가장|제일)\s*첨부(?:파일)?.{0,6}적", analysis.standalone_question)
+    )
+    _attachment_superlative = _attachment_superlative_max or _attachment_superlative_min
+    _attachment_extreme_count = None
+    _attachment_extreme_payload = None
+    if _attachment_superlative:
+        # ⚠️ "대한무역투자진흥공사 심의위원회 안건 중에 첨부파일 제일 적은 거는?"가 심의위원회
+        # 레코드(3건/7건)가 아니라 완전히 다른 메뉴인 기관정보 레코드(1건)를 "가장 적다"고
+        # 답하는 교차오염이 즉흥 테스트로 재현됨(2026-11-11) — `_comment_entry_count`는
+        # 내부자료 외 메뉴에선 항상 0을 반환해 자동으로 걸러지지만, `_attachment_entry_count`
+        # 는 모든 메뉴에서 유효한 값을 반환하므로 `results`에 기관명 검색이 섞어 넣은 다른
+        # 메뉴 레코드까지 비교 대상에 끼어들 수 있다. 질문이 메뉴를 명시했으면(filters.
+        # 데이터유형) 그 메뉴로만 좁혀서 비교 — 혹시 필터가 비어있거나 좁히면 후보가 아예
+        # 없어지는 예외적 상황엔 기존처럼 전체를 대상으로 폴백(완전히 틀린 답보다 덜 나쁨).
+        _att_scope = analysis.filters.데이터유형
+        _att_candidates = (
+            [r for r in results if r.get("데이터유형") == _att_scope] if _att_scope else results
+        ) or results
+        _attachment_pairs = [(cnt, r) for r in _att_candidates if (cnt := _attachment_entry_count(r)) > 0]
+        if _attachment_pairs:
+            _attachment_extreme_count, _attachment_extreme_payload = (
+                max(_attachment_pairs, key=lambda x: x[0])
+                if _attachment_superlative_max
+                else min(_attachment_pairs, key=lambda x: x[0])
+            )
+            _akey = (_attachment_extreme_payload.get("데이터유형"), _attachment_extreme_payload.get("원본ID"))
+            results = [_attachment_extreme_payload] + [
+                r for r in results if (r.get("데이터유형"), r.get("원본ID")) != _akey
+            ]
+
     # 키워드 전수 스캔(최대 30건)이 첨부 청크(수천~1만 자 이상)와 겹치면 [자료] 전체 텍스트가
     # 수만~10만 자를 넘어가 답변 생성 프롬프트가 지나치게 커진다(2026-09-28, "중소기업 수수료
     # 면제 관련 지침" 질문에서 31건 합쳐 92,808자 → 63,422 프롬프트 토큰까지 커져 완성 토큰
@@ -3788,6 +6075,26 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 동일한 패턴 — 막연한 안내만으론 부족해서 실패했던 적이 있으니 구체적 값을 못박는다).
     _date_threshold_set = bool(analysis.filters.신청일이후 or analysis.filters.신청일이전)
     _year_threshold_set = bool(analysis.filters.연도이후 or analysis.filters.연도이전)
+    # 연도이후/이전(범위)뿐 아니라 정확히 한 연도로 좁힌 질문도 같은 문제를 겪는다 —
+    # "연도" 필터는 신청연도일 뿐인데, 레코드 본문(요청구분·요청내용 등)이 서비스 대상
+    # 기간으로 다른 연도(예: 신청은 2024년, 자료기간은 2025.1.1~2025.12.31)를 더 자주
+    # 언급하면 답변 생성 LLM이 본문의 그 연도를 보고 "질문의 연도와 안 맞는다"고 스스로
+    # 재판단해 no_result로 거절하는 게 실측 확인됨(2026-11-11 — "한국환경공단 2024년
+    # 자료 있어?"가 신청연도=2024로 정확히 필터링된 레코드를 주고도 5회 중 4회 거절,
+    # 본문에 "2025"가 여러 번 나오는 레코드였음). 연도이후/이전과 동일한 패턴으로
+    # "이미 신청연도로 확인됐다"는 사실을 명시해 재판단을 막는다.
+    _year_exact_set = bool(analysis.filters.연도) and not _year_threshold_set
+
+    # 단순 필드 값 조회(2026-11-12, 위 `_SIMPLE_FIELD_QUERY_LABELS` 정의부 참고) — 결과가
+    # 2건 이상일 때만 적용. "수수료"는 fee superlative(_fee_kinds)가 이미 비교·주석을
+    # 전담하므로 중복 주입을 피하기 위해 그쪽이 발동했으면 여기서는 건너뛴다.
+    _simple_field_labels = (
+        [lbl for pat, lbl in _SIMPLE_FIELD_QUERY_LABELS if pat.search(analysis.standalone_question)]
+        if len(results) >= 2
+        else []
+    )
+    if _fee_kinds and "수수료" in _simple_field_labels:
+        _simple_field_labels = [lbl for lbl in _simple_field_labels if lbl != "수수료"]
 
     context_blocks = []
     context_chars = 0
@@ -3837,6 +6144,22 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
                     "만족/불만족한다고 단정하지 말고, 이 자료만으로 no_result 판단을 내리지 마라 "
                     "— 다른 자료 중 연도가 확인된 것이 있으면 그것을 근거로 답하라.] " + text
                 )
+        if _year_exact_set:
+            _rec_year_exact = _extract_year(payload, _metadata_header_cache)
+            if _rec_year_exact is not None and str(_rec_year_exact) == str(analysis.filters.연도):
+                text = (
+                    f"[이 자료의 연도(신청연도)는 {analysis.filters.연도}로, 질문의 연도 조건과 "
+                    "이미 정확히 일치하는 것으로 코드가 직접 확인했다. 본문 속 사업기간·자료기간 "
+                    "등 다른 연도 표현(신청연도와 다른 해를 다룰 수 있다)과 혼동해서 스스로 "
+                    "재판단하지 말고, 이 확인을 그대로 신뢰해 no_result=false로 답하라.] " + text
+                )
+            elif _rec_year_exact is None:
+                text = (
+                    "[이 자료는 연도(신청연도) 정보가 없어 질문의 연도 조건을 검증할 수 없다. "
+                    "조건을 만족/불만족한다고 단정하지 말고, 이 자료만으로 no_result 판단을 "
+                    "내리지 마라 — 다른 자료 중 연도가 확인된 것이 있으면 그것을 근거로 답하라.] "
+                    + text
+                )
         if _recency_extreme_date:
             _this_date = _extract_recency_key(payload, _recency_base_type, _metadata_header_cache)
             _kind = "가장 최근" if _recency_max else "가장 오래된"
@@ -3872,6 +6195,28 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
                 f"신청이력 {_fee_total_checked}건 전체를 코드가 직접 비교해 확인한 "
                 f"{_fee_labels}이다. 본문 속 다른 수수료 값과 혼동해서 스스로 재비교하지 말고, "
                 "이 자료를 답으로 삼아라.] " + text
+            )
+        if (
+            _comment_extreme_payload
+            and payload.get("데이터유형") == _comment_extreme_payload.get("데이터유형")
+            and payload.get("원본ID") == _comment_extreme_payload.get("원본ID")
+        ):
+            _comment_extreme_label = "가장 많은" if _comment_superlative_max else "가장 적은"
+            text = (
+                f"[이 자료의 댓글 개수는 {_comment_extreme_count}개로, 검색된 자료 중 댓글이 "
+                f"{_comment_extreme_label} 것으로 코드가 직접 세어 확인했다. 본문 속 다른 자료의 댓글 수와 "
+                "혼동해서 스스로 재비교하지 말고, 이 자료를 답으로 삼아라.] " + text
+            )
+        if (
+            _attachment_extreme_payload
+            and payload.get("데이터유형") == _attachment_extreme_payload.get("데이터유형")
+            and payload.get("원본ID") == _attachment_extreme_payload.get("원본ID")
+        ):
+            _attachment_extreme_label = "가장 많은" if _attachment_superlative_max else "가장 적은"
+            text = (
+                f"[이 자료의 첨부파일 개수는 {_attachment_extreme_count}개로, 검색된 자료 중 "
+                f"첨부가 {_attachment_extreme_label} 것으로 코드가 직접 세어 확인했다. 본문 속 다른 자료의 첨부 "
+                "개수와 혼동해서 스스로 재비교하지 말고, 이 자료를 답으로 삼아라.] " + text
             )
         if excluded_org:
             # "한국환경공단 말고 다른 기관" 같은 제외 질문에서, 코드가 이미 기관명으로
@@ -3935,6 +6280,17 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
                 "확인했다. 이 제외 조건을 이미 만족하는 것으로 신뢰하고, 본문에 그 사실이 적혀있는지 "
                 "스스로 재확인하려 하지 마라.] " + text
             )
+        if _simple_field_labels:
+            _simple_field_parts = [
+                f"{_label}={_simple_field_value(payload, _label, _metadata_header_cache) or '정보 없음'}"
+                for _label in _simple_field_labels
+            ]
+            text = (
+                f"[이 자료의 {', '.join(_simple_field_parts)} — 코드가 직접 이 자료에서 확인한 값이다. "
+                "본문을 다시 뒤져 다른 값으로 재판단하지 말고 이 값을 그대로 인용하라. '정보 없음'이면 "
+                "실제로 이 자료엔 그 항목이 없는 것이니, 거짓으로 다른 값을 지어내거나 '정보가 없다'고 "
+                "전체를 포기하지 말고 다른 자료 중 값이 있는 것을 근거로 답하라.] " + text
+            )
         if context_blocks and context_chars + len(text) > _CONTEXT_CHAR_BUDGET:
             context_truncated = True
             break
@@ -3969,14 +6325,51 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
             if keyword_matches(keyword, payload["text"], payload.get("요약") or "")
         ]
         if matched:
+            # ⚠️ 2026-11-09에 narrow 사례만 이 강제 지시를 빼고 판단을 LLM에게 맡기는 쪽으로
+            # 한 번 시도했으나(아래 "원자력 발전"/"스타트업 지원" 류를 고치려는 목적), 이미
+            # 검증된 좋은 narrow 사례(API 연동 방식/원산지 자율발급/탄소국경조정제도)까지
+            # 덩달아 "찾지 못함"으로 뒤집히는 명백한 회귀를 실측 확인(API 0/3, 탄소국경조정
+            # 0/3) — LLM이 지시를 약하게 받으면 narrow된 모든 매치를 과도하게 의심하게
+            # 되는 것으로 보여 즉시 되돌림(원래 동작으로 복원). narrow 사례의 "회사명·목록
+            # 항목으로만 우연히 등장" 문제는 여전히 미해결로 남음 — 2026-11-06 "디지털
+            # 전환"과 같은 "LLM 판단 신뢰성 한계" 범주로 재분류, 추가 수정 보류.
             keyword_note = (
                 f"\n\n[안내] 이 질문은 '{keyword}'라는 단어가 본문에 실제로 들어있는 자료를 찾는 검색이다. "
                 f"아래 번호의 [자료]는 이미 본문에 '{keyword}'가 실제로 포함된 것으로 확인됐다: "
                 f"{', '.join(f'[자료 {n}]' for n in matched)}. 이 자료들은 질문의 다른 조건(예: 특정 항목명과의 "
                 "정확한 일치)을 완벽히 만족하지 않아도 관련 있는 것으로 간주하고 반드시 no_result=false로, "
-                "groups에 포함해서 답하라. 이 안내를 무시하고 no_result=true로 답하지 마라."
+                "groups에 포함해서 답하라. 이 안내를 무시하고 no_result=true로 답하지 마라.\n"
+                f"다만 이 확인은 '{keyword}'라는 글자가 본문 어딘가에 있다는 뜻일 뿐, 그 자료 전체가 "
+                f"'{keyword}'에 관한 문서라는 뜻은 아니다. narrative를 쓸 때는 그 자료가 실제로 무엇에 관한 "
+                "문서인지(제목·주요내용 등 전체 맥락)부터 먼저 파악하고, 그걸 중심으로 설명하라. 만약 "
+                f"'{keyword}'가 문서의 핵심 주제가 아니라 계약서의 표준 조항처럼 일부 문구로만 등장한다면, "
+                "그 사실을 숨기지 말고 '이 자료는 OOO에 관한 문서이며, 그 안에 부수적으로 'XX' 관련 조항이 "
+                "포함되어 있다'는 식으로 정직하게 구분해서 써라. 문서의 실제 핵심 내용이 다른 주제인데도 "
+                f"'{keyword}'가 문서 전체의 핵심 주제인 것처럼 서술하지 마라(예: 수수료 승인요청 문서에 보안 "
+                "협조 조항이 한 줄 있다고 해서 '보안 점검에 관한 자료'라고 쓰면 안 된다 — 그 문서의 진짜 "
+                "핵심은 수수료 승인요청이다)."
             )
-        elif not (_detail_match and _detail_matches):
+            # 원래 질문의 다단어 구절이 본문에 그대로는 없어서 더 짧은 단어로 축소된 경우
+            # (예: "원산지 자율발급" → "원산지"), 떨어져 나간 단어가 사용자 의도의 핵심일
+            # 수 있다 — "원산지"처럼 아주 흔한 단어 하나만 남으면 관세신고 데이터필드
+            # 목록처럼 전혀 무관한 문서까지 매칭되는데, 위 안내가 "무조건 관련 있다고
+            # 간주하라"고 강제해버리면 그런 무관한 문서까지 그대로 답에 포함되는 문제가
+            # 실측 확인됨(2026-11-05). 위 "무조건 포함하라" 지시를 이 경우엔 완화해, 축소된
+            # 단어까지 고려한 실제 관련성 판단을 LLM에게 돌려준다.
+            if keyword_narrowed_from:
+                keyword_note += (
+                    f"\n\n[추가 안내] 사용자의 원래 질문은 '{keyword_narrowed_from}'였는데, 이 문구 "
+                    f"그대로는 본문에서 찾지 못해 더 짧은 '{keyword}'로 좁혀서 검색한 것이다. 따라서 "
+                    f"위 [자료]들이 '{keyword}'를 포함한다는 것만으로 무조건 관련 있다고 단정하지 말고, "
+                    f"사용자가 실제로 궁금해한 것은 '{keyword_narrowed_from}' 전체라는 점을 고려해 각 "
+                    f"자료가 정말 그 원래 의미와 관련 있는지 다시 한번 판단하라. 예를 들어 '{keyword}'가 "
+                    "단지 서류 양식의 항목명(예: 데이터 필드 목록 중 하나)으로만 등장하고 문서 전체가 "
+                    f"'{keyword_narrowed_from}'와 무관한 다른 주제라면, 그 자료는 groups에서 빼라."
+                )
+        elif not (_detail_match and _detail_matches) and not (
+            (analysis.filters.수출입구분 and analysis.filters.수출입구분 in keyword)
+            or (analysis.filters.통계종류 and analysis.filters.통계종류 in keyword)
+        ):
             # matched가 비어있다는 건 아래 [자료] 어디에도 키워드가 문자 그대로 없다는 뜻이다.
             # 이 안내 없이는 LLM이 막연히 주제가 비슷해 보인다는 이유로 "포함되어 있다"고
             # 근거 없이 단정하는 사례가 실측 확인됨(2026-10-13, "프로토콜" 질문 — 본문에
@@ -3988,6 +6381,14 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
             # 확인해둔 레코드들까지 전부 no_result로 뒤집어버림(검증된 긍정 안내와 정반대
             # 지시가 동시에 들어가 모순). 전송방식·제공주기 구조화 매치가 이미 있으면(코드가
             # 더 신뢰할 수 있는 확인을 이미 했으므로) 이 부정 안내 자체를 내지 않는다.
+            # ⚠️ 같은 문제가 수출입구분/통계종류에도 재현됨(2026-11-03, "수출입 관련 통계
+            # 신청한 기관이 어디야?" — LLM이 수출입구분="수출입"(코드 폴백으로 정확히
+            # 보강됨, 2026-10-27)과 동시에 키워드="수출입 관련 통계 신청한 기관"(수식어까지
+            # 포함한 통째 문장, `_strip_keyword_filler`가 못 거르는 패턴)을 같이 채워버리면,
+            # 그 키워드 문구 자체는 본문에 글자 그대로 없어서 이 부정 안내가 발동해 이미
+            # 정확하게 narrowing된 20건을 전부 no_result로 뒤집음. 키워드가 수출입구분/
+            # 통계종류 값을 그대로 포함하는 경우(=같은 주제의 중복 서술일 뿐)는 구조화
+            # 필드의 정확매칭을 더 신뢰할 수 있으므로 이 부정 안내를 내지 않는다.
             keyword_note = (
                 f"\n\n[안내] 질문의 '{keyword}'라는 단어는 아래 [자료] 어디에도 본문 그대로 등장하지 "
                 "않는다. 주제가 막연히 비슷해 보인다는 이유로 관련 있다고 추측해서 답하지 말고, "
@@ -4001,13 +6402,73 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 자료를 내부자료라고 단정하는 심각한 오답이 나온다(2026-10-21 실측 확인). 각
     # 자료가 실제로 어느 데이터유형인지는 이미 [자료 N] 레이블에 명시돼 있으니, 그걸
     # 그대로 쓰도록 안내한다.
+    # ⚠️ 위 막연한 안내("각 [자료]에 실제로 표시된 데이터유형을 정확히 써라")만으로는
+    # LLM이 질문 속 메뉴 단어를 그대로 베끼는 걸 못 막는 경우가 실측 확인됨(2026-11-10 —
+    # "해양환경관리공단 외부요청 중에 원안수용된 안건 있어?"가 5/5 전부 "외부 요청 중...
+    # 있습니다"로 틀리게 답함, 실제 자료는 심의위원회 1건뿐이었는데도). 이 프로젝트에서
+    # 반복 확인된 패턴(막연한 지시보다 구체적 사실을 직접 명시하는 쪽이 훨씬 잘 통함,
+    # 예: 2026-08-10 keyword_note) — results에 실제로 담긴 데이터유형이 하나뿐이면 그
+    # 값을 안내 문구에 직접 박아 넣는다(여러 종류가 섞여 있으면 기존처럼 일반 지시만).
+    _relaxed_actual_types = {r.get("데이터유형") for r in results if r.get("데이터유형")}
     data_type_relaxed_note = ""
     if data_type_relaxed and analysis.filters.데이터유형:
-        data_type_relaxed_note = (
-            f"\n\n[안내] 질문에서 '{analysis.filters.데이터유형}'를 언급했지만, 그 메뉴에는 조건에 맞는 "
-            "자료가 없어서 다른 메뉴의 자료를 대신 찾아왔다. 답변에서 질문 속 메뉴 이름을 그대로 베껴 "
-            "쓰지 말고, 각 [자료]에 실제로 표시된 데이터유형(예: 신청이력/외부요청/심의위원회 등)을 "
-            "정확히 써라 — 다른 메뉴의 자료를 질문 속 메뉴인 것처럼 단정하지 마라."
+        if len(_relaxed_actual_types) == 1:
+            _actual_type = next(iter(_relaxed_actual_types))
+            data_type_relaxed_note = (
+                f"\n\n[안내] 질문에서 '{analysis.filters.데이터유형}'를 언급했지만, 그 메뉴에는 조건에 맞는 "
+                f"자료가 없어서 다른 메뉴의 자료를 대신 찾아왔다. 아래 [자료]의 실제 데이터유형은 전부 "
+                f"'{_actual_type}'다. 답변에서 '{analysis.filters.데이터유형}'(질문 속 메뉴 이름)을 그대로 "
+                f"쓰지 말고 반드시 '{_actual_type}'로 정확히 써라."
+            )
+        else:
+            data_type_relaxed_note = (
+                f"\n\n[안내] 질문에서 '{analysis.filters.데이터유형}'를 언급했지만, 그 메뉴에는 조건에 맞는 "
+                "자료가 없어서 다른 메뉴의 자료를 대신 찾아왔다. 답변에서 질문 속 메뉴 이름을 그대로 베껴 "
+                "쓰지 말고, 각 [자료]에 실제로 표시된 데이터유형(예: 신청이력/외부요청/심의위원회 등)을 "
+                "정확히 써라 — 다른 메뉴의 자료를 질문 속 메뉴인 것처럼 단정하지 마라."
+            )
+
+    # 질문이 요청한 심의결과 값이 이 시스템에 존재하지 않는 값이었던 경우(_build_filter의
+    # unknown_committee_result 참고, 2026-11-09 발견 — "부결된 안건 있어?"가 "제공불가"
+    # 레코드를 "부결된 안건"이라고 확신에 차서 답함). 그 필터는 이미 조용히 제거돼
+    # 아래 [자료]는 검증 안 된 벡터 유사도 결과일 뿐이니, 질문의 단어로 재서술하지 못하게
+    # 명시적으로 막는다.
+    unknown_committee_result_note = ""
+    if unknown_committee_result:
+        unknown_committee_result_note = (
+            f"\n\n[안내] 질문의 '{unknown_committee_result}'는 이 시스템의 심의결과 값으로 존재하지 "
+            "않는다. 아래 [자료]는 그 조건과 무관하게 검색된 것일 수 있으니, 자료의 실제 심의결과가 "
+            f"무엇이든 그걸 '{unknown_committee_result}'인 것처럼 서술하지 마라. 그런 결과를 가진 "
+            "안건을 찾지 못했다고 정직하게 no_result=true로 답하라."
+        )
+
+    # 통계종류도 심의결과와 완전히 같은 이유로 같은 안내가 필요하다(2026-11-09 발견).
+    unknown_statistics_type_note = ""
+    if unknown_statistics_type:
+        unknown_statistics_type_note = (
+            f"\n\n[안내] 질문의 '{unknown_statistics_type}'는 이 시스템의 통계종류 값으로 존재하지 "
+            "않는다. 아래 [자료]는 그 조건과 무관하게 검색된 것일 수 있으니, 자료의 실제 통계종류가 "
+            f"무엇이든 그걸 '{unknown_statistics_type}'인 것처럼 서술하지 마라. 그런 통계종류를 가진 "
+            "자료를 찾지 못했다고 정직하게 no_result=true로 답하라."
+        )
+
+    # 연도 완화(`_search()`의 year_relaxed, 2026-11-11 발견)는 "연도가 달라도 키워드가
+    # 진짜 관련성을 보장한다"는 전제(B-53 원래 사례)로 연도 필터 자체를 지우고 검색한
+    # 것이라, 아래 [자료] 중 질문이 요구한 연도와 실제로 다른 레코드가 섞여 있을 수 있다.
+    # "그 중에 2024년 거는 뭐야?"처럼 목록에서 특정 연도 하나를 콕 집어 묻는 질문에서는
+    # 그 전제가 안 맞아, 2024년이 아닌 레코드(예: 2014/2017년)를 2024년인 것처럼 확신에
+    # 차서 제시하는 버그가 실측 확인됨 — 각 자료 자신의 신청일/등록일(YYYYMMDD)에 적힌
+    # 실제 연도를 직접 확인하도록 명시해 재판단을 유도한다(막연한 경고만으론 부족했던
+    # 기존 사례들처럼, 구체적인 연도 값을 직접 박아 넣는다).
+    year_relaxed_note = ""
+    if year_relaxed and analysis.filters.연도:
+        year_relaxed_note = (
+            f"\n\n[안내] 질문의 '{analysis.filters.연도}년' 조건은 검증 없이 완화된 상태다 — 아래 "
+            f"[자료]는 '{analysis.filters.연도}년'과 무관하게 검색됐을 수 있다. 각 자료 자신의 "
+            "신청일/등록일(YYYYMMDD)에 실제로 적힌 연도를 직접 확인해, 질문이 요구하는 연도와 "
+            f"정확히 일치하는 자료만 근거로 삼아라. '{analysis.filters.연도}년'과 일치하는 자료가 "
+            "하나도 없으면 다른 연도의 자료를 그 연도인 것처럼 서술하지 말고, 정직하게 "
+            "no_result=true로 답하라."
         )
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -4098,7 +6559,7 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         {
             "role": "user",
             "content": (
-                f"[자료]\n{context_text}\n\n[질문]\n{_answer_question_text}{keyword_note}{truncation_note}{data_type_relaxed_note}"
+                f"[자료]\n{context_text}\n\n[질문]\n{_answer_question_text}{keyword_note}{truncation_note}{data_type_relaxed_note}{unknown_committee_result_note}{unknown_statistics_type_note}{year_relaxed_note}"
             ),
         }
     )
@@ -4121,6 +6582,58 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         )
         session_store.append_turn(session_id, question, fallback_answer)
         return ChatResponse(session_id=session_id, answer=fallback_answer, sources=[])
+    # ⚠️ no_result를 false로 두고도 summary 자체가 "없습니다"류 완전한 부정 문장으로만
+    # 끝나는 내부 모순이 실측 확인됨(2026-11-10, "교육 훈련 프로그램 관련 자료 있어?" —
+    # narrow 매칭이 "교육 훈련"(17건, 보일러플레이트성 흔한 구절)으로 좁혀져 LLM이 전부
+    # 무관하다고 판단해 summary에 "...관련된 자료는 없습니다."라고 쓰면서도 no_result는
+    # False로 남겨 14개 무관한 근거자료가 그대로 화면에 붙음). GroundedAnswer 스키마 지침
+    # ("근거를 전혀 못 찾으면 no_result=true, 나머지 필드는 비워둬라")을 LLM이 안정적으로
+    # 안 지키는 또 다른 사례 — 2026-10-15에 반대 방향(no_result=True인데 근거는 붙어 나옴)을
+    # 고친 것과 같은 안전장치를 반대 방향에도 적용해, 사용자가 보는 말풍선과 근거자료 목록이
+    # 서로 모순되지 않게 한다.
+    if not grounded.no_result and _PURE_NEGATIVE_SUMMARY_RE.match(grounded.summary.strip()):
+        grounded = grounded.model_copy(update={"no_result": True, "groups": []})
+
+    # "외부요청 중 수수료 관련 자료/내역 보여줘"처럼 키워드로 좁힌 다건(多件) 질문에서,
+    # 검색(`results`)은 매번 정확히 같은 레코드를 찾아내는데도 그걸 groups로 "묶어서 세는"
+    # 이 마지막 단계가 실행마다 들쭉날쭉한 게 실측 확인됨(2026-11-16, 사용자 제보 —
+    # 완전히 동일한 질문을 8회 반복했는데 4건/3건(1건 조용히 누락)/숫자 미명시가 섞여
+    # 나옴, 운영 배포 버전으로 직접 재현). `analysis.filters.키워드`가 있으면 그 시점의
+    # `results`는 이미 `keyword_matches()`로 리터럴 매칭이 확인된 것만 남은 상태라
+    # (2026-10-13 B-54) "전부 진짜 관련 있다"고 신뢰할 수 있다 — 그룹 개수를 LLM
+    # 판단에 맡기는 대신, 실제로 [자료]에 올라간(컨텍스트 예산에 안 잘린) 레코드 전부가
+    # 반드시 groups에 포함되도록 코드가 보강한다. 데이터 정합성이 걸린 문제라 "확률적으로
+    # 개선"이 아니라 "항상 보장"을 목표로 함.
+    _KEYWORD_LISTING_COMPLETENESS_MAX = 20
+    if (
+        not grounded.no_result
+        and analysis.filters.키워드
+        and 2 <= len(context_blocks) <= _KEYWORD_LISTING_COMPLETENESS_MAX
+    ):
+        _covered_indices = {g.source_index for g in grounded.groups}
+        _missing_indices = [i for i in range(1, len(context_blocks) + 1) if i not in _covered_indices]
+        if _missing_indices:
+            _extra_groups = [
+                AnswerGroup(
+                    source_index=i,
+                    narrative=_fallback_narrative_for_payload(results[i - 1], analysis.filters.키워드),
+                )
+                for i in _missing_indices
+            ]
+            _completeness_updates: dict = {
+                "groups": grounded.groups + _extra_groups,
+                "used_indices": sorted(set(grounded.used_indices) | set(range(1, len(context_blocks) + 1))),
+            }
+            # possibly_truncated(검색 상한 등으로 [자료] 자체가 "전체 중 일부"일 수 있는
+            # 경우)엔 "총 N건"이라고 확정 짓는 게 오히려 거짓일 수 있다 — 그 경우 summary는
+            # LLM이 쓴 그대로(이미 "확정적으로 개수 말하지 말라"는 지시를 받음) 두고, groups
+            # 완전성만 보강한다. [자료]에 올라간 게 곧 전체(안 잘림)일 때만 개수를 확정한다.
+            if not possibly_truncated:
+                _completeness_updates["summary"] = (
+                    f"{analysis.filters.키워드}가 포함된 자료가 총 {len(context_blocks)}건 확인되었습니다."
+                )
+            grounded = grounded.model_copy(update=_completeness_updates)
+
     history_text = _render_history_text(grounded)
     bubble_text = "관련 이력을 찾지 못했습니다." if grounded.no_result else grounded.summary
     details = _build_details(grounded, results, analysis.filters.키워드)

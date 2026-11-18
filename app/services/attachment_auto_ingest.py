@@ -76,12 +76,26 @@ def run_incremental_attachment_ingest(docucd: str) -> int:
         _record_attachment_ingest_run(docucd, run_started_at, 0)
         return 0
 
+    # 정보기술팀 OCR은 "전날까지 생성된 첨부"를 다음날 새벽에 처리한다 — 오늘 생성된
+    # 첨부는 구조적으로 아직 결과파일이 있을 수 없으므로, 결과파일 존재 여부를 굳이
+    # 확인하지 않고 바로 "보류"로 다음 실행에 미룬다. 이게 없으면, 이 배치가 하루에
+    # 한 번보다 자주 돌거나 당일 중 생성된 파일을 조회 시점에 우연히 포함하게 될 때마다
+    # "결과파일 없음" 보류 로그가 반복 발생한다(2026-11-06, 정보기술팀 로그로 발견 —
+    # 오전 9시대엔 없던 첨부가 같은 날 10시대에 생성·발견된 사례로 확인됨).
+    today_start = run_started_at.replace(hour=0, minute=0, second=0, microsecond=0)
+
     entries: list[tuple[str, dict]] = []
-    pending_dtms: list[datetime] = []  # 결과파일이 아직 없는 건들의 등록·수정시각
+    pending_dtms: list[datetime] = []  # 결과파일이 아직 없는(또는 오늘 생성된) 건들의 등록·수정시각
 
     for att in new_atts:
         filename = att["ATTFILE_NM"]
         parent_id = att["ATTFILE_ID"]
+        eff_dtm = _attachment_effective_dtm(att)
+
+        if eff_dtm >= today_start:
+            print(f"[attachment_auto:{docucd}] 오늘 생성된 첨부라 다음 실행에 처리(보류): {filename}")
+            pending_dtms.append(eff_dtm)
+            continue
 
         if _is_path_only(filename):
             entries.append((
@@ -115,7 +129,9 @@ def run_incremental_attachment_ingest(docucd: str) -> int:
             print(f"[attachment_auto:{docucd}] 결과파일 비어있음(건너뜀): {filename}")
             continue
         print(f"[attachment_auto:{docucd}] 결과파일 읽음({len(text)}자): {filename}")
-        entries += _build_entries_for_text(parent_id, att["ATTFILE_NUM"], filename, text, data_type)
+        entries += _build_entries_for_text(
+            parent_id, att["ATTFILE_NUM"], filename, text, data_type, file_path=att["FILE_PATH"]
+        )
 
     total = _upsert_entries(data_type, entries, f"attachment_auto:{docucd}") if entries else 0
 

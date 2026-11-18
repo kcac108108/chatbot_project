@@ -59,7 +59,13 @@
     display: flex;
     flex-direction: column;
     min-height: 0;
+    /* 네이티브 스크롤바는 완전히 숨김(아래 .cscroll-* 커스텀 스크롤바로 대체) — Chrome/Edge의
+       "Fluent/오버레이 스크롤바" 기능이 켜진 환경에서는 ::-webkit-scrollbar로 폭·색을
+       아무리 키워도 브라우저가 무시하고 얇은 네이티브 바만 그려서(2026-11-17 실사용 확인),
+       순수 CSS로는 두껍고 또렷한 스크롤바를 보장할 수 없음 — JS로 직접 그린다. */
+    scrollbar-width: none;
   }
+  .sidebar::-webkit-scrollbar { display: none; width: 0; }
   .sidebar-brand {
     display: flex; align-items: center; gap: 9px;
     margin-bottom: 22px; padding: 0 2px;
@@ -78,6 +84,23 @@
   .sidebar h3.sec-menu { color: var(--accent); }
   .sidebar h3.sec-faq { color: #1d7a5f; }
   .sidebar h3.sec-recent { color: var(--ink-soft); }
+  .sidebar h3.sec-search { color: var(--mint); }
+  .quick-search-row { display: flex; gap: 6px; }
+  #keyword-input {
+    flex: 1; min-width: 0; font-family: inherit; font-size: 12.5px;
+    padding: 7px 10px; border: 1px solid var(--rule); border-radius: 8px;
+    background: #fff; color: var(--ink); outline: none;
+  }
+  #keyword-input:focus { border-color: rgba(52,201,163,.5); }
+  #keyword-search-btn {
+    flex-shrink: 0; width: 32px; border: none; border-radius: 8px;
+    background: var(--mint); color: #fff; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    transition: background .15s;
+  }
+  #keyword-search-btn:hover { background: #2aa88a; }
+  #keyword-search-btn:disabled { opacity: .6; cursor: default; }
+  .side-hint { font-size: 10.8px; color: var(--ink-faint); line-height: 1.5; margin-top: 7px; padding: 0 1px; }
   .side-section { margin-bottom: 18px; padding-top: 14px; border-top: 1px solid var(--rule); }
   .side-section:first-of-type { padding-top: 0; border-top: none; }
   .side-list { display: flex; flex-direction: column; gap: 4px; }
@@ -159,9 +182,34 @@
     display: flex; flex-direction: column; gap: 16px;
     width: 100%; max-width: 1100px; margin: 0 auto;
   }
-  #chat::-webkit-scrollbar { width: 7px; }
-  #chat::-webkit-scrollbar-thumb { background: rgba(255,255,255,.12); border-radius: 999px; }
-  #chat::-webkit-scrollbar-track { background: transparent; }
+  /* 네이티브 스크롤바는 완전히 숨김(.sidebar와 같은 이유 — 아래 .cscroll-* 커스텀 스크롤바로 대체) */
+  #chat { scrollbar-width: none; }
+  #chat::-webkit-scrollbar { display: none; width: 0; }
+
+  /* ---------------- 커스텀 스크롤바(JS로 위치·크기 계산, position:fixed) ----------------
+     브라우저 네이티브 스크롤바(오버레이 모드)가 CSS 폭·색 지정을 무시하는 문제를 근본적으로
+     우회하기 위해, 스크롤 대상(#chat/.sidebar) 위에 완전히 별도의 트랙+섬(thumb) div를
+     그려서 스크롤 위치에 맞춰 JS가 직접 좌표를 갱신한다(2026-11-17). */
+  .cscroll-track {
+    position: fixed;
+    width: 24px;
+    border-radius: 999px;
+    z-index: 80;
+    display: none;
+  }
+  .cscroll-thumb {
+    position: absolute;
+    left: 4px; right: 4px;
+    border-radius: 999px;
+    cursor: pointer;
+    transition: background .15s;
+  }
+  #chat-cscroll { background: rgba(255,255,255,.05); }
+  #chat-cscroll .cscroll-thumb { background: rgba(142,160,181,.8); }
+  #chat-cscroll .cscroll-thumb:hover, #chat-cscroll .cscroll-thumb.dragging { background: rgba(142,160,181,1); }
+  #sidebar-cscroll { background: rgba(27,36,51,.05); }
+  #sidebar-cscroll .cscroll-thumb { background: rgba(107,118,132,.65); }
+  #sidebar-cscroll .cscroll-thumb:hover, #sidebar-cscroll .cscroll-thumb.dragging { background: rgba(107,118,132,.9); }
 
   .msg-row { display: flex; gap: 9px; max-width: min(860px, 92%); animation: fadeIn .22s ease; }
   .msg-row.user { align-self: flex-end; flex-direction: row-reverse; }
@@ -206,6 +254,22 @@
   }
   .retry-btn:hover { background: var(--danger-soft); }
 
+  /* 답변 전체·건별 상세(1번째/2번째 건...) 각각을 따로 복사할 수 있는 버튼(2026-11-18,
+     실사용 피드백) — align-self로 부모가 flex-column이든 row든 늘어나지 않고 내용 크기만큼만
+     차지하게 고정한다. */
+  .copy-btn {
+    display: inline-flex; align-items: center; gap: 4px;
+    align-self: flex-start; flex-shrink: 0;
+    background: transparent; border: 1px solid rgba(255,255,255,.14);
+    color: var(--ink-dark-soft); border-radius: 7px; padding: 4px 9px;
+    font-size: 11px; font-family: inherit; cursor: pointer;
+    transition: background .15s, border-color .15s, color .15s;
+  }
+  .copy-btn svg { flex-shrink: 0; }
+  .copy-btn:hover { background: rgba(255,255,255,.07); border-color: rgba(255,255,255,.28); color: var(--ink-dark); }
+  .copy-btn.copied { color: var(--mint); border-color: rgba(52,201,163,.45); }
+  .copy-btn:disabled { cursor: default; }
+
   .detail-list { display: flex; flex-direction: column; gap: 5px; width: 100%; }
   .detail-row { border: 1px solid rgba(255,255,255,.08); border-radius: 9px; background: rgba(255,255,255,.02); overflow: hidden; }
   .detail-head {
@@ -221,6 +285,8 @@
   .detail-row.open .detail-teaser { visibility: hidden; }
   .detail-body { display: none; padding: 0 12px 11px; font-size: 12.6px; line-height: 1.65; color: var(--ink-dark-soft); }
   .detail-row.open .detail-body { display: block; }
+  .detail-body-row { display: flex; align-items: flex-start; gap: 8px; }
+  .detail-narrative { flex: 1; min-width: 0; }
 
   .sources-label { font-size: 10.5px; color: var(--ink-dark-soft); margin-top: 2px; }
   .sources { display: flex; flex-direction: column; gap: 8px; width: 100%; }
@@ -306,31 +372,32 @@
     border-radius: 8px; font-size: 11px; color: var(--ink-dark-soft); line-height: 1.5; white-space: pre-wrap;
   }
   .attachment-item.open .attachment-preview { display: block; }
-  .attachment-download-link {
-    display: inline-block; margin-top: 8px; font-size: 11px; font-weight: 600;
-    color: var(--mint); text-decoration: none; border: 1px solid rgba(52,201,163,.4);
-    border-radius: 999px; padding: 4px 10px; transition: background .15s, border-color .15s;
-  }
-  .attachment-download-link:hover { background: rgba(52,201,163,.14); border-color: rgba(52,201,163,.6); }
 
   /* 첨부 미리보기 밑 "요약/상세" 토글 — 사전 생성된 짧은 요약이 기본(디폴트)이고,
      사용자가 "상세"를 누르면 그 순간 GPT로 더 자세한 설명을 실시간 생성한다
-     (2026-10-21, 사용자 요청: 요약이 너무 간략해서 더 상세한 내용을 보고 싶을 때). */
+     (2026-10-21, 사용자 요청: 요약이 너무 간략해서 더 자세한 내용을 보고 싶을 때). */
   /* 미리보기(attachment-preview)가 안 펼쳐진 상태에서도 항상 보이고 있어서,
      파일명 칩 바로 밑에 "요약/상세" 버튼만 떠 있는 게 그 자체로 미리보기인 것처럼
      오해를 줄 수 있다는 사용자 지적(2026-10-21) — 칩을 펼쳤을 때만 미리보기
-     내용과 함께 나타나도록 숨김 처리. */
-  .attachment-mode-btns { display: none; gap: 4px; margin-top: 6px; }
+     내용과 함께 나타나도록 숨김 처리. "파일 다운로드"도 같은 줄·같은 크기로 맞춰달라는
+     사용자 요청(2026-11-05)에 따라 이 행(attachment-mode-btns) 안에 같이 넣는다 —
+     경로전용(내용 없음) 첨부는 다운로드 버튼 하나만 이 행에 들어간다. */
+  .attachment-mode-btns { display: none; gap: 4px; margin-top: 6px; flex-wrap: wrap; }
   .attachment-item.open .attachment-mode-btns { display: flex; }
-  .attachment-mode-btn {
+  .attachment-mode-btn, .attachment-download-link {
     font-size: 9.5px; background: transparent; color: var(--ink-dark-soft);
     border: 1px solid rgba(255,255,255,.14); border-radius: 999px; padding: 2px 9px;
     cursor: pointer; font-family: inherit; transition: background .15s, border-color .15s, color .15s;
+    text-decoration: none; display: inline-block;
   }
-  .attachment-mode-btn:hover { border-color: rgba(255,255,255,.3); }
+  .attachment-mode-btn:hover, .attachment-download-link:hover { border-color: rgba(255,255,255,.3); }
   .attachment-mode-btn.active {
     background: rgba(52,201,163,.16); border-color: rgba(52,201,163,.5); color: var(--mint); font-weight: 700;
   }
+  /* 다운로드는 토글(요약/상세)과 달리 "선택 상태"가 아니라 항상 같은 모습의 액션이라,
+     민트 색만 기본으로 줘서 구분되게 한다(토글은 active일 때만 민트). */
+  .attachment-download-link { color: var(--mint); font-weight: 600; border-color: rgba(52,201,163,.4); }
+  .attachment-download-link:hover { background: rgba(52,201,163,.14); border-color: rgba(52,201,163,.6); }
 
   .extracted-table-wrap { overflow-x: auto; margin: 6px 0; }
   .extracted-table { border-collapse: collapse; width: 100%; font-size: 11px; }
@@ -445,6 +512,22 @@
 
       <div class="side-section">
         <div class="sec-title-row">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" style="color:var(--mint)"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.3 15.3 20 20" stroke-linecap="round"/></svg>
+          <h3 class="sec-search">키워드 검색</h3>
+        </div>
+        <div class="side-list">
+          <div class="quick-search-row">
+            <input type="text" id="keyword-input" placeholder="단어나 문구 입력" autocomplete="off">
+            <button id="keyword-search-btn" type="button" aria-label="검색">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.3 15.3 20 20" stroke-linecap="round"/></svg>
+            </button>
+          </div>
+          <div class="side-hint">요약 없이, 입력한 단어가 실제로 포함된 자료를 그대로 찾아 보여줍니다.</div>
+        </div>
+      </div>
+
+      <div class="side-section">
+        <div class="sec-title-row">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" style="color:var(--accent)"><rect x="3" y="3" width="8" height="8" rx="1.5"/><rect x="13" y="3" width="8" height="8" rx="1.5"/><rect x="3" y="13" width="8" height="8" rx="1.5"/><rect x="13" y="13" width="8" height="8" rx="1.5"/></svg>
           <h3 class="sec-menu">빠른 메뉴</h3>
         </div>
@@ -491,6 +574,9 @@
     </div>
   </div>
 
+  <div class="cscroll-track" id="chat-cscroll"><div class="cscroll-thumb" id="chat-cscroll-thumb"></div></div>
+  <div class="cscroll-track" id="sidebar-cscroll"><div class="cscroll-thumb" id="sidebar-cscroll-thumb"></div></div>
+
 <script>
 let sessionId = null;
 let composing = false;
@@ -508,6 +594,78 @@ const recentListEl = document.getElementById("recent-list");
 const sidebarEl = document.getElementById("sidebar");
 const sidebarBackdropEl = document.getElementById("sidebar-backdrop");
 const menuToggleEl = document.getElementById("menu-toggle");
+const keywordInputEl = document.getElementById("keyword-input");
+const keywordSearchBtnEl = document.getElementById("keyword-search-btn");
+
+// 브라우저 네이티브 스크롤바(오버레이 모드)가 CSS 폭·색 지정을 무시해서 아무리 굵게
+// 키워도 화면엔 얇게 나오는 문제(2026-11-17 실사용 확인) — 네이티브 스크롤바는 완전히
+// 숨기고, position:fixed인 트랙+섬(thumb) div를 JS가 스크롤 위치에 맞춰 직접 그린다.
+function setupCustomScrollbar(scrollEl, track, thumb, extraVisibilityCheck) {
+  let dragging = false, dragStartY = 0, dragStartTop = 0;
+
+  function layout() {
+    // position:fixed 요소(모바일 드로어의 .sidebar)는 Chrome 스펙상 offsetParent가
+    // 항상 null이라 그 체크를 못 씀 — extraVisibilityCheck가 주어지면 그걸 전적으로 신뢰한다.
+    const visible = extraVisibilityCheck
+      ? extraVisibilityCheck()
+      : getComputedStyle(scrollEl).display !== "none" && scrollEl.offsetParent !== null;
+    if (!visible || scrollEl.scrollHeight <= scrollEl.clientHeight + 1) {
+      track.style.display = "none";
+      return;
+    }
+    const rect = scrollEl.getBoundingClientRect();
+    track.style.display = "block";
+    track.style.top = rect.top + "px";
+    track.style.left = (rect.right - track.offsetWidth - 3) + "px";
+    track.style.height = rect.height + "px";
+    const trackH = track.clientHeight;
+    const thumbH = Math.max(30, (scrollEl.clientHeight / scrollEl.scrollHeight) * trackH);
+    const maxTop = trackH - thumbH;
+    const range = scrollEl.scrollHeight - scrollEl.clientHeight;
+    const ratio = range > 0 ? scrollEl.scrollTop / range : 0;
+    thumb.style.height = thumbH + "px";
+    thumb.style.top = (ratio * maxTop) + "px";
+  }
+
+  scrollEl.addEventListener("scroll", layout);
+  window.addEventListener("resize", layout);
+  scrollEl.addEventListener("transitionend", layout);
+  new MutationObserver(layout).observe(scrollEl, { childList: true, subtree: true, characterData: true, attributes: true });
+  new MutationObserver(layout).observe(shellEl, { attributes: true, attributeFilter: ["class"] });
+
+  thumb.addEventListener("mousedown", (e) => {
+    dragging = true;
+    dragStartY = e.clientY;
+    dragStartTop = scrollEl.scrollTop;
+    thumb.classList.add("dragging");
+    document.body.style.userSelect = "none";
+    e.preventDefault();
+  });
+  track.addEventListener("mousedown", (e) => {
+    if (e.target === thumb) return;
+    const rect = track.getBoundingClientRect();
+    const clickRatio = (e.clientY - rect.top) / rect.height;
+    scrollEl.scrollTop = clickRatio * (scrollEl.scrollHeight - scrollEl.clientHeight);
+  });
+  window.addEventListener("mousemove", (e) => {
+    if (!dragging) return;
+    const trackH = track.clientHeight;
+    const thumbH = thumb.clientHeight;
+    const maxTop = trackH - thumbH;
+    if (maxTop <= 0) return;
+    const range = scrollEl.scrollHeight - scrollEl.clientHeight;
+    scrollEl.scrollTop = dragStartTop + ((e.clientY - dragStartY) / maxTop) * range;
+  });
+  window.addEventListener("mouseup", () => {
+    if (!dragging) return;
+    dragging = false;
+    thumb.classList.remove("dragging");
+    document.body.style.userSelect = "";
+  });
+
+  layout();
+  return layout;
+}
 
 const DETAIL_TEASER_LEN = 42;
 const RECENT_LIMIT = 5;
@@ -690,22 +848,17 @@ function buildSourceChip(s, orgGroupMeta, opts) {
       renderRichText(attPreview, att.미리보기);
       item.appendChild(attPreview);
 
-      // 내용은 안 보여주기로 한 자료(테이블/SQL 정보성)는 요약 대신 파일 자체를
-      // 내려받을 수 있는 링크를 추가로 보여준다 — 이런 자료는 내용 자체가 없으므로
-      // "상세" 버튼도 의미가 없어 추가하지 않는다.
-      if (att.파일경로) {
-        const downloadLink = document.createElement("a");
-        downloadLink.className = "attachment-download-link";
-        downloadLink.href = `/attachment-download?file_path=${encodeURIComponent(att.파일경로)}&display_name=${encodeURIComponent(att.첨부파일명 || "")}`;
-        downloadLink.textContent = "파일 다운로드";
-        downloadLink.addEventListener("click", (e) => e.stopPropagation());
-        attPreview.appendChild(downloadLink);
-      } else {
+      // 요약/상세 토글과 다운로드 링크를 한 행(modeBtns)에 같이 담는다 — 둘 다 같은
+      // 줄·같은 크기로 보이길 원한다는 사용자 요청(2026-11-05). 경로전용(내용 없는
+      // SQL/카탈로그성) 첨부는 토글 없이 다운로드만, 일반 첨부는 토글+(파일경로 있으면)
+      // 다운로드까지 같이 들어갈 수 있다.
+      const modeBtns = document.createElement("div");
+      modeBtns.className = "attachment-mode-btns";
+
+      if (!att.경로전용) {
         // "요약"(기본, 사전 생성)/"상세"(클릭 시 실시간 생성) 토글 — 상세는 처음 누를
         // 때만 서버에 요청하고 결과를 캐시해 재조회하지 않는다("이력 보기" 버튼과 동일
         // 패턴). 요약으로 돌아가면 다시 렌더링 없이 원래 미리보기를 그대로 보여준다.
-        const modeBtns = document.createElement("div");
-        modeBtns.className = "attachment-mode-btns";
         const summaryBtn = document.createElement("button");
         summaryBtn.className = "attachment-mode-btn active";
         summaryBtn.type = "button";
@@ -716,7 +869,6 @@ function buildSourceChip(s, orgGroupMeta, opts) {
         detailBtn.textContent = "상세";
         modeBtns.appendChild(summaryBtn);
         modeBtns.appendChild(detailBtn);
-        item.appendChild(modeBtns);
 
         const summaryText = att.미리보기;
         let detailText = null;
@@ -757,6 +909,22 @@ function buildSourceChip(s, orgGroupMeta, opts) {
             renderRichText(attPreview, detailText);
           }
         });
+      }
+
+      // 파일경로가 있으면(경로전용·일반 첨부 모두) 원본 다운로드 링크를 같은 행에
+      // 추가한다. attPreview 안에 넣으면 위 토글의 renderRichText가 매번
+      // attPreview.innerHTML을 통째로 지워서 같이 사라지므로, modeBtns(item 직속)에 붙인다.
+      if (att.파일경로) {
+        const downloadLink = document.createElement("a");
+        downloadLink.className = "attachment-download-link";
+        downloadLink.href = `/attachment-download?file_path=${encodeURIComponent(att.파일경로)}&display_name=${encodeURIComponent(att.첨부파일명 || "")}`;
+        downloadLink.textContent = "파일 다운로드";
+        downloadLink.addEventListener("click", (e) => e.stopPropagation());
+        modeBtns.appendChild(downloadLink);
+      }
+
+      if (modeBtns.children.length > 0) {
+        item.appendChild(modeBtns);
       }
 
       attChip.addEventListener("click", (e) => {
@@ -889,7 +1057,10 @@ function renderHistoryTable(container, items) {
   table.className = "extracted-table history-table";
 
   // 칼럼폭을 미리 고정해둔다(table-layout:fixed는 내용이 아니라 이 비율만 본다) —
-  // 신청일(짧은 고정 길이)·원본ID(고정 길이)는 좁게, 사업명(가변 길이)은 넓게.
+  // 신청일(짧은 고정 길이)·원본ID(고정 길이)는 좁게, 요청구분(가변 길이)은 넓게.
+  // 사업명 대신 요청구분을 보여주는 이유: 같은 기관의 반복 계약은 사업명이 전부 동일해서
+  // (예: 한국환경공단 83건 전부 "수입통계자료 제공 서비스 계약") 목록만 봐서는 어떤 행이
+  // 어떤 건인지 구분이 안 되는데, 요청구분은 건별로 거의 다 다르다(2026-11-05 사용자 제보).
   const colgroup = document.createElement("colgroup");
   [13, 63, 24].forEach(pct => {
     const col = document.createElement("col");
@@ -900,7 +1071,7 @@ function renderHistoryTable(container, items) {
 
   const thead = document.createElement("thead");
   const headRow = document.createElement("tr");
-  ["신청일", "사업명", "원본ID"].forEach(h => {
+  ["신청일", "요청구분", "원본ID"].forEach(h => {
     const th = document.createElement("th");
     th.textContent = h;
     headRow.appendChild(th);
@@ -912,7 +1083,7 @@ function renderHistoryTable(container, items) {
   items.forEach(it => {
     const tr = document.createElement("tr");
     tr.className = "history-row";
-    [it.신청일 || "-", it.사업명 || "-", it.원본ID].forEach((v, idx) => {
+    [it.신청일 || "-", it.요청구분 || "-", it.원본ID].forEach((v, idx) => {
       const td = document.createElement("td");
       if (idx === 2) {
         // 원본ID 칸에 클릭 가능 표시(chevron) 추가 — 행 전체가 클릭 영역이라
@@ -1064,6 +1235,48 @@ function pushRecentQuestion(q, rowEl) {
   renderRecentList();
 }
 
+// 답변 전체 또는 건별 상세(1번째/2번째 건...) 하나만 클립보드로 복사하는 버튼(2026-11-18,
+// 실사용 피드백). getText는 클릭 시점에 복사할 텍스트를 반환하는 함수 — DOM 생성 시점에
+// 텍스트를 미리 고정하지 않고 클로저로 늦게 평가해, 나중에 내용이 바뀌어도 안전하다.
+function createCopyButton(getText) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "copy-btn";
+  btn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg><span>복사</span>';
+  btn.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    const text = getText();
+    let ok = true;
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch (err) {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+      } catch (err2) {
+        ok = false;
+      }
+    }
+    const label = btn.querySelector("span");
+    const original = label.textContent;
+    label.textContent = ok ? "복사됨" : "복사 실패";
+    btn.classList.toggle("copied", ok);
+    btn.disabled = true;
+    setTimeout(() => {
+      label.textContent = original;
+      btn.classList.remove("copied");
+      btn.disabled = false;
+    }, 1400);
+  });
+  return btn;
+}
+
 function addMessage(role, text, sources, isError, retryQuestion, details) {
   const row = document.createElement("div");
   const hasEvidence = (sources && sources.length > 0) || (details && details.length > 0);
@@ -1081,6 +1294,22 @@ function addMessage(role, text, sources, isError, retryQuestion, details) {
   bubble.className = "bubble" + (isError ? " error" : "");
   bubble.textContent = text;
   col.appendChild(bubble);
+
+  // 답변 전체 복사 — 에러 메시지("다시 시도" 버튼이 뜨는 경우)는 복사할 실제 답변이
+  // 아니므로 제외, 사용자 메시지는 이미 화면에 그대로 보이므로 대상 아님. 건별 상세
+  // (1번째 건/2번째 건...)가 있으면 각 건을 펼쳐보지 않아도 요약 밑에 함께 복사되도록,
+  // 화면에 보이는 축약 티저가 아니라 전체 narrative를 이어 붙인다(실사용 피드백 2026-11-18
+  // — "안에 들어가서 보는 내용까지는 필요 없다"는 근거자료 카드는 빼고 서술 텍스트만).
+  // 근거자료가 하나도 없는 메시지("관련 이력을 찾지 못했습니다" 류 거절·안내, 첫 인사말
+  // 등)는 애초에 복사할 실질 내용이 없으니 버튼 자체를 안 보여준다(실사용 피드백,
+  // 2026-11-18 — "찾지 못했다 같은 건 복사 버튼이 안 보여도 되지 않냐").
+  if (role === "bot" && !isError && hasEvidence) {
+    col.appendChild(createCopyButton(() => {
+      if (!details || details.length === 0) return text;
+      const detailText = details.map(d => `${d.label}: ${d.narrative}`).join("\n\n");
+      return text + "\n\n" + detailText;
+    }));
+  }
 
   if (isError && retryQuestion) {
     const retryBtn = document.createElement("button");
@@ -1126,9 +1355,16 @@ function addMessage(role, text, sources, isError, retryQuestion, details) {
       const body = document.createElement("div");
       body.className = "detail-body";
 
+      const narrativeRow = document.createElement("div");
+      narrativeRow.className = "detail-body-row";
+
       const narrative = document.createElement("div");
+      narrative.className = "detail-narrative";
       narrative.textContent = d.narrative;
-      body.appendChild(narrative);
+      narrativeRow.appendChild(narrative);
+      narrativeRow.appendChild(createCopyButton(() => d.narrative));
+
+      body.appendChild(narrativeRow);
 
       if (d.source) {
         const srow = buildSourceChip(d.source);
@@ -1252,6 +1488,75 @@ questionEl.addEventListener("keydown", (e) => {
   }
 });
 
+// 한글 마지막 글자의 받침 유무로 조사를 고른다(2026-11-12, 배치 테스트 중 "통관가"/
+// "지식재산권가"처럼 받침 있는 단어에 받침 없는 조사가 붙는 어색한 표현 발견) — ㄹ받침은
+// "으로"가 아니라 "로"를 쓰는 예외도 반영. 한글이 아닌 글자(영문/숫자)로 끝나면 받침 없는
+// 쪽을 기본값으로 쓴다.
+function koreanJosa(word, withBatchim, withoutBatchim) {
+  const ch = (word || "").trim().slice(-1);
+  const code = ch.charCodeAt(0);
+  if (code >= 0xAC00 && code <= 0xD7A3) {
+    const finalCode = (code - 0xAC00) % 28;
+    if (finalCode === 0) return withoutBatchim;
+    if (withBatchim === "으로" && finalCode === 8) return "로"; // ㄹ받침 예외
+    return withBatchim;
+  }
+  return withoutBatchim;
+}
+
+// "빠른 검색" — 자연어 질문분석·답변 생성 LLM을 전혀 거치지 않고, 입력한 단어가 실제로
+// 포함된 자료를 그대로 /keyword-search로 조회해 소스카드로 보여준다(2026-11-12).
+async function callKeywordSearch(keyword) {
+  keywordSearchBtnEl.disabled = true;
+  addTyping();
+  try {
+    const params = new URLSearchParams({ keyword });
+    if (currentMenuScope) params.set("menu_scope", currentMenuScope);
+    const resp = await fetch("/keyword-search?" + params.toString());
+    removeTyping();
+
+    if (!resp.ok) {
+      addMessage("bot", `오류가 발생했습니다. (HTTP ${resp.status})`, null, true);
+      return;
+    }
+
+    const data = await resp.json();
+    let text;
+    if (data.count === 0) {
+      text = `"${keyword}"${koreanJosa(keyword, "이", "가")} 포함된 자료를 찾지 못했습니다.`;
+    } else if (data.keyword !== keyword) {
+      text = `"${keyword}"${koreanJosa(keyword, "으로", "로")}는 찾지 못해 "${data.keyword}"${koreanJosa(data.keyword, "으로", "로")} 좁혀 찾았습니다. 총 ${data.count}건입니다.`;
+    } else {
+      text = `"${data.keyword}"${koreanJosa(data.keyword, "이", "가")} 포함된 자료 ${data.count}건을 찾았습니다.`;
+    }
+    if (data.truncated) text += " (검색 상한에 걸려 더 있을 수 있습니다)";
+    addMessage("bot", text, data.sources);
+  } catch (err) {
+    removeTyping();
+    addMessage("bot", "서버에 연결할 수 없습니다.", null, true);
+  } finally {
+    keywordSearchBtnEl.disabled = false;
+  }
+}
+
+function sendKeywordSearch() {
+  if (keywordSearchBtnEl.disabled) return;
+  const keyword = keywordInputEl.value.trim();
+  if (!keyword) return;
+  const row = addMessage("user", `키워드 검색: ${keyword}`);
+  pushRecentQuestion(`키워드 검색: ${keyword}`, row);
+  keywordInputEl.value = "";
+  callKeywordSearch(keyword);
+}
+
+keywordSearchBtnEl.addEventListener("click", sendKeywordSearch);
+keywordInputEl.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    sendKeywordSearch();
+  }
+});
+
 menuToggleEl.addEventListener("click", () => shellEl.classList.toggle("sidebar-open"));
 sidebarBackdropEl.addEventListener("click", closeSidebarOnMobile);
 
@@ -1260,6 +1565,19 @@ renderFaqList();
 renderRecentList();
 
 addMessage("bot", "안녕하세요. 이력관리시스템 챗봇입니다. 기관명, 연도, 담당자·요청자, 심의결과 등으로 이력을 검색할 수 있습니다. 왼쪽 메뉴에서 범위를 고르시거나, 궁금한 점을 바로 입력해보세요.");
+
+const chatScrollLayout = setupCustomScrollbar(
+  chatEl,
+  document.getElementById("chat-cscroll"),
+  document.getElementById("chat-cscroll-thumb"),
+);
+const sidebarScrollLayout = setupCustomScrollbar(
+  sidebarEl,
+  document.getElementById("sidebar-cscroll"),
+  document.getElementById("sidebar-cscroll-thumb"),
+  () => window.innerWidth > 720 || shellEl.classList.contains("sidebar-open"),
+);
+setTimeout(() => { chatScrollLayout(); sidebarScrollLayout(); }, 300);
 </script>
 </body>
 </html>

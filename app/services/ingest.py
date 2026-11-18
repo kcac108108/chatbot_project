@@ -22,6 +22,28 @@ def _point_id(data_type: str, source_id) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{data_type}:{source_id}"))
 
 
+# 로그에 ID 목록까지 통째로 찍어도 괜찮은 상한 — 매일 도는 증분 적재는 보통 수십 건
+# 이하라 ID까지 다 찍어도 안전하지만, since=None(전체 재적재, 900건+)까지 똑같이
+# 찍으면 로그가 과도하게 커진다. 2026-11-06, 운영 담당자가 "CHUNK_COUNT 숫자 하나만
+# 보고는 이게 정확히 뭘 가리키는지 알 수가 없다"고 지적 — 기존엔 총 개수만 남기고
+# 어떤 데이터유형·어떤 원본ID가 포함됐는지는 로그에 전혀 안 남아, 매번 Oracle 여러
+# 테이블을 역산해서 맞춰봐야 했다. 이제는 그 역산 없이 로그만 보고 바로 확인 가능.
+_CHUNK_LOG_ID_LIMIT = 200
+
+
+def _log_chunk_breakdown(chunks: list[dict]) -> None:
+    by_type: dict[str, list] = {}
+    for c in chunks:
+        meta = c["metadata"]
+        by_type.setdefault(meta["데이터유형"], []).append(meta["원본ID"])
+
+    for data_type, ids in by_type.items():
+        if len(ids) <= _CHUNK_LOG_ID_LIMIT:
+            print(f"[ingest] {data_type} {len(ids)}건: {ids}")
+        else:
+            print(f"[ingest] {data_type} {len(ids)}건 (대량 처리라 ID 목록은 생략)")
+
+
 def _collect_all_chunks(since: datetime | None = None) -> list[dict]:
     params = {"since": since}
     chunks: list[dict] = []
@@ -39,6 +61,7 @@ def run_ingest(since: datetime | None = None) -> int:
     증분 스케줄과 뒤섞이면 안 된다."""
     ensure_collection()
     chunks = _collect_all_chunks(since)
+    _log_chunk_breakdown(chunks)
 
     total = 0
     for i in range(0, len(chunks), BATCH_SIZE):

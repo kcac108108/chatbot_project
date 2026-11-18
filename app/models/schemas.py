@@ -4,11 +4,18 @@ from pydantic import BaseModel, Field
 
 DATA_TYPES = Literal["기관정보", "신청이력", "외부요청", "내부자료", "심의위원회"]
 
+# /chat과 /keyword-search가 공유하는 메뉴 스코프 타입 — 전에는 ChatRequest에만 인라인으로
+# 정의돼 있었는데, /keyword-search 엔드포인트가 평범한 str 매개변수로 받고 있어서 잘못된
+# 값("존재하지않는스코프" 등)이 들어와도 조용히 "스코프 없음(전체 검색)"으로 새는 걸
+# 실측 확인(2026-11-12) — /chat은 이 타입으로 검증돼 422로 걸러지는데 /keyword-search만
+# 예외였음. 하나로 공유해 두 엔드포인트가 항상 같은 검증을 받도록 한다.
+MenuScope = Literal["기관별 사업정보", "외부요청", "내부자료", "심의위원회", "첨부파일"]
+
 
 class ChatRequest(BaseModel):
     question: str
     session_id: Optional[str] = None
-    menu_scope: Optional[Literal["기관별 사업정보", "외부요청", "내부자료", "심의위원회", "첨부파일"]] = Field(
+    menu_scope: Optional[MenuScope] = Field(
         None, description="사용자가 웹 화면에서 특정 메뉴로 범위를 고정한 경우. 미지정(전체)이면 null."
         "'첨부파일'은 메뉴가 아니라 5개 메뉴의 첨부내용 전체를 가로질러 검색하는 전용 범위"
     )
@@ -23,6 +30,10 @@ class RelatedAttachment(BaseModel):
     첨부파일명: str
     미리보기: str
     파일경로: Optional[str] = None
+    # 경로전용(SQL/카탈로그성 — 내용 자체가 없음)인지. 다운로드 링크는 파일경로 유무로
+    # 뜨지만, "요약/상세" 토글은 내용이 실제로 있을 때만 의미가 있어 따로 구분이 필요하다
+    # (2026-11-05, 일반 첨부도 다운로드를 지원하면서 둘을 같이 보여줄 수 있게 됨).
+    경로전용: bool = False
 
 
 class AttachmentDetailResponse(BaseModel):
@@ -32,7 +43,12 @@ class AttachmentDetailResponse(BaseModel):
 class HistoryItem(BaseModel):
     원본ID: str
     신청일: Optional[str] = None
-    사업명: Optional[str] = None
+    # "이력 보기" 목록에서 각 건을 구분하는 용도라 사업명이 아니라 요청구분을 쓴다 — 같은
+    # 기관의 반복 계약은 사업명이 전부 동일(예: 한국환경공단 83건 전부 "수입통계자료 제공
+    # 서비스 계약")해서 사업명만으론 목록에서 어떤 행이 어떤 건인지 구분이 안 되는데,
+    # 요청구분은 건별로 거의 다 다르다(같은 83건에서 요청구분은 80종, 2026-11-05 사용자
+    # 스크린샷 제보로 발견).
+    요청구분: Optional[str] = None
 
 
 class OrganizationHistoryResponse(BaseModel):
@@ -46,6 +62,17 @@ class SourceItem(BaseModel):
     미리보기: Optional[str] = None
     세부항목: list[DetailField] = Field(default_factory=list)
     관련첨부: list[RelatedAttachment] = Field(default_factory=list)
+
+
+# "빠른 검색" — 자연어 질문분석(LLM 키워드 추출·답변 종합) 없이, 사용자가 입력한 단어를
+# 그대로 본문 전수 스캔해 매칭된 자료를 보여주는 기능(2026-11-12, 사용자 제안). 지금까지
+# 발견된 버그의 양대 축이 "LLM이 자연어에서 키워드를 잘못 뽑는 것"과 "검색은 맞았는데
+# 답변 생성 LLM이 종합하다가 지어내는 것"이었는데, 둘 다 건너뛰어 원천적으로 제거한다.
+class KeywordSearchResponse(BaseModel):
+    keyword: str = Field(description="실제로 검색에 쓰인 키워드 — 필러 제거·narrow 축소를 거쳤으면 사용자 입력과 다를 수 있다")
+    count: int = 0
+    truncated: bool = Field(False, description="검색 상한에 걸려 더 있을 수 있음")
+    sources: list[SourceItem] = Field(default_factory=list)
 
 
 class AnswerDetail(BaseModel):

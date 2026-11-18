@@ -7,8 +7,12 @@ from pydantic import BaseModel
 
 from app.core.config import OPENAI_API_KEY, OPENAI_CHAT_MODEL, OPENAI_EMBEDDING_MODEL, SSL_CERT_PATH
 
-# MonitorApp TLS 인터셉션 대응 — httpx는 SSL_CERT_FILE 환경변수를 자동으로 읽지 않아 명시 필요
-_http_client = httpx.Client(verify=SSL_CERT_PATH) if SSL_CERT_PATH else None
+# MonitorApp TLS 인터셉션 대응 — httpx는 SSL_CERT_FILE 환경변수를 자동으로 읽지 않아 명시 필요.
+# http_client를 None으로 넘기면 openai SDK가 내부적으로 자체 기본 클라이언트를 만드는데,
+# 이 과정이 openai==1.51.0 + httpx==0.28.1 조합에서 깨진다(httpx가 구버전 방식의 proxies
+# 인자 지원을 없앴음 — 2026-10-29, SSL_CERT_FILE이 비어있는 운영 환경에서 처음 발견된 크래시).
+# 항상 직접 만든 httpx.Client를 넘겨 그 깨진 내부 경로 자체를 타지 않도록 한다.
+_http_client = httpx.Client(verify=SSL_CERT_PATH) if SSL_CERT_PATH else httpx.Client()
 _client = OpenAI(api_key=OPENAI_API_KEY, http_client=_http_client)
 
 

@@ -4,7 +4,7 @@ import re
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 
 from app.core.config import ATTACHMENT_BASE_DIR, CHAT_REQUEST_TIMEOUT_SECONDS
@@ -12,6 +12,8 @@ from app.models.schemas import (
     AttachmentDetailResponse,
     ChatRequest,
     ChatResponse,
+    KeywordSearchResponse,
+    MenuScope,
     OrganizationHistoryResponse,
     SourceItem,
 )
@@ -37,6 +39,14 @@ async def chat(request: ChatRequest) -> ChatResponse:
     except asyncio.TimeoutError:
         logger.warning("chat 요청 타임아웃(%s초 초과): session_id=%s", CHAT_REQUEST_TIMEOUT_SECONDS, session_id)
         return ChatResponse(session_id=session_id, answer=chat_service.REQUEST_TIMEOUT_ANSWER, sources=[])
+
+
+# "빠른 검색" — 사이드바 입력창에서 사용자가 직접 입력한 단어를 자연어 질문분석 없이
+# 그대로 전수 스캔해 매칭된 자료를 보여준다(2026-11-12). LLM 호출(질문분석·답변생성)이
+# 전혀 없어 /chat과 달리 전체 제한시간을 걸 필요가 없다 — Qdrant 스캔만 하는 가벼운 요청.
+@router.get("/keyword-search", response_model=KeywordSearchResponse)
+def keyword_search(keyword: str, menu_scope: MenuScope | None = None) -> KeywordSearchResponse:
+    return chat_service.keyword_search(keyword, menu_scope)
 
 
 # 기관정보 카드의 "이력 보기" 버튼 — 그 기관의 신청이력 전체를 top-K 제한 없이, LLM 서술
@@ -91,3 +101,17 @@ def download_attachment(file_path: str, display_name: str | None = None) -> File
     if display_name and Path(display_name).suffix.lower() == Path(filename).suffix.lower():
         download_name = display_name
     return FileResponse(local_path, filename=download_name)
+
+
+# ⚠️ 임시 진단용(2026-11-17) — 장명근 피드백 "메뉴별 대화 메모리" 가능 여부를 검토하다가,
+# 로그인 없이 IP로라도 사용자를 구분하는 방안이 나왔는데 그 전제(아파치 리버스 프록시가
+# 실제 클라이언트 IP를 우리 쪽에 넘겨주는지)부터 확인이 필요해서 추가함. 읽기 전용,
+# 데이터 변경·저장 전혀 없음 — 서로 다른 PC에서 열어봐서 값이 PC별로(그 PC의 실제 사설
+# IP와 일치하게) 다르게 나오면 정상 전달되는 것. 확인 끝나면 지워도 무방.
+@router.get("/debug-client-ip")
+def debug_client_ip(request: Request) -> dict:
+    return {
+        "x_forwarded_for": request.headers.get("x-forwarded-for"),
+        "x_real_ip": request.headers.get("x-real-ip"),
+        "client_host": request.client.host if request.client else None,
+    }
