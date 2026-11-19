@@ -825,15 +825,33 @@ def _is_non_name_token(name: str) -> bool:
 # 경우는 사실상 없어(전송방식/제공주기처럼 진짜 의미 있는 경우는 2026-10-27에 이미 별도
 # 구조화 필드로 분리돼 이 필러 목록과 무관하게 처리됨), 기존 "내용/관련/자료" 등과 같은
 # 원리로 안전하게 추가한다.
+# "파일"도 같은 성격이다 — "교부내역(수정본) 파일 있어?"에서 "파일"이 안 걸러지면 복구된
+# 키워드가 "교부내역(수정본) 파일"이 되는데, 실제 첨부 청크 본문·헤더엔 파일명 바로 뒤에
+# "파일"이라는 글자가 절대 안 붙어있어(헤더는 "[...../ 교부내역(수정본).xlsx] (N/M번째
+# 조각)" 형식) 리터럴 매칭이 깨짐 — "교부내역(수정본)"만 남으면 정확히 매칭되는 걸 직접
+# 확인(2026-11-19, 신지원 피드백 "외부요청 메뉴에 존재하는 파일로 검색했으나 실패" 재현).
 _KEYWORD_FILLER_WORDS = {
     "내용", "관련", "자료", "있는", "있어", "것", "건", "거", "방식", "방법", "사례", "경우",
+    "파일",
 }
 
 
 def _strip_keyword_filler(keyword: str) -> str:
     tokens = keyword.split()
-    while len(tokens) > 1 and tokens[-1] in _KEYWORD_FILLER_WORDS:
-        tokens.pop()
+    while len(tokens) > 1:
+        last = tokens[-1]
+        bare = last
+        # "파일을"/"파일이"처럼 조사가 붙은 꼴도 같은 필러로 인식한다 — "~ 파일을
+        # 찾아주세요" 같은 직접 질의형 재작성에서 흔히 조사가 그대로 붙어 나오는데,
+        # 기존 정확 일치 비교로는 이걸 못 걸러낸다(위 같은 재현에서 "zip 파일을"로 확인).
+        for particle in _TRAILING_PARTICLES_FOR_GENERIC_CHECK:
+            if bare.endswith(particle) and len(bare) > len(particle):
+                bare = bare[: -len(particle)]
+                break
+        if bare in _KEYWORD_FILLER_WORDS:
+            tokens.pop()
+        else:
+            break
     return " ".join(tokens)
 
 
@@ -873,10 +891,30 @@ _CONTENT_ABOUT_CLAUSE_RE = re.compile(
 # 투자진흥공사 2026 글로벌공급망팀 청구내역 알려줘"류 "기관+연도+세부항목명+알려줘"
 # 질문에서 세부항목명이 키워드로 안 뽑히고 통째로 버려짐). "관련" 패턴과 동일하게
 # 문장 끝의 어미(알려줘/보여줘/무엇인가요 등)만 앵커로 삼고 그 앞 구절을 복구한다.
+# "찾아줘"(찾기 요청)·"있나요"(존재확인)는 특히 파일/첨부를 지목해서 검색하는 질문에서
+# "알려줘"/"보여줘"보다 더 자연스럽게 쓰이는데도 기존 어미 목록에 전혀 없어서, 키워드
+# 복구 자체가 안 되고 그대로 버려지는 문제가 실측 확인됨(2026-11-19 — 팀원이 "외부요청
+# 메뉴에 존재하는 파일로 검색했는데 못 찾는다"고 제보한 걸 "통계자료교부대장.zip 찾아줘"/
+# "교부내역 수정본 파일 있어?"로 재현, 둘 다 filters.키워드=None으로 완전히 빈 채 버려짐
+# 확인). "알려줘"/"보여줘"와 같은 어미 그룹에 "찾아줘"·존재확인 표현들을 추가한다.
+# 실제 파일명을 그대로 묻는 질문엔 확장자 구분용 마침표(".zip"/".xlsx")나 하이픈·물결표가
+# 흔히 들어가는데, 기존 문자 클래스엔 이게 전혀 없어서 "교부대장.zip을 찾아주세요"가
+# 마침표 앞에서 캡처가 끊겨 "zip을"만 복구되는(정작 의미 있는 "교부대장" 부분은 버려지는)
+# 문제도 같은 재현에서 확인됨 — 문자 클래스에 ".~-"를 추가한다.
+# 1차 수정 범위를 사용자가 재확인("찾아줘/있어 는 언제든지 물어볼수도 있는 단어")하는
+# 과정에서 "있어?"(요 없이 반말로 묻는 가장 흔한 형태)가 어미 목록에 아예 빠져있던 걸
+# 추가로 발견(직접 테스트: "있어요/있나요"만 되고 "있어?"는 안 됨) — "있어"를 포함해
+# "없어?"(부정형으로 같은 뜻을 묻는 경우)·"검색해줘"·"찾아봐"(캐주얼 명령형)·"확인해줘"·
+# "있니/없니"(반말 의문형)까지 같은 자리에서 한꺼번에 보강한다.
 _CONTENT_DIRECT_CLAUSE_RE = re.compile(
-    r"([가-힣A-Za-z0-9/·()\s]{2,40}?)\s*(?:은|는|이|가)?\s*"
+    r"([가-힣A-Za-z0-9/·()\s.~-]{2,40}?)\s*(?:은|는|이|가)?\s*"
     r"(?:무엇인가요|무엇입니까|뭐예요|뭔가요|뭐야|"
-    r"알려\s*(?:줘|주세요|줄래요?|주실래요?)|보여\s*(?:줘|주세요))\s*[?!.]*$"
+    r"알려\s*(?:줘|주세요|줄래요?|주실래요?)|보여\s*(?:줘|주세요)|"
+    r"찾아\s*(?:줘|주세요|줄래요?|주실래요?|봐)|"
+    r"검색\s*해\s*(?:줘|주세요|줄래요?|주실래요?)|"
+    r"확인\s*해\s*(?:줘|주세요|줄래요?|주실래요?)|"
+    r"있나요|있어요|있습니까|있나|있는지|있어|있니|"
+    r"없나요|없어요|없습니까|없나|없는지|없어|없니)\s*[?!.]*$"
 )
 # "그거 말고 2018년 거는 두 개던데 둘 다 보여줘"처럼 직전 턴에 보여준 특정 레코드를
 # 가리키며 "그거 말고 다른 걸 보여줘" 식으로 이어가는 순수 지시대명사+제외+분류사 질문은,
@@ -1145,7 +1183,71 @@ _NARROW_KEYWORD_MAX_HITS = 200
 _NARROW_SUFFIX_FALLBACK_MAX_HITS = 30
 
 
-def _narrow_keyword_to_match(keyword: str, data_types: set[str] | None = None) -> str:
+def _distinct_doc_count(hits: list[dict]) -> int:
+    """narrow의 "너무 흔한 단어인가" 판정은 원래 "이 단어가 전혀 무관한 서로 다른 문서
+    여러 개에 걸쳐 흔하게 등장하는가"를 보려는 것인데, 지금까지는 `scan_text_contains`가
+    반환한 raw 청크(조각) 개수를 그대로 그 신호로 썼다. 그런데 외부요청 첨부 중 통계자료
+    교부대장류 엑셀/zip은 행이 수천 개라 한 파일이 600~800개 조각으로 쪼개지는 경우가
+    실제로 있고, 그 파일의 헤더(고유한 파일명)는 조각마다 똑같이 반복돼 자기 자신의 정확한
+    파일명만으로도 조각 수만큼(최대 상한까지) "히트"가 쌓인다 — 서로 다른 문서에 흔한
+    단어라서가 아니라, 문서 하나가 원래 그렇게 쪼개져 있을 뿐인데도 "너무 흔해서 거절"
+    판정에 걸려버리는 문제가 실측 확인됨(2026-11-19, 신지원 피드백 "외부요청 메뉴에
+    존재하는 파일로 검색했으나 실패" 재현 — "통계자료교부대장"이 정확히 그 파일 하나만의
+    조각 30개로 상한에 걸려 거절됨). (데이터유형, 원본ID) 조합으로 중복을 제거해 "몇 개의
+    서로 다른 레코드에 걸쳐 나타나는가"로 바꾸면, 조각이 아무리 많아도 같은 파일이면 1로
+    세어져 이 문제가 해결되고, 실제로 여러 문서에 걸쳐 흔한 단어(API/국가 등 기존에 이미
+    검증된 사례)는 그대로 여러 건으로 세어져 기존 거절 판정이 그대로 유지된다."""
+    seen = {(h.get("데이터유형"), h.get("원본ID")) for h in hits}
+    return len(seen)
+
+
+# narrow의 "이 축소된 후보가 너무 흔하지 않은가" 판단은 지금까지 DB 전체를 기준으로만
+# 봤다 — 그런데 질문에 기관명이 같이 있으면(예: "한국무역협회의 계약금액 인상 협약 내용
+# 알려줘"), 정작 확인해야 할 건 "그 기관 범위 안에서도 이 축소된 후보가 실제로 매칭되는가"
+# 이다. "계약금액 인상 협약"(3단어)이 한국무역협회 문서엔 세 단어가 붙어있지 않아 전체
+# 매칭은 실패하는데, narrow가 "계약금액 인상"(2단어)으로 줄이면서 "DB 전체에 이 2단어가
+# 매칭되는 다른 문서가 있다"는 이유만으로 통과시켜버림 — 정작 한국무역협회 문서 자체엔
+# "계약금액"(표 제목)과 "인상"(다른 문단의 "수수료를 인상")이 떨어져 있어 이 축소된
+# 후보도 안 맞는데, 그 사실은 전혀 확인 안 하고 "DB 어딘가엔 있으니 괜찮다"고 받아들여
+# 결국 한국무역협회 문서가 최종 리터럴 필터에서 걸러져 "찾지 못함"으로 실패하는 버그가
+# 실측 확인됨(2026-11-19, 차영경 피드백 — 실제 원본 화면 스크린샷으로 해당 문서가 존재함을
+# 확인한 뒤 재현). 기관명이 주어지면, 축소 후보를 "DB 전체에서 너무 흔한가"뿐 아니라
+# "그 기관 문서 중에도 실제로 매칭되는 게 있는가"까지 같이 확인한다 — 둘 다 통과해야
+# 받아들인다(기관명이 없으면 기존 동작 그대로).
+def _org_scoped_hits(hits: list[dict], org_name: str) -> list[dict]:
+    cache: dict = {}
+    return [h for h in hits if _effective_field(h, "기관명", cache) == org_name]
+
+
+def _keyword_org_list_answer(keyword: str, results: list[dict]) -> tuple[str, list[dict]] | None:
+    """`_ORG_LIST_REQUEST_RE`가 매칭되고, `results`가 이미 정확한 필드 전용 스캔(예:
+    `scan_detail_field_contains`)으로 좁혀진 뒤에만 호출하라 — "지역 항목이 나가는
+    업체 알려줘"처럼 조건(키워드)에 맞는 기관들을 전부 나열해달라는 질문에, LLM 요약을
+    거치지 않고 `results`에서 distinct 기관명을 직접 뽑아 결정론적으로 답한다. 기관명을
+    하나도 못 찾으면(결과가 전부 내부자료 등 기관명 개념이 없는 메뉴) None을 반환해
+    호출부가 기존 일반 검색(LLM 요약)으로 자연스럽게 넘어가게 한다."""
+    cache: dict = {}
+    orgs: list[str] = []
+    seen_orgs: set[str] = set()
+    representative: dict[str, dict] = {}
+    for payload in results:
+        org = _effective_field(payload, "기관명", cache)
+        if not org:
+            continue
+        if org not in seen_orgs:
+            seen_orgs.add(org)
+            orgs.append(org)
+            representative[org] = payload
+    if not orgs:
+        return None
+    answer = f"{keyword} 관련 자료를 등록한 기관은 다음과 같습니다: " + ", ".join(orgs) + "."
+    sources = [representative[org] for org in orgs]
+    return answer, sources
+
+
+def _narrow_keyword_to_match(
+    keyword: str, data_types: set[str] | None = None, org_name: str | None = None
+) -> str:
     """바깥 호출부가 `keyword`로 스캔해 0건임을 이미 확인했을 때만 불러라 — 끝 단어를
     하나씩 빼며 실제로 매칭되는 가장 긴 조합을 찾는다(전수 스캔 1회씩, 매칭되는 순간
     바로 반환). 아무 길이에서도 안 걸리면 원래 키워드를 그대로 돌려줘 호출부가 "정말
@@ -1158,7 +1260,9 @@ def _narrow_keyword_to_match(keyword: str, data_types: set[str] | None = None) -
         if len(candidate.replace(" ", "")) < 2:
             break
         hits = scan_text_contains(candidate, _NARROW_KEYWORD_MAX_HITS, data_types)
-        if hits and len(hits) < _NARROW_KEYWORD_MAX_HITS:
+        if hits and _distinct_doc_count(hits) < _NARROW_KEYWORD_MAX_HITS:
+            if org_name and not _org_scoped_hits(hits, org_name):
+                continue
             return candidate
     # 접두사(앞쪽 유지) 방향으로는 상한 안에 드는 후보가 전혀 없었다 — "원산지 자율발급"
     # 처럼 핵심어가 뒤쪽에 있는 경우("원산지"는 261건으로 상한 초과 거절, 뒤쪽 "자율발급"은
@@ -1170,8 +1274,9 @@ def _narrow_keyword_to_match(keyword: str, data_types: set[str] | None = None) -
     last_word = tokens[-1]
     if len(last_word) >= 2:
         hits = scan_text_contains(last_word, _NARROW_SUFFIX_FALLBACK_MAX_HITS, data_types)
-        if hits and len(hits) < _NARROW_SUFFIX_FALLBACK_MAX_HITS:
-            return last_word
+        if hits and _distinct_doc_count(hits) < _NARROW_SUFFIX_FALLBACK_MAX_HITS:
+            if not (org_name and not _org_scoped_hits(hits, org_name)):
+                return last_word
     return keyword
 
 
@@ -1189,19 +1294,23 @@ def _narrow_keyword_to_match(keyword: str, data_types: set[str] | None = None) -
 _PURE_HANGUL_RE = re.compile(r"^[가-힣]+$")
 
 
-def _narrow_compound_keyword_to_match(keyword: str, data_types: set[str] | None = None) -> str:
+def _narrow_compound_keyword_to_match(
+    keyword: str, data_types: set[str] | None = None, org_name: str | None = None
+) -> str:
     """바깥 호출부가 공백 없는 keyword로 스캔해 0건임을 이미 확인했을 때만 불러라 —
     끝에서 2글자씩 떼며 실제로 매칭되는 가장 긴 조합을 찾는다. 순수 한글 4글자 이상에만
     적용(최소 4글자 남을 때까지만 축소 — 2글자는 Korean에서 너무 범용적인 경우가 많아
-    노이즈 위험이 크다)."""
+    노이즈 위험이 크다). org_name이 있으면 `_narrow_keyword_to_match`와 동일하게 그
+    기관 문서 중에도 실제로 매칭되는지 같이 확인한다."""
     if not _PURE_HANGUL_RE.match(keyword) or len(keyword) < 6:
         return keyword
     length = len(keyword) - 2
     while length >= 4:
         candidate = keyword[:length]
         hits = scan_text_contains(candidate, _NARROW_KEYWORD_MAX_HITS, data_types)
-        if hits and len(hits) < _NARROW_KEYWORD_MAX_HITS:
-            return candidate
+        if hits and _distinct_doc_count(hits) < _NARROW_KEYWORD_MAX_HITS:
+            if not (org_name and not _org_scoped_hits(hits, org_name)):
+                return candidate
         length -= 2
     return keyword
 
@@ -1224,7 +1333,9 @@ def _narrow_compound_keyword_to_match(keyword: str, data_types: set[str] | None 
 # 나열한 순서도 원문 어순을 어느 정도 반영할 가능성이 높다고 보고 마지막 항목을 우선
 # 신뢰하는 쪽을 기본값으로 택함. 완벽한 해결은 아니지만(여전히 전제일 뿐), 적어도
 # "콤마 뒤 주제가 통째로 사라지는" 가장 나쁜 경우는 막는다.
-def _resolve_multi_topic_keyword(keyword: str, data_types: set[str] | None = None) -> str:
+def _resolve_multi_topic_keyword(
+    keyword: str, data_types: set[str] | None = None, org_name: str | None = None
+) -> str:
     """콤마로 나뉜 키워드가 아니면 그대로 반환. 나뉘어 있으면 마지막 항목부터 역순으로
     기존 필러제거+narrow 파이프라인을 거쳐 상한 안에서 실제로 매칭되는 첫 번째 주제를
     돌려준다. 전부 매칭 안 되면 원본 그대로 돌려줘 호출부의 기존 처리(결국 "정말 없음")를
@@ -1236,11 +1347,13 @@ def _resolve_multi_topic_keyword(keyword: str, data_types: set[str] | None = Non
         candidate = _strip_keyword_filler(part)
         if not scan_text_contains(candidate, 1, data_types):
             if " " in candidate:
-                candidate = _narrow_keyword_to_match(candidate, data_types)
+                candidate = _narrow_keyword_to_match(candidate, data_types, org_name)
             elif _PURE_HANGUL_RE.match(candidate):
-                candidate = _narrow_compound_keyword_to_match(candidate, data_types)
+                candidate = _narrow_compound_keyword_to_match(candidate, data_types, org_name)
         hits = scan_text_contains(candidate, _NARROW_KEYWORD_MAX_HITS, data_types)
-        if hits and len(hits) < _NARROW_KEYWORD_MAX_HITS:
+        if hits and _distinct_doc_count(hits) < _NARROW_KEYWORD_MAX_HITS:
+            if org_name and not _org_scoped_hits(hits, org_name):
+                continue
             return candidate
     return keyword
 
@@ -2395,6 +2508,16 @@ def _analyze_query(question: str, history: list[dict]) -> QueryAnalysis:
 
 KEYWORD_SCAN_LIMIT = 30
 
+# "지역 항목이 나가는 업체 알려줘"처럼 기관명 없이 "이 키워드를 가진 기관들이 어디냐"고
+# 폭넓게 묻는 질문에서, KEYWORD_SCAN_LIMIT(30)이 너무 작아 한 기관의 레코드들이 그 상한을
+# 먼저 다 채워버리고 정작 다른 기관들은 스캔 결과 자체에 못 들어오는 문제가 실측 확인됨
+# (2026-11-19, 차영경 피드백 — "지역"이 '제공항목' 필드에 있는 기관이 실제로는 8곳인데
+# 한국기계산업진흥회 레코드만으로 30건 상한을 채워버려 매번 1~2개 기관만 나옴, ground
+# truth 전수 확인 결과 전체 매칭은 63건으로 상한의 2배가 넘음). 기관명이 없을 때만(=
+# 특정 기관 하나로 좁혀진 상황이 아니라 "여러 기관에 걸쳐 찾는" 상황일 때만) 상한을
+# 넉넉하게 높인다 — 기관명이 있으면 기존 상한(30)으로 이미 충분하므로 그대로 둔다.
+_BROAD_KEYWORD_SCAN_LIMIT = 150
+
 # 기관명/요청자/제공자/담당자/결재자처럼 특정 대상 하나를 정확히 지목하는 필터가 걸리면,
 # 그 대상에 딸린 이력이 CHAT_TOP_K(기본 6)보다 많을 수 있다("관세청이 요청한 자료" 8건 중
 # 6건만 반환되는 문제로 실데이터에서 재현됨). 이런 필터는 벡터 유사도 근사가 아니라 정확
@@ -2409,10 +2532,18 @@ KEYWORD_SCAN_LIMIT = 30
 # 제외+날짜조건" 조합처럼 기관명·역할필드 등 다른 narrowing 신호가 전혀 없고 날짜조건만
 # 있는 질문은 narrowing 없는 걸로 간주돼 top-6으로 좁혀지고, 그중 날짜 필터링을 거쳐
 # 2/5건만 남는 완전성 누락이 실측 확인됨.
+# "키워드"는 여기 빠져있었는데, 같은 뜻의 질문인데도 질문분석 LLM이 가끔 "지역별 통계"를
+# 통계종류 필드가 아니라 키워드 필드에 직접 담는 경우가 있어(둘 다 똑같이 구체적인 검색
+# 조건인데도) — 통계종류에 담기면 이 목록에 있어 top-20을 쓰지만, 키워드에 담기면 이
+# 목록에 없어 top-6(CHAT_TOP_K)으로 떨어져 같은 자료가 20건 vs 6건으로 들쭉날쭉하게
+# 나오는 데이터 정합성 문제가 실측 확인됨(2026-11-19, 신지원 피드백 "외부요청에서
+# 지역별 통계 관련 내역"을 같은 세션에서 반복 질문했더니 3건/2건으로 달라짐 — 추적 결과
+# 키워드 경로일 때 top-6에 걸려 20건 중 앞쪽 6건만 가져오는 것으로 확인). 키워드도 다른
+# 필드와 동등하게 구체적인 narrowing 신호이므로 이 목록에 포함한다.
 _NARROWING_FILTER_FIELDS = {
     "기관명", "요청자", "제공자", "담당자", "결재자",
     "연도", "통계종류", "수출입구분", "심의결과", "차수",
-    "신청일이후", "신청일이전", "연도이후", "연도이전",
+    "신청일이후", "신청일이전", "연도이후", "연도이전", "키워드",
 }
 FILTERED_SEARCH_LIMIT = 20
 
@@ -2962,8 +3093,9 @@ def _search(
             scan_data_types = (scan_data_types & confirmed_set) if allowed_data_types is not None else confirmed_set
     if keyword:
         scan_ran = True
-        scan_results = scan_text_contains(keyword, KEYWORD_SCAN_LIMIT, scan_data_types)
-        if len(scan_results) >= KEYWORD_SCAN_LIMIT:
+        _scan_limit = _BROAD_KEYWORD_SCAN_LIMIT if not analysis.filters.기관명 else KEYWORD_SCAN_LIMIT
+        scan_results = scan_text_contains(keyword, _scan_limit, scan_data_types)
+        if len(scan_results) >= _scan_limit:
             scan_incomplete = True
         for payload in scan_results:
             # 기관명이 필터로 걸려있는데(예: "한국환경공단 신청이력 중 수수료 0원인거") "수수료"
@@ -3274,6 +3406,30 @@ def _search(
         for payload in find_by_type_and_field("기관정보", "기관명", org_name):
             key = _pool_key(payload)
             if key not in seen:
+                seen.add(key)
+                merged.append(payload)
+
+    # 신청이력도 기관정보와 똑같은 문제를 겪는다 — 기관명으로 좁혀도 벡터 유사도 top-K
+    # (보통 20)만 후보로 가져오는데, 이력이 많은 기관(한국무역협회 46건, 한국환경공단
+    # 83건 등)에서는 키워드와 진짜 리터럴로 매칭되는 레코드가 그 top-K 밖으로 밀려
+    # B-54 리터럴 필터까지 갈 기회도 없이 완전히 사라지는 문제가 실측 확인됨(2026-11-19,
+    # 차영경 피드백 — "한국무역협회 계약금액 인상 협약 내용 알려줘"가 실제로 "계약금액"을
+    # 포함하는 정답 레코드가 존재하는데도 "찾지 못함"으로 실패, 추적 결과 그 레코드가
+    # 벡터 유사도 상위 20건 안에 전혀 안 들어있었음). 기관정보와 달리 레코드 수가 많을
+    # 수 있어, 리터럴로 걸러낼 수 있는 "키워드가 있을 때만" 전체를 가져와 병합한다 —
+    # 키워드 없이 무조건 전부 가져오면 "전체 이력 보기" 버튼 등 기존 기능과 중복되고
+    # 불필요하게 무거워진다. 기관정보와 동일한 메뉴 교차오염 방지 가드를 그대로 쓴다.
+    if (
+        org_name
+        and analysis.filters.키워드
+        and not _org_info_merge_blocked
+        and (allowed_data_types is None or "신청이력" in allowed_data_types)
+    ):
+        for payload in find_by_type_and_field("신청이력", "기관명", org_name, limit=200):
+            key = _pool_key(payload)
+            if key not in seen and keyword_matches(
+                analysis.filters.키워드, payload.get("text", ""), payload.get("요약") or ""
+            ):
                 seen.add(key)
                 merged.append(payload)
 
@@ -4008,6 +4164,29 @@ _LIST_FIELD_KEYWORDS = {"담당자": ("담당자",), "결재자": ("결재자",)
 _LIST_ASK_WORDS = ("목록", "리스트", "어디", "뭐가 있", "누가 있", "뭐 있", "누구")
 # "몇 개"/"몇 명"은 넣지 않는다 — "총 몇 개야" 같은 집계 질문에도 흔히 쓰이는 표현이라
 # 목록 요청 신호로 쓰면 집계 질문과 오탐이 생김(실제 재현됨)
+#
+# "지역 항목이 나가는 업체 알려줘"처럼 조건(키워드)에 맞는 기관을 전부 나열해달라는
+# 질문은, `results`에서 distinct 기관명을 코드가 직접 뽑아 결정론적으로 답한다 —
+# LLM 요약에 맡기면 많은 결과 중 일부 기관만 추려버리는 완전성 문제가 재현됨(2026-11-19,
+# 차영경 피드백 재현 — `scan_detail_field_contains`(2026-11-18 신설, "제공항목"/
+# "요청항목" 세부항목만 정확히 스캔해 33건·8개 기관을 정확히 찾아냄)로 results 자체는
+# 이미 완전하고 정확한데, 그 뒤 일반 LLM 답변생성이 1~2개 기관만 추려 요약해버림).
+# ⚠️ 처음엔 이 전용 경로를 `scan_text_contains`(본문 전체 전수 스캔) 결과에 바로
+# 붙였다가, "지역"이라는 일반 단어가 주소·사업명 등에도 흔해 무관한 기관까지 23~24개로
+# 부풀려지는 걸 실측 확인(완전성은 개선되지만 정확성이 심각하게 나빠지는 trade-off)해
+# 즉시 되돌렸다 — `scan_detail_field_contains`가 세부항목 필드 하나만 정확히 좁혀
+# 보는 전용 스캔이라는 걸 처음엔 놓치고 있었기 때문. 이 전용 경로를 거쳐 이미 정확하게
+# 좁혀진 `results`에만 아래 `_ORG_LIST_REQUEST_RE` 매칭을 적용한다(아래 `ask()` 안
+# `_item_matches`/`_detail_matches` 블록 직후 참고) — "SSL 인증서 관련 업체 자료
+# 있어?"처럼 "업체"가 그냥 지나가는 말로 섞인 경우까지 오탐하지 않도록, "업체/기관/
+# 회사"가 "알려줘" 바로 앞에 와서 문장의 목적어 역할을 할 때만(중간에 다른 내용 서술
+# 없이 붙어있을 때만) 매칭한다.
+_ORG_LIST_REQUEST_RE = re.compile(
+    r"(?:업체|기관|회사)(?:들)?\s*(?:을|를)?\s*"
+    r"(?:알려\s*(?:줘|주세요|줄래요?|주실래요?)|"
+    r"찾아\s*(?:줘|주세요|줄래요?|주실래요?)|"
+    r"보여\s*(?:줘|주세요))\s*[?!.]*$"
+)
 
 
 def _resolve_list_menu(text: str) -> str | None:
@@ -4642,17 +4821,37 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # ("글로벌공급망팀 청구내역")을 온전히 살릴 수 있다. 복구가 끝내 실패하면(관련/
     # 어미 패턴 둘 다 안 맞는 질문), 지어낸 값들 중 하나라도 있으면 그걸 그대로 키워드로
     # 쓴다(기존 동작 그대로 — 완전한 구절은 아니어도 없는 것보단 낫다).
+    # 통계종류/수출입구분은 "DB에 진짜로 존재하는 값인가"(_KNOWN_STATISTICS_TYPES 등)뿐
+    # 아니라, "이 메뉴에 애초에 존재하는 필드인가"도 따로 확인해야 한다 — `_build_filter`
+    # 안에 이미 있는 `_MENU1_ONLY_FIELDS` 규칙(기관정보/신청이력에만 있는 필드라, 최종
+    # 데이터유형이 그 둘이 아니면 Qdrant 조건에서 조용히 빼버림)과 여기가 서로 몰랐던
+    # 게 문제였다 — "지역별 통계"는 _KNOWN_STATISTICS_TYPES엔 있어 아래 "알려지지 않은
+    # 값" 체크를 피해가지만(진짜 DB 값이니까), 그 값이 '외부요청' 메뉴에는 구조화 필드로
+    # 존재하지 않아 `_build_filter`가 조용히 버린다 — 그런데 `_build_filter`는 자기 내부
+    # 복사본만 고치고 `analysis.filters`는 그대로라, 바로 아래 키워드 복구 단계가
+    # "통계종류가 이미 이 값을 담고 있으니 복구할 필요 없다"고 오판해 후보 텍스트에서
+    # 그 값을 지워버리고, 결국 키워드가 끝내 안 채워져 리터럴 매칭(B-54)이 전혀 안 걸리는
+    # 버그로 이어졌다(2026-11-19, 신지원 피드백 "외부요청에서 지역별 통계 관련 내역" —
+    # 같은 세션에서 완전히 동일한 질문을 반복해도 3건/2건으로 들쭉날쭉, ground truth는
+    # 리터럴 매칭 2건). 사용자가 메뉴를 직접 고정한 경우(allowed_data_types)엔 그 스코프가
+    # 기관정보/신청이력과 겹치면 값을 신뢰(데모션 안 함) — 그 외엔 `analysis.filters.
+    # 데이터유형`이 메뉴1이 아니라고 뽑혔으면 "이 필드가 이 메뉴에 없다"로 보고 demote한다.
+    _menu1_scope_ok = bool(allowed_data_types) and bool(allowed_data_types & _MENU1_DATA_TYPES)
+    _stat_field_menu_mismatch = (
+        not _menu1_scope_ok
+        and analysis.filters.데이터유형 is not None
+        and analysis.filters.데이터유형 not in _MENU1_DATA_TYPES
+    )
+
     _hallucinated_value: str | None = None
-    if (
-        analysis.filters.통계종류
-        and analysis.filters.통계종류 not in _KNOWN_STATISTICS_TYPES
+    if analysis.filters.통계종류 and (
+        analysis.filters.통계종류 not in _KNOWN_STATISTICS_TYPES or _stat_field_menu_mismatch
     ):
         _hallucinated_value = _hallucinated_value or analysis.filters.통계종류
         analysis.filters = analysis.filters.model_copy(update={"통계종류": None})
 
-    if (
-        analysis.filters.수출입구분
-        and analysis.filters.수출입구분 not in _NON_NAME_DOMAIN_WORDS
+    if analysis.filters.수출입구분 and (
+        analysis.filters.수출입구분 not in _NON_NAME_DOMAIN_WORDS or _stat_field_menu_mismatch
     ):
         _hallucinated_value = _hallucinated_value or analysis.filters.수출입구분
         analysis.filters = analysis.filters.model_copy(update={"수출입구분": None})
@@ -4721,7 +4920,9 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 제거·narrow 파이프라인에 그대로 넘기면 콤마 뒤 두 번째 주제가 영구히 사라지므로
     # (2026-11-05 실측 확인) 가장 먼저 단일 주제로 정리해둔다.
     if analysis.filters.키워드 and "," in analysis.filters.키워드:
-        resolved = _resolve_multi_topic_keyword(analysis.filters.키워드, allowed_data_types)
+        resolved = _resolve_multi_topic_keyword(
+            analysis.filters.키워드, allowed_data_types, analysis.filters.기관명
+        )
         if resolved != analysis.filters.키워드:
             keyword_narrowed_from = analysis.filters.키워드
             analysis.filters = analysis.filters.model_copy(update={"키워드": resolved})
@@ -4741,7 +4942,7 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         # 없고 더 짧은 핵심어("API 연동 방식"의 "API")만 있는 경우가 실측 확인됨
         # (2026-11-04). 0건 확인 후에만 좁혀본다 — 애초에 매칭되면 축소 불필요.
         if " " in trimmed and not scan_text_contains(trimmed, 1, allowed_data_types):
-            narrowed = _narrow_keyword_to_match(trimmed, allowed_data_types)
+            narrowed = _narrow_keyword_to_match(trimmed, allowed_data_types, analysis.filters.기관명)
             if narrowed != trimmed:
                 keyword_narrowed_from = trimmed
                 analysis.filters = analysis.filters.model_copy(update={"키워드": narrowed})
@@ -4754,7 +4955,9 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
             and not keyword_narrowed_from
             and not scan_text_contains(final_keyword, 1, allowed_data_types)
         ):
-            narrowed2 = _narrow_compound_keyword_to_match(final_keyword, allowed_data_types)
+            narrowed2 = _narrow_compound_keyword_to_match(
+                final_keyword, allowed_data_types, analysis.filters.기관명
+            )
             if narrowed2 != final_keyword:
                 keyword_narrowed_from = final_keyword
                 analysis.filters = analysis.filters.model_copy(update={"키워드": narrowed2})
@@ -5481,7 +5684,20 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
             or _extract_provided_item_candidate(question)
         )
         if _item_candidate:
-            _item_scan_limit = 900 if (analysis.filters.연도 or excluded_org) else KEYWORD_SCAN_LIMIT
+            # "지역 항목이 나가는 업체 알려줘"처럼 조건에 맞는 기관을 전부 나열해달라는
+            # 질문이면, 표시 상한(KEYWORD_SCAN_LIMIT=30)을 적용하기 전에 먼저 알아채서
+            # 스캔 자체의 상한을 넉넉하게(900) 올린다 — 이 "목록" 답변은 LLM 프롬프트에
+            # 넣는 게 아니라 코드가 직접 distinct 기관명만 뽑아서 보여주는 거라, 더 많이
+            # 가져와도 비용·속도 문제가 없다(`_keyword_org_list_answer` 참고). 기관명이
+            # 명시된 질문(한 기관으로 좁혀진 경우)은 이 분기 대상이 아니므로 기존처럼 작게
+            # 유지한다 — "1단계(스캔 자체 상한)"와 "2단계(표시용 slice)" 둘 다 늘려야
+            # 한다는 걸 처음엔 놓쳤다(2026-11-19, 1차 시도가 7/8 기관만 찾아 발견).
+            _is_org_list_request = not analysis.filters.기관명 and bool(
+                _ORG_LIST_REQUEST_RE.search(analysis.standalone_question)
+            )
+            _item_scan_limit = (
+                900 if (_is_org_list_request or analysis.filters.연도 or excluded_org) else KEYWORD_SCAN_LIMIT
+            )
             _item_matches = scan_detail_field_contains(
                 _PROVIDED_ITEM_LABELS, _item_candidate, _item_scan_limit
             )
@@ -5491,6 +5707,18 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
                 _item_matches = [p for p in _item_matches if p.get("기관명") != excluded_org]
             if analysis.filters.연도:
                 _item_matches = [p for p in _item_matches if p.get("연도") == analysis.filters.연도]
+            if _item_matches and _is_org_list_request:
+                _org_list_result = _keyword_org_list_answer(_item_candidate, _item_matches)
+                if _org_list_result is not None:
+                    _org_list_answer, _org_list_payloads = _org_list_result
+                    _org_list_sources = [
+                        _build_source_item(p, _item_candidate) for p in _org_list_payloads
+                    ]
+                    session_store.append_turn(session_id, question, _org_list_answer)
+                    session_store.set_last_sources(session_id, _org_list_payloads)
+                    return ChatResponse(
+                        session_id=session_id, answer=_org_list_answer, sources=_org_list_sources
+                    )
             _item_matches = _item_matches[:KEYWORD_SCAN_LIMIT]
             if _item_matches:
                 results = _item_matches
