@@ -20,6 +20,7 @@ from app.core.vectordb import (
     scan_detail_field_contains,
     scan_field_contains,
     scan_text_contains,
+    strip_chunk_header,
 )
 from app.core.vectordb import search as vector_search
 from app.models.schemas import (
@@ -345,7 +346,7 @@ def _find_related_attachments(
     if keyword:
         for chunk in chunks:
             filename = chunk.get("첨부파일명") or "첨부파일"
-            if keyword_matches(keyword, chunk.get("text") or "", chunk.get("요약") or ""):
+            if keyword_matches(keyword, strip_chunk_header(chunk.get("text") or ""), chunk.get("요약") or ""):
                 matched_filenames.add(filename)
 
     seen_files: set[str] = set()
@@ -1152,6 +1153,19 @@ def _recover_dropped_content_keyword(
         year_value = getattr(filters, year_field, None)
         if year_value:
             candidate = candidate.replace(str(year_value), " ")
+    # "2026 DX가속화팀"처럼, 질문분석 LLM이 "년" 없는 bare 4자리 연도를 filters.연도로
+    # 아예 인식 못 하는 경우가 실측 확인됨(2026-11-21 — 같은 "N년 없는 bare 연도+팀명"
+    # 패턴인데 "DX가속화팀"은 4/4 전부 실패, "글로벌공급망팀"은 6/6 전부 성공 — LLM이
+    # 팀명에 따라 일관되게 다르게 반응함). 그러면 위 filters.연도 기반 스트립이 지울
+    # 대상 자체가 없어 bare "2026"이 가짜 키워드 후보에 그대로 남고, 뒤쪽 narrow 축소가
+    # "DX가속화팀"(진짜 주제) 대신 "2026"(거의 모든 문서에 걸쳐 나타나는 숫자) 쪽을
+    # 먼저 선택해 완전히 무관한 레코드 다수를 끌어오는 2차 피해로 이어진다("대한무역
+    # 투자진흥공사 2026 DX가속화팀 관련 내역 알려줘"가 연도·팀 둘 다 무관한 2021~2026년
+    # 레코드 10여 건을 뒤섞어 보여줌). filters.연도 추출 성공 여부와 무관하게, 19xx~20xx대
+    # 숫자 하나가 독립적으로(앞뒤에 다른 숫자가 안 붙어서 더 긴 숫자열의 일부가 아님)
+    # 남아있으면 안전하게 지운다 — 날짜(20261012)처럼 더 긴 숫자열의 일부인 경우는
+    # 보존한다(그 자체가 유효한 콘텐츠 후보일 수 있음).
+    candidate = re.sub(r"(?<!\d)(?:19|20)\d{2}(?!\d)", " ", candidate)
     # "최근 5개년"처럼 질문분석에 넘기기 전 코드가 절대 연도범위로 미리 치환한 상대 기간
     # 표현도, 이 함수의 두 번째 호출(raw question 기준)에서는 치환 전 원문이 그대로
     # 남아있어 위 연도값 스트립을 피해 가짜 키워드로 복구되는 문제가 있었다(2026-11-13 —
@@ -2878,7 +2892,7 @@ def _results_miss_keyword(results: list, keyword: str | None) -> bool:
     if not keyword:
         return False
     return not any(
-        keyword_matches(keyword, r.payload.get("text") or "", r.payload.get("요약") or "")
+        keyword_matches(keyword, strip_chunk_header(r.payload.get("text") or ""), r.payload.get("요약") or "")
         for r in results
     )
 
@@ -3507,6 +3521,22 @@ def _search(
     # 명시한 2026년과는 무관한 레코드였음). `_history_merge_matches_other_filters`로 이미
     # Qdrant 네이티브 필터가 쓰는 것과 동일한 기준(연도 정확매칭/범위, 통계종류 동의어 그룹,
     # 수출입구분)을 재확인한다.
+    #
+    # ⚠️ 바로 이어서 같은 기관(대한무역투자진흥공사)으로 "2026 글로벌공급망팀 청구내역"을
+    # 물었더니 이번엔 연도도 같은데 전혀 다른 팀("소재부품장비팀") 레코드가 섞이는 걸
+    # 사용자가 재발견(2026-11-21) — DB 직접조회로 원인 확정: `CRP_DEPT_NAME`(부서명)은
+    # 레코드(신청이력) 단위가 아니라 기관ID(ORGANIZATION_ID) 단위로 한 번만 등록되는
+    # 필드인데, 이 조직은 한 기관ID에 "소재부품장비팀, DX가속화팀, 글로벌공급망팀"처럼
+    # 콤마로 여러 팀이 한꺼번에 묶여 있음(실측: 이 패턴을 쓰는 기관은 DB 전체에 2곳뿐,
+    # 다른 한 곳은 국민건강보험공단). 청크 머리말(`chunk_builder.py`가 만드는 "[신청이력
+    # ID] 기관명(분류, 부서명)이(가) ... 신청." 줄)이 이 버킷을 그대로 복제해 넣다 보니,
+    # 그 기관ID 아래 **모든** 레코드의 머리말에 세 팀 이름이 전부 들어가 있어서, 그중
+    # 어느 팀 이름으로 검색해도 실제로는 다른 팀 건인 레코드까지 전부 걸림 — 머리말은
+    # 레코드 "자신"의 내용이 아니라 기관 "전체"의 메타데이터라 생긴 구조적 문제다.
+    # `strip_chunk_header`(머리말 줄 제거, `vectordb.py` 정의부 참고)를 키워드 매칭
+    # 직전에 적용해, 레코드 자신의 진짜 내용(요청구분/요청내용 등)에만 매칭 여부를
+    # 판단하게 한다 — 기관명 자체를 찾는 경로는 별도 정확매칭(기관명 필드)을 쓰므로
+    # 영향 없음.
     if (
         org_name
         and analysis.filters.키워드
@@ -3517,7 +3547,7 @@ def _search(
             key = _pool_key(payload)
             if (
                 key not in seen
-                and keyword_matches(analysis.filters.키워드, payload.get("text", ""), payload.get("요약") or "")
+                and keyword_matches(analysis.filters.키워드, strip_chunk_header(payload.get("text", "")), payload.get("요약") or "")
                 and _history_merge_matches_other_filters(payload, analysis.filters)
             ):
                 seen.add(key)
@@ -6246,10 +6276,13 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 재현됨(2026-10-13, "프로토콜" 질문 — 세션 후속질문 5회 중 2회, 확인된 [자료 3][자료 5]
     # 대신 매칭 안 된 [자료 1][자료 2]를 근거로 들어 없는 내용을 지어냄). 안내 문구로 유도하는
     # 대신, 매칭 안 된 자료를 LLM이 애초에 볼 수 없게 만들어 잘못 인용할 여지 자체를 없앤다.
+    # ⚠️ 여기서도 `strip_chunk_header`를 적용한다 — 머리말에 복제된 부서 버킷(위 병합
+    # 블록 주석 참고)이 "매칭됨"으로 통과시켜버리면, 그 레코드가 이 필터를 거쳐 LLM에게
+    # 그대로 넘어가는 같은 종류의 교차오염이 이 단계에서도 똑같이 재현될 수 있다.
     if analysis.filters.키워드:
         _matched_results = [
             r for r in results
-            if keyword_matches(analysis.filters.키워드, r["text"], r.get("요약") or "")
+            if keyword_matches(analysis.filters.키워드, strip_chunk_header(r["text"]), r.get("요약") or "")
         ]
         if _matched_results:
             results = _matched_results
@@ -6723,12 +6756,14 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 자료 1개(36,711자)만 들어갔고, 나머지 2~25번은 LLM이 "SSL 인증서 설치 가이드" 등으로
     # 완전히 지어냄). 이 budget 초과 상황 자체는 possibly_truncated로 이미 안내되니, 여기서는
     # 실제로 전달된 자료에 대해서만 "확인됨"이라고 말한다.
+    # 여기도 동일하게 `strip_chunk_header`를 적용한다 — 안 그러면 머리말에 복제된 부서
+    # 버킷 때문에 "[자료 N]은 이미 확인됐다"는 안내 자체가 틀린 레코드에 붙을 수 있다.
     keyword_note = ""
     if analysis.filters.키워드:
         keyword = analysis.filters.키워드
         matched = [
             i + 1 for i, payload in enumerate(results[: len(context_blocks)])
-            if keyword_matches(keyword, payload["text"], payload.get("요약") or "")
+            if keyword_matches(keyword, strip_chunk_header(payload["text"]), payload.get("요약") or "")
         ]
         if matched:
             # ⚠️ 2026-11-09에 narrow 사례만 이 강제 지시를 빼고 판단을 LLM에게 맡기는 쪽으로

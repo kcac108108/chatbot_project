@@ -63,6 +63,26 @@ def keyword_matches(keyword: str, *texts: str) -> bool:
     pattern = re.compile(pattern_str, re.IGNORECASE)
     return any(pattern.search(t) for t in texts if t)
 
+
+# 청크(text)의 첫 줄은 `chunk_builder.py`가 자동 생성하는 머리말(`[데이터유형 ID]
+# 기관명(분류, 부서명)이(가)/의 ... 신청/요청/안건.` 패턴)이다. 이 부서명(CRP_DEPT_NAME)이
+# 사실은 "이 레코드"가 아니라 "이 기관ID"에 한 번 등록된 부서 버킷이라, 같은 기관ID 아래의
+# 모든 레코드에 똑같이 복제돼 들어간다 — 그래서 콤마로 여러 부서가 묶인 기관(2026-11-21
+# 실측 확인: 대한무역투자진흥공사 한 기관ID가 "소재부품장비팀, DX가속화팀, 글로벌공급망팀"로
+# 등록돼있음, 국민건강보험공단도 한 건 있음)에서는, 실제로는 "소재부품장비팀" 건인
+# 레코드도 머리말 때문에 "글로벌공급망팀"으로 검색하면 똑같이 걸려버린다(사용자 실사용
+# 제보로 발견 — "대한무역투자진흥공사 2026 글로벌공급망팀 청구내역"이 소재부품장비팀 건을
+# 섞어서 보여줌). 머리말을 뺀 본문(요청구분/요청내용/제목 등 레코드 자신의 진짜 내용)만
+# 보면 이 교차오염이 사라진다 — 기관명 자체를 찾는 경로는 이 함수가 아니라 별도 정확매칭
+# (기관명 필드 필터/`scan_field_contains`)을 쓰므로 영향 없다.
+_CHUNK_HEADER_LINE_RE = re.compile(r"^\[[^\]]+\][^\n]*\n?")
+
+
+def strip_chunk_header(text: str) -> str:
+    """청크 본문에서 자동 생성 머리말 줄 하나만 제거한다(`_CHUNK_HEADER_LINE_RE` 참고).
+    순수 콘텐츠 키워드 매칭 전용 — 저장된 payload의 `text` 자체는 건드리지 않는다."""
+    return _CHUNK_HEADER_LINE_RE.sub("", text or "", count=1)
+
 _client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
 
 
@@ -198,7 +218,9 @@ def scan_text_contains(keyword: str, limit: int, data_types: set[str] | None = N
         for p in points:
             if data_types is not None and p.payload.get("데이터유형") not in data_types:
                 continue
-            text = p.payload.get("text", "")
+            # 머리말(기관명/부서명 등)은 레코드 자신의 내용이 아니라 기관ID 단위로
+            # 복제된 메타데이터라 여기서 빼고 본다(`strip_chunk_header` 정의부 참고).
+            text = strip_chunk_header(p.payload.get("text", ""))
             summary = p.payload.get("요약", "") or ""
             if keyword_matches(keyword, text, summary):
                 matches.append(p.payload)
