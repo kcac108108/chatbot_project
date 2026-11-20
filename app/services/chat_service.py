@@ -3825,6 +3825,19 @@ _GENUINE_AGGREGATE_HINT_RE = re.compile(
     r"순위|1위|몇\s*(개|건|명|곳)|전부|모두|통째로|빠짐없이"
 )
 
+# "합계"/"총액"/"총 금액"/"총 비용" — 돈 관련 집계만 가리킨다("총 건수"/"총 개수"는
+# 개수 집계라 범위 밖, `_fee_sum_answer`가 다루는 건 PAY_AMT 합산뿐이므로 제외).
+# `_fee_sum_answer`(기관명+연도로 명확히 좁혀진 합계 — 코드가 PAY_AMT를 직접 합산해
+# 100% 정확하게 계산 가능) 트리거용(2026-11-20).
+_FEE_SUM_INTENT_RE = re.compile(r"합계|총액|총\s*(금액|비용)")
+
+# "사업명별 계약금액 합계"/"분기별 청구금액"처럼 그룹별로 나눠 달라는 요청은 `_fee_sum_
+# answer`가 계산하는 "범위 전체를 하나로 합친 총액"과 답이 다르다(그룹별 소계가 아니라
+# 전체 합계를 주면 질문과 안 맞는 오답이 됨) — 이런 그룹화 신호가 있으면 트리거하지
+# 않고 기존 집계 거절을 그대로 유지한다. 지금까지 실측된 패턴만 좁게 나열(닫힌 목록,
+# "개별"처럼 "별"로 끝나지만 그룹화가 아닌 일반 단어와 안 겹치게).
+_FEE_SUM_GROUPBY_RE = re.compile(r"사업명별|분기별|월별|연도별|팀별|항목별|유형별|부서별")
+
 # "등록된/등록되"를 "신청된/신청되"로 치환 — 답변 생성 LLM에게 보여줄 질문 텍스트 전용
 # (ask()의 [질문] 구성부 참고). 이 시스템에 "등록일" 필드가 없어 생기는 용어 혼동을
 # 피하기 위함.
@@ -4649,6 +4662,53 @@ def _full_org_history_answer(org_name: str) -> tuple[str, list[SourceItem], list
     return answer, sources, org_payloads
 
 
+# "대한무역투자진흥공사 2026년 청구금액 합계 알려줘"처럼 기관명(+연도)으로 명확히
+# 좁혀진 수수료 합계 요청은, "합계"라는 단어 때문에 집계 질문으로 거절되지만 실제로는
+# PAY_AMT라는 구조화 필드를 그 범위 안에서 전부 더하기만 하면 코드가 100% 정확하게
+# 계산 가능하다 — "전체 코퍼스 대상 임의 집계"(순위·평균 등, 벡터 top-K로는 전체를
+# 보장 못 해 여전히 거절이 맞음)와 달리, 벡터검색/LLM 요약을 전혀 안 거치는 완전
+# 결정론적 계산이라 기존에 이미 예외로 허용된 "업체 목록 전체 조회"/"연도조건부
+# 목록"/"수수료 최댓값·최솟값"과 같은 성격이다(2026-11-20, 박민우 피드백 — 원 질문:
+# "대한무역투자진흥공사 2026년 계약 목록하고 조회된 계약들의 합계 알려줘").
+# `_fee_kinds`(최댓값/최솟값)와 동일한 숫자 추출 정규식을 재사용하되, 집계 방식만
+# 다르다(max/min 대신 sum). PAY_AMT가 varchar에 "5,928,000원(부가세 별도)"처럼
+# 저장돼 있어서 "-"(미정) 등 숫자로 못 뽑는 값은 집계에서 제외하고 그 건수를 정직하게
+# 안내한다.
+def _fee_sum_answer(org_name: str, year: str | None) -> tuple[str, list[SourceItem], list[dict]] | None:
+    all_history = find_by_type_and_field("신청이력", "기관명", org_name, limit=200)
+    if year:
+        all_history = [p for p in all_history if str(p.get("연도")) == str(year)]
+    if not all_history:
+        return None
+    total = 0
+    counted = 0
+    for p in all_history:
+        for item in p.get("세부항목") or []:
+            if item.get("label") == "수수료":
+                m = re.search(r"\d[\d,]*", str(item["value"]).strip())
+                if m:
+                    total += int(m.group(0).replace(",", ""))
+                    counted += 1
+                break
+    skipped = len(all_history) - counted
+    scope = f"{org_name}의 {year}년" if year else f"{org_name}의"
+    if counted == 0:
+        answer = (
+            f"{scope} 신청이력은 총 {len(all_history)}건이 확인되었으나, 수수료 금액이 "
+            f"확인 가능한 건이 없어 합계를 계산할 수 없습니다."
+        )
+    elif skipped:
+        answer = (
+            f"{scope} 신청이력은 총 {len(all_history)}건이며, 그중 수수료 금액이 확인되는 "
+            f"{counted}건의 합계는 {total:,}원입니다({skipped}건은 수수료가 금액으로 확인되지 "
+            f"않아 집계에서 제외됨)."
+        )
+    else:
+        answer = f"{scope} 신청이력은 총 {len(all_history)}건이며, 수수료 합계는 {total:,}원입니다."
+    sources = [_build_source_item(p) for p in all_history]
+    return answer, sources, all_history
+
+
 # 기관명 변경(구 명칭→신 명칭)·오타·두문자/음역 약칭("코트라"=대한무역투자진흥공사처럼
 # 글자 자체가 안 겹쳐 아래 부분문자열 매칭으로는 절대 못 찾는 경우)은, 문자열 유사도로
 # 자동 추론하기 안전하지 않거나 아예 불가능해서 사람이 직접 확인한 매핑만 신뢰한다
@@ -5363,6 +5423,28 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         )
     ):
         analysis.is_aggregation_question = False
+
+    # "대한무역투자진흥공사 2026년 계약 목록하고 조회된 계약들의 합계 알려줘"처럼
+    # 기관명으로 명확히 좁혀진 수수료 합계 요청은, 거절하기 전에 코드가 직접 정확하게
+    # 계산 가능한 케이스인지 먼저 확인한다(`_fee_sum_answer` 정의부 참고, 2026-11-20).
+    if (
+        analysis.is_aggregation_question
+        and analysis.filters.기관명
+        and not _FEE_SUM_GROUPBY_RE.search(question)
+        and not _FEE_SUM_GROUPBY_RE.search(analysis.standalone_question)
+        and (
+            _FEE_SUM_INTENT_RE.search(question)
+            or _FEE_SUM_INTENT_RE.search(analysis.standalone_question)
+        )
+    ):
+        _fee_sum_result = _fee_sum_answer(analysis.filters.기관명, analysis.filters.연도)
+        if _fee_sum_result is not None:
+            _fee_sum_answer_text, _fee_sum_sources, _fee_sum_payloads = _fee_sum_result
+            session_store.append_turn(session_id, question, _fee_sum_answer_text)
+            session_store.set_last_sources(session_id, _fee_sum_payloads)
+            return ChatResponse(
+                session_id=session_id, answer=_fee_sum_answer_text, sources=_fee_sum_sources
+            )
 
     if analysis.is_aggregation_question:
         session_store.append_turn(session_id, question, AGGREGATION_REFUSAL)
