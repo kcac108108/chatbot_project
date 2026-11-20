@@ -1912,6 +1912,29 @@ _KNOWN_STATISTICS_TYPES = {
 }
 
 
+def _history_merge_matches_other_filters(payload: dict, filters: FilterExtraction) -> bool:
+    """`_search()`의 "기관명+키워드로 신청이력 전체 병합" 블록(2026-11-19 B-80) 전용
+    보조 검증 — 그 블록은 키워드 리터럴 매칭만 보고 연도·통계종류·수출입구분 같은 다른
+    narrowing 필터를 전혀 확인하지 않아, 그 기관의 다른 연도/범주 레코드까지 섞여
+    들어오는 교차오염이 실측 확인됨(2026-11-20). Qdrant 네이티브 필터(`_build_filter`)가
+    쓰는 것과 동일한 기준(연도 정확매칭·범위, 통계종류 동의어 그룹, 수출입구분)으로
+    재확인한다 — 필터가 비어있으면(해당 안 함) 항상 통과."""
+    year = payload.get("연도")
+    if filters.연도 and str(year) != str(filters.연도):
+        return False
+    if (filters.연도이후 or filters.연도이전) and not _matches_year_threshold(
+        payload, filters.연도이후, filters.연도이전
+    ):
+        return False
+    if filters.통계종류 and filters.통계종류 in _KNOWN_STATISTICS_TYPES:
+        if payload.get("통계종류") not in _resolve_statistics_type_group(filters.통계종류):
+            return False
+    if filters.수출입구분 and filters.수출입구분 in _NON_NAME_DOMAIN_WORDS:
+        if payload.get("수출입구분") != filters.수출입구분:
+            return False
+    return True
+
+
 def _build_filter(
     extracted: FilterExtraction,
     allowed_data_types: set[str] | None = None,
@@ -3474,6 +3497,16 @@ def _search(
     # 수 있어, 리터럴로 걸러낼 수 있는 "키워드가 있을 때만" 전체를 가져와 병합한다 —
     # 키워드 없이 무조건 전부 가져오면 "전체 이력 보기" 버튼 등 기존 기능과 중복되고
     # 불필요하게 무거워진다. 기관정보와 동일한 메뉴 교차오염 방지 가드를 그대로 쓴다.
+    #
+    # ⚠️ 바로 위 구현이 "키워드만" 확인하고 연도·통계종류·수출입구분 같은 다른 narrowing
+    # 필터를 전혀 검증하지 않아, 그 기관의 다른 연도/다른 범주 레코드까지 섞여 들어오는
+    # 교차오염이 실측 확인됨(2026-11-20 — "대한무역투자진흥공사 2026년 AI마케팅팀 관련
+    # 내역 알려줘"에 2025년 레코드 2건이 섞임. 그 레코드의 요청구분은 실제로 "디지털
+    # 사업팀"이고, "AI마케팅팀"이라는 글자는 첨부파일명 속 팀명 변경 안내 문구("AI마케팅팀
+    # (디지털사업팀 또는 DX가속화팀)")에만 있어 리터럴 매칭 자체는 거짓이 아니었지만, 질문이
+    # 명시한 2026년과는 무관한 레코드였음). `_history_merge_matches_other_filters`로 이미
+    # Qdrant 네이티브 필터가 쓰는 것과 동일한 기준(연도 정확매칭/범위, 통계종류 동의어 그룹,
+    # 수출입구분)을 재확인한다.
     if (
         org_name
         and analysis.filters.키워드
@@ -3482,8 +3515,10 @@ def _search(
     ):
         for payload in find_by_type_and_field("신청이력", "기관명", org_name, limit=200):
             key = _pool_key(payload)
-            if key not in seen and keyword_matches(
-                analysis.filters.키워드, payload.get("text", ""), payload.get("요약") or ""
+            if (
+                key not in seen
+                and keyword_matches(analysis.filters.키워드, payload.get("text", ""), payload.get("요약") or "")
+                and _history_merge_matches_other_filters(payload, analysis.filters)
             ):
                 seen.add(key)
                 merged.append(payload)
