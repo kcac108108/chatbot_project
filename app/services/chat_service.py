@@ -248,6 +248,28 @@ _ATTACHMENT_METADATA_FIELDS = (
 _ROLE_FIELDS_FOR_SCAN = ("요청자", "제공자", "담당자", "결재자")
 
 
+def _role_fields_match(payload: dict, filters: FilterExtraction) -> bool:
+    """역할필드(요청자/제공자/담당자/결재자) 중 하나라도 긍정 필터로 걸려 있으면, 그중
+    최소 하나가 이 payload의 해당 필드 값에 실제로 포함돼야 True — DB가 "박상용 계장"처럼
+    직함을 붙이거나 "김인태, 전봉석"처럼 콤마로 여러 명을 한 필드에 저장해도 부분 문자열로
+    맞는다. 역할필드 필터가 전혀 없으면(검사 자체가 무의미) 무조건 True.
+
+    2026-11-20 발견: Qdrant의 역할필드 조건은 정확매칭(MatchValue)이라 "박상용"(이름만)과
+    저장값 "박상용 계장"(이름+직함)이 전혀 매칭 안 돼 항상 0건 → `_search()`가 그 조건을
+    빼고 전체 데이터유형으로 재검색(fallback)하는데, 이때 role_filters 검증 없이 벡터
+    결과(vector_payloads)를 그대로 받아들여 전혀 무관한 다른 요청자(남소영/김중응 등)의
+    레코드가 "확인된 자료"로 섞여 들어가는 게 실측 확인됨("박상용 계장이 요청한 외부요청
+    알려줘" 20건 중 10건만 진짜, 나머지 10건은 다른 사람). 기존에 "전수 스캔 안전망"
+    (scan_field_contains)이 이미 진짜 매치 전부를 확실히 찾아내고 있었으므로, 벡터 fallback
+    쪽에서 역할필드를 안 지키는 노이즈만 걸러내면 된다. 제외(exclusion) 질문은 `_search()`
+    호출 전에 이미 role 필드를 None으로 지워두므로(ask()의 `_excluded_role_precheck` 참고)
+    이 체크가 정상 작동 중인 제외 흐름을 건드리지 않는다."""
+    role_filters = [(f, getattr(filters, f, None)) for f in _ROLE_FIELDS_FOR_SCAN]
+    if not any(v for _, v in role_filters):
+        return True
+    return any(v and payload.get(f) and v in str(payload.get(f)) for f, v in role_filters)
+
+
 def _effective_field(payload: dict, field: str, cache: dict) -> object | None:
     """payload 자신에게 그 필드 값이 있으면 그대로, 없으면(첨부 청크 — 기관명·연도·
     통계종류 등 메타데이터가 전부 부모 레코드에만 있음, 2026-10-13 확정) 부모 레코드를
@@ -932,8 +954,10 @@ _CLAUSE_JUNK_TOKENS = _KEYWORD_FILLER_WORDS | {
     "중에", "안건에", "안건", "안건을", "안건이", "안건은", "안건의", "에서", "에는", "의", "중",
     # "그거 말고"의 "말고"(="~이 아니라")는 순수 배제 연결어일 뿐 그 자체가 검색 주제일 수
     # 없다 — "빼고"/"제외"/"제외하고"도 같은 성격(이미 excluded_* 류 전용 로직이 실제 제외
-    # 대상 추출은 별도로 담당하므로, 여기서는 그냥 걸러내도 안전).
-    "말고", "빼고", "제외", "제외하고",
+    # 대상 추출은 별도로 담당하므로, 여기서는 그냥 걸러내도 안전). "외에"/"외의"/"이외"도
+    # 같은 뜻의 또 다른 표현("~박상용 계장 외의 다른 사람이...")인데 빠져있어서, 이름+직함을
+    # 떼어낸 뒤 이 연결어가 혼자 남아 가짜 키워드로 복구되는 걸 2026-11-20에 실측 확인.
+    "말고", "빼고", "제외", "제외하고", "외에", "외의", "이외",
     # "제공불가인"처럼 구조화 필드 값에 붙던 연결어미가, 그 값 자체를 떼어낸 뒤 혼자
     # 남는 경우(2026-11-12) — "인"/"로"/"으로" 단독은 문법적으로 불완전해 그 자체로
     # 진짜 검색어가 될 수 없으므로 안전하게 필러 취급한다.
@@ -965,6 +989,15 @@ _CLAUSE_JUNK_TOKENS = _KEYWORD_FILLER_WORDS | {
     # 이 목록에 없어 안 걸러지고, 남은 "기관"/"리스트를"도 단일 단어 전수일치만 보는
     # 아래 _GENERIC_NONCONTENT_CANDIDATES 검사로는 다중 토큰 조합을 못 잡았음.
     "계약한", "계약하는", "신청한", "등록한", "접수한", "처리한", "완료한", "작성한", "제출한",
+    # "박상용 계장이 아닌 다른 사람이 요청한 외부요청은 있나요?"(제외 질문의 standalone_
+    # question 재작성)처럼, 역할필드 값+직함을 "{value}(?:\s*직함)?" 단위로 떼어내도
+    # "이"가 직함에 공백 없이 바로 붙어있으면("계장이") 못 같이 떼어져 "이"만 남고, 그
+    # 뒤를 잇는 부정·지시대명사 구절("아닌 다른 사람이")은 역할동사류와 달리 denylist에
+    # 없어 그대로 가짜 키워드로 복구되는 버그가 실측 확인됨(2026-11-20 — "박상용 계장
+    # 말고 다른 사람이 요청한 외부요청은 없어?"가 이 가짜 키워드 때문에 검색 결과 10건이
+    # 전부 지워지고 0건으로 실패). "~이 아닌" 부정형과 "다른 사람/분" 지시 표현은 역할동사
+    # 처럼 그 자체로는 검색 주제가 될 수 없는 순수 문법 조각이라 필러로 간주한다.
+    "아닌", "다른", "사람", "사람이", "사람은", "사람을", "분", "분이", "분은", "분을",
 }
 # "관련" 없이 어미만 보고 복구할 때는 "한국환경공단 이력 알려줘"처럼 기관명을 뗀 뒤
 # 남는 게 이 시스템의 일반 메뉴/화면 용어뿐인 경우가 있다 — 이런 건 진짜 검색 키워드가
@@ -1025,6 +1058,22 @@ _SUPERLATIVE_PHRASE_RE = re.compile(
     r"|1\s*(등|위|순위)(?!급)"
 )
 
+# 요청자/제공자/담당자/결재자(역할필드) DB 값이 "이름 직함"(예: "박상용 계장") 형태로
+# 저장된 경우, 질문에도 같은 형태로 등장하면 이름만 떼어내도 직함이 그대로 토큰으로
+# 남아 가짜 키워드로 복구되는 버그가 실측 확인됨(2026-11-20, "박상용 계장이 요청한
+# 외부요청 알려줘"가 "계장이가 포함된 자료가 총 20건 확인되었습니다"처럼 조사가 중복된
+# 말로 답하며 검색 자체도 완전히 새어버림 — 원인은 "요청한"은 이미 필러로 걸러지는데
+# "계장이"는 걸러지지 않아 유일하게 남는 토큰이 되고, 그게 "진짜 검색어"로 오인됨).
+# 직함은 승진 등으로 바뀔 수 있어 검색 필터 자체는(이미 그렇듯) 이름만으로 매칭해야
+# 맞지만, 질문 문장에서 이름 뒤에 붙은 직함 잔재가 키워드로 새는 것만 막으면 된다 —
+# 이름(필터값)을 떼어낼 때 그 직후에 오는 흔한 직함 단어까지 한 단위로 같이 떼어낸다.
+_PERSON_TITLE_WORDS = (
+    "계장|주임|주무관|주사보|주사|서기관|사무관|과장|차장|부장|국장|실장|팀장|팀원|"
+    "소장|원장|위원장|이사장|사무총장|본부장|센터장|연구원장|대표|대리|사원|선임|수석|"
+    "책임|상무|전무|이사|부이사관|이사관|관리관|차관|장관"
+)
+_PERSON_NAME_TITLE_SUFFIX_RE = re.compile(rf"\s*(?:{_PERSON_TITLE_WORDS})")
+
 
 def _recover_dropped_content_keyword(
     text: str, filters: FilterExtraction, raw_org_name: str | None = None
@@ -1060,7 +1109,11 @@ def _recover_dropped_content_keyword(
     for role_field in _ROLE_FIELDS_FOR_SCAN:
         value = getattr(filters, role_field, None)
         if value:
-            candidate = candidate.replace(value, " ")
+            candidate = re.sub(
+                re.escape(value) + r"(?:" + _PERSON_NAME_TITLE_SUFFIX_RE.pattern + r")?",
+                " ",
+                candidate,
+            )
     # "2010년 심의위원회 안건 기관 리스트 알려줘"처럼, 이미 filters.데이터유형으로 뽑힌
     # 메뉴 이름 리터럴("심의위원회" 등)이 후보 텍스트에 그대로 남아 "심의위원회 기관
     # 리스트를"을 가짜 키워드로 복구하는 문제가 실측 확인됨(2026-11-13) — 기관명/역할필드와
@@ -3001,6 +3054,8 @@ def _search(
 
     vector_payloads = []
     for r in results:
+        if not _role_fields_match(r.payload, analysis.filters):
+            continue
         key = _pool_key(r.payload)
         if key not in seen:
             seen.add(key)
@@ -5459,11 +5514,17 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         _excluded_role_values(_carried_text) or _excluded_role_values(analysis.standalone_question) or _excluded_role_values(question)
     )
     if _excluded_role_precheck:
-        _role_updates = {
-            f: None
-            for f in _PERSON_ROLE_FIELDS
-            if getattr(analysis.filters, f, None) in _excluded_role_precheck
-        }
+        # ⚠️ 2026-11-20 발견: 원래는 정확히 같은 문자열일 때만 지웠는데, `_excluded_role_values`가
+        # DB 저장값 그대로("박상용 계장", 직함 포함)를 돌려주는 반면 `analysis.filters.요청자`는
+        # 이름만("박상용")이라 정확 일치가 항상 실패 — 지워져야 할 요청자가 안 지워진 채로
+        # 남아, 제외 대상 본인의 레코드만 긍정 필터로 좁혀지는(그리고 뒤이은 제외 후처리가
+        # 그 좁혀진 결과를 전부 걸러내 0건이 되는) 회귀로 이어짐. 역할필드 매칭은 이 프로젝트
+        # 전역에서 항상 부분 문자열 포함으로 하므로(직함·콤마 다중값 대응) 여기도 동일하게.
+        _role_updates = {}
+        for f in _PERSON_ROLE_FIELDS:
+            v = getattr(analysis.filters, f, None)
+            if v and any(v in excl or excl in v for excl in _excluded_role_precheck):
+                _role_updates[f] = None
         if _role_updates:
             analysis.filters = analysis.filters.model_copy(update=_role_updates)
 
@@ -6832,12 +6893,28 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 판단에 맡기는 대신, 실제로 [자료]에 올라간(컨텍스트 예산에 안 잘린) 레코드 전부가
     # 반드시 groups에 포함되도록 코드가 보강한다. 데이터 정합성이 걸린 문제라 "확률적으로
     # 개선"이 아니라 "항상 보장"을 목표로 함.
+    # ⚠️ 2026-11-20 발견: "A 말고 다른 사람이 요청한 외부요청" 같은 역할필드 제외
+    # 질문도 똑같이 완전성이 불안정했다("박상용 계장 말고..."가 10회 중 6회는 no_result,
+    # 나머지도 1~2건만 그룹화 — 진짜 정답 10건인데도). 이 질문엔 `analysis.filters.키워드`가
+    # 없어(제외 전용이라 비어있는 게 정상) 위 보강이 전혀 적용되지 않았던 것 — 그런데
+    # `results`는 이미 역할필드/연도/차수/심의결과/통계종류/수출입구분 제외 필터로 걸러진,
+    # keyword_matches()와 동등한 신뢰도의 "검증된" 집합이다. 키워드 유무가 아니라 "이
+    # 풀이 확실한가"를 기준으로 게이트를 넓히고, no_result=True로 잘못 거절된 경우까지
+    # 뒤집어 복구한다(키워드 전용이던 기존 가드는 `not grounded.no_result`라 no_result=True
+    # 상태는 아예 손 못 댔었음).
+    _exclusion_narrowed_pool = bool(
+        excluded_names
+        or excluded_years
+        or excluded_rounds
+        or excluded_results
+        or excluded_stat_group
+        or excluded_trade_types
+    )
+    _trustworthy_pool = bool(analysis.filters.키워드) or _exclusion_narrowed_pool
     _KEYWORD_LISTING_COMPLETENESS_MAX = 20
-    if (
-        not grounded.no_result
-        and analysis.filters.키워드
-        and 2 <= len(context_blocks) <= _KEYWORD_LISTING_COMPLETENESS_MAX
-    ):
+    if _trustworthy_pool and 1 <= len(context_blocks) <= _KEYWORD_LISTING_COMPLETENESS_MAX:
+        if grounded.no_result:
+            grounded = grounded.model_copy(update={"no_result": False, "groups": [], "used_indices": []})
         _covered_indices = {g.source_index for g in grounded.groups}
         _missing_indices = [i for i in range(1, len(context_blocks) + 1) if i not in _covered_indices]
         if _missing_indices:
@@ -6857,9 +6934,15 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
             # LLM이 쓴 그대로(이미 "확정적으로 개수 말하지 말라"는 지시를 받음) 두고, groups
             # 완전성만 보강한다. [자료]에 올라간 게 곧 전체(안 잘림)일 때만 개수를 확정한다.
             if not possibly_truncated:
-                _completeness_updates["summary"] = (
-                    f"{analysis.filters.키워드}가 포함된 자료가 총 {len(context_blocks)}건 확인되었습니다."
-                )
+                if analysis.filters.키워드:
+                    _completeness_updates["summary"] = (
+                        f"{analysis.filters.키워드}가 포함된 자료가 총 {len(context_blocks)}건 확인되었습니다."
+                    )
+                else:
+                    # 제외 조건만 있고 키워드가 없으면("A 말고 다른 사람") 포함 기준을
+                    # 한 단어로 설명할 수 없어, 포함 조건을 가리키는 "~가 포함된" 대신
+                    # 건수만 정직하게 확정한다.
+                    _completeness_updates["summary"] = f"조건에 맞는 자료가 총 {len(context_blocks)}건 확인되었습니다."
             grounded = grounded.model_copy(update=_completeness_updates)
 
     history_text = _render_history_text(grounded)
