@@ -4739,12 +4739,27 @@ def _full_org_history_answer(org_name: str) -> tuple[str, list[SourceItem], list
 # 다르다(max/min 대신 sum). PAY_AMT가 varchar에 "5,928,000원(부가세 별도)"처럼
 # 저장돼 있어서 "-"(미정) 등 숫자로 못 뽑는 값은 집계에서 제외하고 그 건수를 정직하게
 # 안내한다.
-def _fee_sum_answer(org_name: str, year: str | None) -> tuple[str, list[SourceItem], list[dict]] | None:
-    all_history = find_by_type_and_field("신청이력", "기관명", org_name, limit=200)
+def _fee_sum_answer(org_name: str, year: str | None) -> tuple[str, list[SourceItem], list[dict]]:
+    all_history_unfiltered = find_by_type_and_field("신청이력", "기관명", org_name, limit=200)
+    all_history = all_history_unfiltered
     if year:
         all_history = [p for p in all_history if str(p.get("연도")) == str(year)]
     if not all_history:
-        return None
+        # 신청이력 자체가 0건인 기관(기관정보만 등록되고 신청 자료는 없는 경우, 예:
+        # 대한제당협회·한국해양진흥공사 등)에서 수수료 합계를 물으면, 그냥 None을 돌려주던
+        # 기존 구현은 호출부가 일반 "집계·순위 거절" 문구(AGGREGATION_REFUSAL)로 떨어지게
+        # 만들어 "이 챗봇은 집계를 못 한다"는 오해를 주는 오답이었다(2026-11-23, 동의어
+        # 목록 48개 그룹 전체를 실제 /chat 호출로 검증하다 발견 — _fee_sum_answer가 이미
+        # 올바른 기관명을 받고도 조용히 None을 반환하는 게 원인이었음, 기관명 치환 자체는
+        # 정확했음). 연도 조건 때문에 0건인지, 애초에 신청이력 자체가 없는지 구분해 정직하게
+        # 안내한다 — 어느 경우든 "답할 수 있는 질문인데 자료가 없다"는 사실 자체는 코드가
+        # 100% 확신할 수 있으므로(find_by_type_and_field 정확매칭), 집계 거절로 떨어뜨릴
+        # 이유가 없다.
+        if year and all_history_unfiltered:
+            answer = f"{org_name}의 {year}년 신청이력이 없어 수수료 합계를 계산할 수 없습니다."
+        else:
+            answer = f"{org_name}의 등록된 신청이력이 없어 수수료 합계를 계산할 수 없습니다."
+        return answer, [], []
     total = 0
     counted = 0
     for p in all_history:
@@ -5553,14 +5568,14 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
             or _FEE_SUM_INTENT_RE.search(analysis.standalone_question)
         )
     ):
-        _fee_sum_result = _fee_sum_answer(analysis.filters.기관명, analysis.filters.연도)
-        if _fee_sum_result is not None:
-            _fee_sum_answer_text, _fee_sum_sources, _fee_sum_payloads = _fee_sum_result
-            session_store.append_turn(session_id, question, _fee_sum_answer_text)
-            session_store.set_last_sources(session_id, _fee_sum_payloads)
-            return ChatResponse(
-                session_id=session_id, answer=_fee_sum_answer_text, sources=_fee_sum_sources
-            )
+        _fee_sum_answer_text, _fee_sum_sources, _fee_sum_payloads = _fee_sum_answer(
+            analysis.filters.기관명, analysis.filters.연도
+        )
+        session_store.append_turn(session_id, question, _fee_sum_answer_text)
+        session_store.set_last_sources(session_id, _fee_sum_payloads)
+        return ChatResponse(
+            session_id=session_id, answer=_fee_sum_answer_text, sources=_fee_sum_sources
+        )
 
     if analysis.is_aggregation_question:
         session_store.append_turn(session_id, question, AGGREGATION_REFUSAL)
