@@ -4967,6 +4967,17 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         ),
         history,
     )
+    # "이력관리시스템에 등록된 업체명 목록을 전부 알려줘"가 운영에서 AGGREGATION_REFUSAL로
+    # 거절되던 버그가 실측 확인됨(2026-11-24, 사용자가 운영 화면에서 직접 제보) — 프롬프트
+    # 3번·4번 항목이 "조건 없는 업체/담당자/결재자 이름 전체 목록 요청은 집계가 아니라 4번
+    # (is_full_list_question)으로 별개 처리하라"고 명시하는데도, "전부"/"모든" 같은 단어 때문에
+    # LLM이 간헐적으로 is_aggregation_question도 같이 true로 잘못 매긴다(직접 10회 반복
+    # 호출로 비결정성 재현 확인). `is_list_question` 판정이 `not analysis.is_aggregation_
+    # question`을 요구해 이 오염된 플래그 하나 때문에 DB 직접조회 경로 자체가 막혀버림 —
+    # 두 플래그는 프롬프트 설계상 서로 배타적이어야 하므로, is_full_list_question이 true면
+    # is_aggregation_question을 코드로 직접 되돌린다(LLM 판단에만 맡기지 않음).
+    if analysis.is_full_list_question:
+        analysis.is_aggregation_question = False
     allowed_data_types = _MENU_SCOPE_DATA_TYPES.get(menu_scope)
 
     # ⚠️ "최근 5개년 OO 심의결과 알려줘"를 "전체" 스코프에서도 신청이력까지 찾도록
@@ -5991,8 +6002,15 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
             # 명시된 질문(한 기관으로 좁혀진 경우)은 이 분기 대상이 아니므로 기존처럼 작게
             # 유지한다 — "1단계(스캔 자체 상한)"와 "2단계(표시용 slice)" 둘 다 늘려야
             # 한다는 걸 처음엔 놓쳤다(2026-11-19, 1차 시도가 7/8 기관만 찾아 발견).
+            # ⚠️ (2026-11-25) standalone_question만 검사하면, LLM 재작성이 "~알려줘"를
+            # "~는 누구인가요?" 같은 의문형으로 바꿔버리는 경우(실측: "국가 항목을 요청한
+            # 업체를 알려줘" → "국가 항목을 요청한 업체는 누구인가요?") 원문은 분명히
+            # "알려줘"로 끝나는데도 결정론적 경로를 매번 놓쳐, 이 FAQ 질문이 매 실행마다
+            # LLM이 임의로 8~10개 기관을 섞어 답하는 비결정적 경로로 떨어지고 있었음 —
+            # `_item_candidate` 추출과 동일한 "standalone 우선, 원문 폴백" 패턴을 적용.
             _is_org_list_request = not analysis.filters.기관명 and bool(
                 _ORG_LIST_REQUEST_RE.search(analysis.standalone_question)
+                or _ORG_LIST_REQUEST_RE.search(question)
             )
             _item_scan_limit = (
                 900 if (_is_org_list_request or analysis.filters.연도 or excluded_org) else KEYWORD_SCAN_LIMIT
