@@ -1102,7 +1102,8 @@ _PERSON_NAME_TITLE_SUFFIX_RE = re.compile(rf"\s*(?:{_PERSON_TITLE_WORDS})")
 
 
 def _recover_dropped_content_keyword(
-    text: str, filters: FilterExtraction, raw_org_name: str | None = None
+    text: str, filters: FilterExtraction, raw_org_name: str | None = None,
+    exclusion_literals: list[str] | None = None,
 ) -> str | None:
     """키워드가 완전히 빈 채로 버려졌을 때, "~ 관련(된) 내용/자료가 있어?" 또는 "~ 알려줘"/
     "~은 무엇인가요?" 같은 직접 질의형 구절에서 이미 다른 필드(기관명/연도/차수/역할필드)로
@@ -1112,7 +1113,13 @@ def _recover_dropped_content_keyword(
     복구한다.
     raw_org_name: `filters.기관명`이 이미 fuzzy 정식명칭으로 치환된 경우(2026-11-13), 질문
     원문엔 여전히 사용자가 쓴 줄임말이 남아있어 정식명칭만으로는 안 떼어진다 — 원래 줄임말도
-    같이 떼어내 "줄임말의"가 가짜 키워드로 복구되는 걸 막는다."""
+    같이 떼어내 "줄임말의"가 가짜 키워드로 복구되는 걸 막는다.
+    exclusion_literals: "원안수용도 아니고 제공불가도 아닌거"처럼 제외 질문일 때, 호출부가
+    이미 안 excluded_results/excluded_stat_group/excluded_trade_types 등의 리터럴 값 —
+    이 값들은 `filters.심의결과` 등이 제외 로직에 의해 이미 None으로 비워진 뒤라 아래
+    free_field 루프가 못 떼어내고, "도 아니고 제공불가도 아닌거"처럼 연결어만 남은 걸
+    가짜 키워드로 복구해 그 뒤 "매칭 안 된 자료 제거" 안전장치가 정답까지 전부 지워버리는
+    문제가 실측 확인됨(2026-11-25)."""
     m = _CONTENT_RELATED_CLAUSE_RE.search(text)
     is_direct = False
     if not m:
@@ -1158,11 +1165,26 @@ def _recover_dropped_content_keyword(
     # 키워드로 복구해, 2026-08-11/2026-11-05에 "자료 제공"/"자료제공" 표기차로 이미 겪었던
     # 것과 같은 계열의 공백 문제). 2음절+2(또는 3)음절로 나뉘는 지점에만 선택적 공백을 허용.
     _free_field_spaced = {"심의결과": r"심의\s*결과", "통계종류": r"통계\s*종류", "수출입구분": r"수출입\s*구분"}
+    # ⚠️ "원안수용도 아니고 제공불가도 아닌거 있어?"처럼 제외 질문에서는, 이 함수가 호출되는
+    # 시점에 아직 `filters.심의결과`가 (LLM이 제외 대상 값을 그대로 채워 넣은) "원안수용"
+    # 그대로 남아있다 — `ask()`의 "excluded_results면 filters.심의결과를 None으로 되돌린다"
+    # 로직은 이 함수보다 한참 뒤에 실행되기 때문. 그래서 아래 plain `.replace(value, " ")`가
+    # "원안수용"만 딱 떼어내고 바로 뒤에 붙는 "도 아니고" 연결어는 그대로 남겨, "도 아니고
+    # 제공불가도 아닌거"처럼 연결어만 남은 걸 가짜 키워드로 복구하는 문제가 실측 확인됨
+    # (2026-11-25). 값 뒤에 붙을 수 있는 "도 아니고/아니며/아니라/아닌" 연결어까지 함께
+    # 떼어내도록 plain replace를 정규식으로 교체 — 연결어가 없는 긍정형(예: "제공불가인
+    # 안건")에선 `(도)?...?`가 전부 선택적이라 값만 정확히 떼어내는 기존 동작 그대로 유지.
     for free_field in ("심의결과", "통계종류", "수출입구분"):
         value = getattr(filters, free_field, None)
         if value:
-            candidate = candidate.replace(value, " ")
+            candidate = re.sub(re.escape(value) + r"(도)?\s*(아니고|아니며|아니라|아닌)?", " ", candidate)
         candidate = re.sub(rf"{_free_field_spaced[free_field]}(가|는|은|이|의)?", " ", candidate)
+    # 제외 질문(excluded_results/excluded_stat_group/excluded_trade_types)의 리터럴 값은
+    # 위 free_field 루프가 `filters.X`에 LLM이 채운 값을 다루지만, 2개 이상(예: "원안수용"+
+    # "제공불가") 중 두 번째부터는 filters 필드 하나에 다 못 담기므로 호출부가 명시적으로
+    # 넘겨준 전체 제외 리터럴 목록을 추가로 같은 방식(연결어 포함)으로 제거한다.
+    for _excl_val in exclusion_literals or ():
+        candidate = re.sub(re.escape(_excl_val) + r"(도)?\s*(아니고|아니며|아니라|아닌)?", " ", candidate)
     # "2026년" 형태는 먼저 정규식으로 통째로 떼어낸다(뒤의 "년"까지 같이 사라짐).
     # "최근 5개년"이 "2022년부터 2026년까지"로 미리 치환된 뒤 들어오면(_resolve_relative_
     # year_range_words), "년" 뒤에 "에" 말고도 "부터"/"까지"/"이후"/"이전"/"이상"/"이하"/
@@ -5166,9 +5188,28 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
     # 과정에서 이 구절 자체가 사라지는 경우를 대비한다. 위에서 정리한 통계종류/수출입구분/
     # 역할필드 지어내기 값이 하나라도 있으면 최후의 폴백으로 그걸 쓴다.
     if not analysis.filters.키워드:
+        # "원안수용도 아니고 제공불가도 아닌거 있어?"처럼 심의결과/통계종류/수출입구분/연도/
+        # 차수를 제외하는 질문은, 이 시점에 그 필드들이 아직 excluded_results 등으로 정리되기
+        # 전이라(해당 블록은 이 함수보다 뒤에 나옴) `filters` 기반 스트리핑이 못 떼어내고
+        # "도 아니고 제공불가도 아닌거"처럼 연결어만 남아 가짜 키워드로 복구되는 문제가
+        # 실측 확인됨(2026-11-25) — 가벼운 순수함수들로 제외 리터럴만 미리 뽑아 같이 떼어낸다.
+        _recovery_exclusion_literals = [
+            *_excluded_committee_results(analysis.standalone_question),
+            *_excluded_committee_results(question),
+            *_excluded_statistics_types(analysis.standalone_question),
+            *_excluded_statistics_types(question),
+            *_excluded_trade_types(analysis.standalone_question),
+            *_excluded_trade_types(question),
+            *_excluded_years(analysis.standalone_question),
+            *_excluded_years(question),
+        ]
         recovered = _recover_dropped_content_keyword(
-            analysis.standalone_question, analysis.filters, _raw_org_name_before_fuzzy
-        ) or _recover_dropped_content_keyword(question, analysis.filters, _raw_org_name_before_fuzzy)
+            analysis.standalone_question, analysis.filters, _raw_org_name_before_fuzzy,
+            exclusion_literals=_recovery_exclusion_literals,
+        ) or _recover_dropped_content_keyword(
+            question, analysis.filters, _raw_org_name_before_fuzzy,
+            exclusion_literals=_recovery_exclusion_literals,
+        )
         if recovered:
             analysis.filters = analysis.filters.model_copy(update={"키워드": recovered})
         elif _hallucinated_value:
@@ -6047,6 +6088,25 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
         # 대상)이 드러나는 괴리가 실측 확인됨(2026-10-22 — raw payload 기준 필터는 통과했지만
         # 최종 sources엔 제외하라고 한 한국환경공단이 13건이나 섞여 나옴). 부모 레코드를
         # 조회해 승격 후 실제로 보일 기관명 기준으로 비교한다.
+        # ⚠️ "A 말고 다른 기관 이력 중에 2024년 이후에 신청된거 있어?"처럼 특정 대상 기관
+        # 없이 제외만 걸면 날짜 임계값 broadening이 결합돼 `results`가 100~200건까지 커질 수
+        # 있는데, 기관명이 없는(첨부) 레코드마다 캐시가 있어도 서로 다른 원본ID면 매번 개별
+        # Qdrant 조회(`find_by_type_and_source`)가 필요해 195회·19.7초가 실측 확인됨(2026-11-25,
+        # HTTP 45초 제한에 매번 걸려 100% 재현 실패) — LLM 호출이 아니라 순수 네트워크 왕복
+        # 누적이 원인. `_CONTEXT_CHAR_BUDGET` 등 기존의 "커지면 안전하게 자른다" 패턴과 동일하게,
+        # 이 비용이 큰 루프에 들어가는 후보 수 자체를 미리 제한한다(완전성 아주 약간 희생,
+        # 확실한 타임아웃보다는 안전).
+        # ⚠️ 추가 실측(2026-11-25): 60으로는 부족했음 — 뒤이은 연도이후 필터(`_matches_year_
+        # threshold`/`_extract_year`, 각자 별도 부모조회 캐시)도 같은 `results`를 또 순회하고,
+        # 첨부가 여러 조각으로 병합되는 레코드가 섞이면 answer-generation 컨텍스트 자체가
+        # 4만자를 넘어가 그걸 조립하는 데만도 수십 초가 걸림(레코드 "개수"가 아니라 "병합된
+        # 문서 크기"가 진짜 비용). 15로 낮춰도 완전히 45초 밑으로 안정되진 않음(실측 40~56초,
+        # 그날 OpenAI 응답 속도에 따라 들쭉날쭉) — 호출 수를 줄여 악화는 막았지만, 이 질문
+        # 유형(특정 대상 없는 제외+날짜범위) 자체의 근본 해결은 아님. 완전히 고치려면 "병합된
+        # 문서 크기"까지 고려한 더 깊은 손질이 필요해 오늘 범위를 넘어가 보류.
+        _EXCLUSION_LOOKUP_CAP = 15
+        if len(results) > _EXCLUSION_LOOKUP_CAP:
+            results = results[:_EXCLUSION_LOOKUP_CAP]
         _org_excl_cache: dict = {}
 
         def _effective_org_for_exclusion(r: dict) -> str | None:
@@ -6321,6 +6381,27 @@ def ask(question: str, session_id: str | None, menu_scope: str | None = None) ->
             results = _round_excluded_filtered
 
     if excluded_results:
+        # ⚠️ "원안수용도 아니고 제공불가도 아닌거 있어?"처럼 기관명·연도 등 좁히는 조건이
+        # 전혀 없는 순수 제외 질문은, 벡터 유사도가 "제외하라고 한 그 단어들"과 가장 비슷한
+        # 레코드를 top-K로 가져오는 구조적 함정에 빠진다 — 원안수용/제공불가가 전체의 약
+        # 2/3을 차지해(실측), top-20이 전부 원안수용 계열로만 채워져서 제외 후 0건이 되는
+        # 걸 직접 확인함(2026-11-25). "전송방식 아닌"(2026-10-27) 등 자유텍스트 속성
+        # 제외와 동일한 "scan_field_contains(label, '', limit)로 전체를 먼저 가져온 뒤
+        # 매치되는 것만 뺀다" 패턴을 여기도 적용 — 좁히는 조건이 없을 때만(있으면 기존처럼
+        # `_search()`가 이미 그 조건으로 좁힌 top-20에 의존해도 안전하므로) 벡터검색을
+        # 믿지 않고 코드가 직접 전체를 긁어 정확한 여집합을 구한다.
+        if not analysis.filters.기관명 and not analysis.filters.연도:
+            _result_all = scan_field_contains("심의결과", "", 900, data_type="심의위원회")
+            _result_excl_ids: set = set()
+            for _ev in excluded_results:
+                _result_excl_ids |= {
+                    p.get("원본ID") for p in scan_field_contains("심의결과", _ev, 900, data_type="심의위원회")
+                }
+            _result_full_corpus_matches = [p for p in _result_all if p.get("원본ID") not in _result_excl_ids][
+                :KEYWORD_SCAN_LIMIT
+            ]
+            if _result_full_corpus_matches:
+                results = _result_full_corpus_matches
         _result_excluded_filtered = [
             r for r in results
             if _effective_field(r, "심의결과", _metadata_header_cache) not in excluded_results
